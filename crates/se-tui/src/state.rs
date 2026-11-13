@@ -82,6 +82,10 @@ pub struct AppState {
     /// The single command metadata source both the picker and `/help`
     /// read, so the two cannot disagree about what exists.
     pub commands: se_command::Registry,
+    /// What this terminal has been observed to deliver. Fills in as the
+    /// user types, so the help bar advertises a newline chord that
+    /// actually arrives rather than one that ought to.
+    pub keys: crate::keys::Probe,
     pub activity: Activity,
     pub status: String,
     pub should_quit: bool,
@@ -116,6 +120,7 @@ impl Default for AppState {
             composer: crate::composer::Composer::new(),
             picker: crate::picker::Picker::default(),
             commands: se_command::builtins::registry_with_builtins(),
+            keys: crate::keys::Probe::new(),
             activity: Activity::Idle,
             status: String::new(),
             should_quit: false,

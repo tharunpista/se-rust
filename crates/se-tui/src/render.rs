@@ -83,9 +83,11 @@ fn draw_picker(f: &mut Frame, transcript_area: Rect, state: &AppState) {
     // conversation, and keep the highlighted row in view.
     const MAX_ROWS: usize = 8;
     let visible = candidates.len().min(MAX_ROWS);
-    let height = (visible as u16)
-        .saturating_add(2)
-        .min(transcript_area.height);
+    // At least one content row, so the "nothing matches" message has
+    // somewhere to go -- an empty result set must say so, not compute a
+    // box too short to draw and vanish silently.
+    let rows = visible.max(1) as u16;
+    let height = rows.saturating_add(2).min(transcript_area.height);
     if height < 3 {
         return;
     }
@@ -503,19 +505,25 @@ fn draw_composer(f: &mut Frame, area: Rect, state: &AppState) {
 /// instructions: only the keys that do something *right now*, plus a
 /// short status when a task is running, in one line.
 fn draw_help_bar(f: &mut Frame, area: Rect, state: &AppState) {
-    let hint = if state.awaiting_approval().is_some() {
-        "y Allow   n Deny   Ctrl+C Exit"
+    // Owned rather than borrowed because the idle hint names the
+    // newline chord this terminal was actually observed to deliver,
+    // which is runtime state, not a literal (charter §4).
+    let hint: String = if state.awaiting_approval().is_some() {
+        "y Allow   n Deny   Ctrl+C Exit".to_string()
     } else if state.picker.is_open() {
         // While the picker owns the keyboard, advertise its keys rather
         // than the composer's -- the keybinding hints and the actual
         // keymap must not disagree (charter §4).
-        "↑↓ Select   Enter Run   Tab Complete   Esc Cancel"
+        "↑↓ Select   Enter Run   Tab Complete   Esc Cancel".to_string()
     } else {
         match state.activity {
-            Activity::Idle => {
-                "/ Commands   Enter Send   Alt+Enter Newline   Ctrl+D Diag   Ctrl+C Exit"
+            Activity::Idle => format!(
+                "/ Commands   Enter Send   {} Newline   Ctrl+D Diag   Ctrl+C Exit",
+                state.keys.newline_hint()
+            ),
+            Activity::Working { .. } => {
+                "Esc Interrupt   Ctrl+C Exit   PgUp/PgDn Scroll".to_string()
             }
-            Activity::Working { .. } => "Esc Interrupt   Ctrl+C Exit   PgUp/PgDn Scroll",
             Activity::AwaitingApproval { .. } => unreachable!("handled above"),
         }
     };
@@ -794,5 +802,84 @@ mod wrapping {
         let line = Line::from(vec![Span::raw("short")]);
         let wrapped = wrap_lines(vec![line], 40);
         assert_eq!(wrapped.len(), 1);
+    }
+
+    fn with_picker(query: &str) -> AppState {
+        let mut state = AppState::new();
+        for c in query.chars() {
+            crate::input::apply_local(&mut state, &crate::input::Action::InsertChar(c));
+        }
+        state
+    }
+
+    #[test]
+    fn an_open_picker_is_actually_drawn_with_its_candidates() {
+        let mut state = with_picker("/mod");
+        assert!(state.picker.is_open());
+        let screen = render(&mut state, 80, 20);
+        assert!(
+            screen.contains("/models"),
+            "the picker must show the matching command:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn a_closed_picker_draws_nothing_over_the_transcript() {
+        let mut state = AppState::new();
+        let screen = render(&mut state, 80, 20);
+        assert!(!screen.contains("/models"));
+    }
+
+    #[test]
+    fn the_picker_shows_a_message_when_nothing_matches() {
+        // An empty result set must not render as a blank box.
+        let mut state = with_picker("/zzzznope");
+        let screen = render(&mut state, 80, 20);
+        assert!(screen.contains("no command matches"), "got:\n{screen}");
+    }
+
+    #[test]
+    fn the_picker_does_not_cover_the_composer() {
+        // It anchors to the transcript area; the draft must stay
+        // visible while the user is choosing a command.
+        let mut state = with_picker("/mod");
+        let screen = render(&mut state, 80, 20);
+        let lines: Vec<&str> = screen.lines().collect();
+        let composer_row = lines
+            .iter()
+            .rposition(|l| l.contains("/mod"))
+            .expect("the draft must be on screen");
+        // The last occurrence of the typed text is the composer, below
+        // the picker rows.
+        assert!(
+            composer_row >= lines.len() - 3,
+            "composer at {composer_row} of {}",
+            lines.len()
+        );
+    }
+
+    #[test]
+    fn the_help_bar_advertises_the_picker_keys_while_it_is_open() {
+        let mut state = with_picker("/mod");
+        let screen = render(&mut state, 100, 20);
+        assert!(screen.contains("Esc Cancel"), "got:\n{screen}");
+        assert!(screen.contains("Enter Run"));
+    }
+
+    #[test]
+    fn the_help_bar_advertises_slash_for_commands_when_idle() {
+        let mut state = AppState::new();
+        let screen = render(&mut state, 100, 20);
+        assert!(screen.contains("/ Commands"), "got:\n{screen}");
+    }
+
+    #[test]
+    fn a_narrow_terminal_does_not_panic_with_the_picker_open() {
+        // The picker computes its own rect; a terminal too short for a
+        // bordered box must skip it rather than underflow.
+        let mut state = with_picker("/mod");
+        for (w, h) in [(20u16, 6u16), (10, 5), (40, 4)] {
+            let _ = render(&mut state, w, h);
+        }
     }
 }

@@ -21,6 +21,7 @@
 
 pub mod composer;
 pub mod input;
+pub mod keys;
 pub mod picker;
 pub mod render;
 pub mod state;
@@ -75,6 +76,10 @@ pub fn run<B: Backend>(
         if event::poll(TICK)? {
             match event::read()? {
                 Event::Key(key) => {
+                    // Recorded before the action is resolved, so the
+                    // probe sees what the terminal delivered even for a
+                    // chord SE does not currently bind.
+                    state.keys.observe(key);
                     let action = action_for_key(&state, key);
                     dirty |= dispatch(&mut state, core, action);
                 }
@@ -192,6 +197,10 @@ pub fn run_command(state: &mut AppState, path: &str) {
     match se_command::builtins::availability(&id) {
         Some(se_command::builtins::Availability::Ready) => match id.as_str() {
             "exit" => state.should_quit = true,
+            "keys" => {
+                let report = state.keys.report();
+                state.push(Entry::Notice(report));
+            }
             "help" | "commands" => {
                 let mut lines = vec!["commands:".to_string()];
                 for category in se_command::builtins::CATEGORIES {
@@ -566,6 +575,36 @@ mod tests {
                 spec.path
             );
         }
+    }
+
+    #[test]
+    fn the_keys_command_reports_what_this_terminal_delivers() {
+        let mut state = AppState::new();
+        run_command(&mut state, "keys");
+        let notice = state
+            .transcript
+            .iter()
+            .find_map(|e| match e {
+                Entry::Notice(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("/keys must print a report");
+        assert!(notice.contains("Alt+Enter"));
+        assert!(notice.contains("Shift+Enter"));
+        // Charter §4: an untested chord is reported as unknown rather
+        // than advertised as working.
+        assert!(notice.contains("not pressed yet"));
+    }
+
+    #[test]
+    fn a_newline_chord_observed_once_is_what_the_help_bar_then_advertises() {
+        let mut state = AppState::new();
+        assert_eq!(state.keys.newline_hint(), "Alt+Enter");
+        state.keys.observe(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::SHIFT,
+        ));
+        assert_eq!(state.keys.newline_hint(), "Shift+Enter");
     }
 
     #[test]
