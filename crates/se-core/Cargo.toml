@@ -1,0 +1,10 @@
+[package]
+name = "se-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SE's execution core: session, task and turn lifecycle, run off the interface's thread."
+
+[dependencies]
+se-protocol = { path = "../se-protocol" }

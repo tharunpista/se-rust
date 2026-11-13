@@ -1,0 +1,19 @@
+[package]
+name = "se"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The `se` binary: wiring and terminal lifecycle."
+
+[[bin]]
+name = "se"
+path = "src/main.rs"
+
+[dependencies]
+se-protocol = { path = "../se-protocol" }
+se-core = { path = "../se-core" }
+se-tui = { path = "../se-tui" }
+clap = { workspace = true }
+crossterm = { workspace = true }
+ratatui = { workspace = true }

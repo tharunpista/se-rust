@@ -1,0 +1,423 @@
+//! Drawing. Derives everything from [`AppState`]; reads no other source.
+
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::Frame;
+
+use crate::state::{Activity, AppState, Entry, ToolState};
+
+/// Charcoal and lavender, carried over from the approved design.
+mod theme {
+    use ratatui::style::{Color, Modifier, Style};
+
+    pub const LAVENDER: Color = Color::Rgb(0xb4, 0xa7, 0xf5);
+    pub const CHARCOAL: Color = Color::Rgb(0x1c, 0x1c, 0x20);
+    pub const TEXT: Color = Color::Rgb(0xe4, 0xe4, 0xe8);
+    pub const MUTED: Color = Color::Rgb(0x8a, 0x8a, 0x95);
+    pub const OK: Color = Color::Rgb(0x86, 0xc9, 0xa0);
+    pub const WARN: Color = Color::Rgb(0xe0, 0xb5, 0x72);
+    pub const ERROR: Color = Color::Rgb(0xe0, 0x7a, 0x7a);
+
+    pub fn base() -> Style {
+        Style::default().fg(TEXT).bg(CHARCOAL)
+    }
+    pub fn muted() -> Style {
+        Style::default().fg(MUTED).bg(CHARCOAL)
+    }
+    pub fn accent() -> Style {
+        Style::default().fg(LAVENDER).bg(CHARCOAL)
+    }
+    pub fn accent_bold() -> Style {
+        accent().add_modifier(Modifier::BOLD)
+    }
+}
+
+pub fn draw(f: &mut Frame, state: &AppState) {
+    let area = f.area();
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme::CHARCOAL)),
+        area,
+    );
+
+    let composer_height = composer_height(state, area.width);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),               // header
+            Constraint::Min(3),                  // transcript
+            Constraint::Length(composer_height), // composer
+            Constraint::Length(1),               // status
+        ])
+        .split(area);
+
+    draw_header(f, chunks[0], state);
+    draw_transcript(f, chunks[1], state);
+    draw_composer(f, chunks[2], state);
+    draw_status(f, chunks[3], state);
+}
+
+fn composer_height(state: &AppState, _width: u16) -> u16 {
+    // Grows with the draft, capped so a long paste cannot swallow the
+    // transcript.
+    let lines = state.composer.lines().count().max(1) as u16;
+    lines.clamp(1, 6) + 2
+}
+
+fn draw_header(f: &mut Frame, area: Rect, state: &AppState) {
+    let mut spans = vec![
+        Span::styled("SE", theme::accent_bold()),
+        Span::styled("  ", theme::base()),
+    ];
+    match state.activity {
+        Activity::Idle => spans.push(Span::styled("ready", theme::muted())),
+        Activity::Working { task } => {
+            spans.push(Span::styled(format!("working {task}"), theme::accent()));
+        }
+        Activity::AwaitingApproval { .. } => {
+            spans.push(Span::styled(
+                "waiting for your decision",
+                theme::accent_bold(),
+            ));
+        }
+    }
+    if !state.status.is_empty() {
+        spans.push(Span::styled("  ·  ", theme::muted()));
+        spans.push(Span::styled(state.status.clone(), theme::muted()));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)).style(theme::base()), area);
+}
+
+fn draw_transcript(f: &mut Frame, area: Rect, state: &AppState) {
+    let mut lines: Vec<Line> = Vec::new();
+    for entry in &state.transcript {
+        match entry {
+            Entry::User(text) => {
+                for (i, l) in text.lines().enumerate() {
+                    let prefix = if i == 0 { "› " } else { "  " };
+                    lines.push(Line::from(vec![
+                        Span::styled(prefix, theme::accent_bold()),
+                        Span::styled(l.to_string(), theme::base()),
+                    ]));
+                }
+            }
+            Entry::Assistant(text) => {
+                for l in text.lines() {
+                    lines.push(Line::from(Span::styled(l.to_string(), theme::base())));
+                }
+            }
+            Entry::Reasoning(text) => {
+                for l in text.lines() {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {l}"),
+                        theme::muted().add_modifier(Modifier::ITALIC),
+                    )));
+                }
+            }
+            Entry::Tool {
+                name,
+                summary,
+                state: tool_state,
+            } => {
+                let (mark, style) = match tool_state {
+                    ToolState::Running => ("…", theme::muted()),
+                    ToolState::Ok => ("✓", Style::default().fg(theme::OK).bg(theme::CHARCOAL)),
+                    ToolState::Failed => {
+                        ("✗", Style::default().fg(theme::ERROR).bg(theme::CHARCOAL))
+                    }
+                    ToolState::Denied => {
+                        ("⊘", Style::default().fg(theme::WARN).bg(theme::CHARCOAL))
+                    }
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {mark} "), style),
+                    Span::styled(name.clone(), style),
+                    Span::styled(format!("  {}", truncate(summary, 60)), theme::muted()),
+                ]));
+            }
+            Entry::Approval {
+                name,
+                summary,
+                decision,
+            } => {
+                let text = match decision {
+                    None => format!("  approve {name}?  {}   [y/n]", truncate(summary, 48)),
+                    Some(true) => format!("  approved {name}"),
+                    Some(false) => format!("  denied {name}"),
+                };
+                let style = if decision.is_none() {
+                    theme::accent_bold()
+                } else {
+                    theme::muted()
+                };
+                lines.push(Line::from(Span::styled(text, style)));
+            }
+            Entry::Notice(text) => {
+                lines.push(Line::from(Span::styled(
+                    format!("  {text}"),
+                    theme::muted(),
+                )));
+            }
+            Entry::Error(text) => {
+                lines.push(Line::from(Span::styled(
+                    format!("  {text}"),
+                    Style::default().fg(theme::ERROR).bg(theme::CHARCOAL),
+                )));
+            }
+        }
+    }
+
+    if state.dropped_events > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {} event(s) were not received — the transcript above may have gaps",
+                state.dropped_events
+            ),
+            Style::default().fg(theme::WARN).bg(theme::CHARCOAL),
+        )));
+    }
+
+    if state.show_diagnostics {
+        if let Some(timings) = &state.last_timings {
+            lines.push(Line::from(Span::styled(
+                format!("  timings: {}", timings.summary()),
+                theme::muted(),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  local {} · total {}",
+                    se_protocol::timings::format_duration(timings.local()),
+                    se_protocol::timings::format_duration(timings.total())
+                ),
+                theme::muted(),
+            )));
+        }
+    }
+
+    // `scroll` counts lines back from the newest, so the view stays
+    // pinned to the bottom while content streams in.
+    let viewport = area.height.saturating_sub(2) as usize;
+    let offset = if lines.len() > viewport {
+        (lines.len() - viewport).saturating_sub(state.scroll as usize)
+    } else {
+        0
+    };
+
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(theme::muted());
+    f.render_widget(
+        Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>())
+            .style(theme::base())
+            .wrap(Wrap { trim: false })
+            .block(block),
+        area,
+    );
+}
+
+fn draw_composer(f: &mut Frame, area: Rect, state: &AppState) {
+    let (text, style) = if state.awaiting_approval().is_some() {
+        (
+            "a decision is waiting above — press y to allow, n to deny".to_string(),
+            theme::accent_bold(),
+        )
+    } else if state.composer.is_empty() {
+        (
+            "describe the work, or press Enter on an empty line to do nothing".to_string(),
+            theme::muted(),
+        )
+    } else {
+        (state.composer.clone(), theme::base())
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(if state.is_busy() {
+            theme::muted()
+        } else {
+            theme::accent()
+        });
+    f.render_widget(
+        Paragraph::new(text)
+            .style(style)
+            .wrap(Wrap { trim: false })
+            .block(block),
+        area,
+    );
+}
+
+fn draw_status(f: &mut Frame, area: Rect, state: &AppState) {
+    let hint = match state.activity {
+        Activity::Idle => "Enter send · Shift+Enter newline · Ctrl+D diagnostics · Esc quit",
+        Activity::Working { .. } => "Esc or Ctrl+C interrupt · PgUp/PgDn scroll",
+        Activity::AwaitingApproval { .. } => "y allow · n deny · Ctrl+C interrupt",
+    };
+    let line = Line::from(vec![
+        Span::styled(hint, theme::muted()),
+        Span::styled("   ", theme::muted()),
+        Span::styled(state.usage_line(), theme::muted()),
+    ]);
+    f.render_widget(Paragraph::new(line).style(theme::base()), area);
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    let flat: String = s
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let kept: String = flat.chars().take(max.saturating_sub(1)).collect();
+    format!("{kept}…")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use se_protocol::{Stage, Timings};
+
+    fn render(state: &AppState, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| draw(f, state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn the_frame_shows_a_header_transcript_composer_and_status() {
+        let mut state = AppState::new();
+        state.push(Entry::User("build the thing".into()));
+        state.push(Entry::Assistant("working on it".into()));
+        let out = render(&state, 80, 16);
+        assert!(out.contains("SE"), "{out}");
+        assert!(out.contains("build the thing"), "{out}");
+        assert!(out.contains("working on it"), "{out}");
+        assert!(out.contains("Enter send"), "{out}");
+    }
+
+    #[test]
+    fn a_pending_approval_is_visible_and_tells_the_user_the_keys() {
+        let mut state = AppState::new();
+        state.activity = Activity::AwaitingApproval {
+            task: se_protocol::TaskId::from_raw(1),
+            call: se_protocol::ToolCallId::from_raw(1),
+        };
+        state.push(Entry::Approval {
+            name: "run_shell".into(),
+            summary: "cargo test".into(),
+            decision: None,
+        });
+        let out = render(&state, 80, 16);
+        assert!(out.contains("run_shell"), "{out}");
+        assert!(out.contains("y allow"), "{out}");
+        // The composer must say why it is not accepting text.
+        assert!(out.contains("decision is waiting"), "{out}");
+    }
+
+    #[test]
+    fn a_long_transcript_shows_its_newest_lines_by_default() {
+        let mut state = AppState::new();
+        for i in 0..200 {
+            state.push(Entry::Assistant(format!("line {i}")));
+        }
+        let out = render(&state, 60, 12);
+        assert!(out.contains("line 199"), "newest must be visible");
+        assert!(!out.contains("line 0\n"), "oldest must be scrolled off");
+    }
+
+    #[test]
+    fn scrolling_back_reveals_older_lines() {
+        let mut state = AppState::new();
+        for i in 0..200 {
+            state.push(Entry::Assistant(format!("line {i}")));
+        }
+        state.scroll = 50;
+        let out = render(&state, 60, 12);
+        assert!(!out.contains("line 199"), "scrolled away from newest");
+        assert!(out.contains("line 14") || out.contains("line 15"), "{out}");
+    }
+
+    #[test]
+    fn a_gap_in_events_is_rendered_as_a_warning_not_hidden() {
+        let mut state = AppState::new();
+        state.dropped_events = 3;
+        let out = render(&state, 80, 10);
+        assert!(out.contains("not received"), "{out}");
+    }
+
+    #[test]
+    fn diagnostics_show_stage_timings_when_enabled() {
+        let mut state = AppState::new();
+        let mut timings = Timings::default();
+        timings.record(se_protocol::Span {
+            stage: Stage::TimeToFirstToken,
+            duration: std::time::Duration::from_millis(120),
+        });
+        state.last_timings = Some(timings);
+
+        let hidden = render(&state, 80, 12);
+        assert!(!hidden.contains("ttft"), "off by default");
+
+        state.show_diagnostics = true;
+        let shown = render(&state, 80, 12);
+        assert!(shown.contains("ttft"), "{shown}");
+        assert!(shown.contains("120ms"), "{shown}");
+    }
+
+    #[test]
+    fn rendering_a_narrow_terminal_does_not_panic() {
+        // Terminals get resized to silly sizes; drawing must survive it.
+        let mut state = AppState::new();
+        state.push(Entry::User("a fairly long line of text here".into()));
+        state.composer = "typing something".into();
+        for (w, h) in [(20, 6), (10, 5), (120, 40), (40, 4)] {
+            let _ = render(&state, w, h);
+        }
+    }
+
+    #[test]
+    fn a_tool_entry_shows_its_outcome_distinctly() {
+        let mut state = AppState::new();
+        state.push(Entry::Tool {
+            name: "read_file".into(),
+            summary: "src/main.rs".into(),
+            state: ToolState::Ok,
+        });
+        state.push(Entry::Tool {
+            name: "run_shell".into(),
+            summary: "exit 1".into(),
+            state: ToolState::Failed,
+        });
+        state.push(Entry::Tool {
+            name: "write_file".into(),
+            summary: "not run".into(),
+            state: ToolState::Denied,
+        });
+        let out = render(&state, 80, 14);
+        assert!(out.contains("✓"), "{out}");
+        assert!(out.contains("✗"), "{out}");
+        assert!(out.contains("⊘"), "{out}");
+    }
+
+    #[test]
+    fn long_tool_summaries_are_truncated_rather_than_wrapping_the_layout() {
+        assert_eq!(truncate("short", 10), "short");
+        let long = "x".repeat(100);
+        let cut = truncate(&long, 20);
+        assert_eq!(cut.chars().count(), 20);
+        assert!(cut.ends_with('…'));
+        // Newlines in a tool summary must not break the single-line row.
+        assert_eq!(truncate("a\nb", 10), "a b");
+    }
+}

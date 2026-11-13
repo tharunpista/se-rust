@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# SE's own local state, when the binary is run inside this repo.
+.se/

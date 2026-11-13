@@ -1,0 +1,13 @@
+[package]
+name = "se-tui"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SE's terminal interface: an event consumer. Performs no I/O other than drawing."
+
+[dependencies]
+se-protocol = { path = "../se-protocol" }
+se-core = { path = "../se-core" }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
