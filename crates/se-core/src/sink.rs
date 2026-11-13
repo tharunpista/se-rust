@@ -12,8 +12,20 @@
 //!   interface (I1).
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// How often the approval wait rechecks cancellation.
+///
+/// This is the fix for E9: `recv()` blocked unconditionally, so a
+/// dropped `UNPARK` (the supervisor's `try_send` to a full 1-slot
+/// channel silently fails if a stale decision is still sitting there)
+/// left the worker parked forever even though `cancelled` was already
+/// true. A short poll is the cost of closing that gap; 25ms is well
+/// under anything a human would perceive as a delay in Ctrl+C or
+/// Shutdown taking effect.
+const APPROVAL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 use se_protocol::{
     CoreEvent, DeltaKind, Payload, SeqCounter, SessionId, Span, Stage, TaskId, ToolCallId, TurnId,
@@ -213,13 +225,25 @@ impl TurnSink {
         // *next* request instantly -- so pressing `y` twice silently
         // approved a tool the user was never shown.
         let decision = loop {
-            match self.approvals.recv() {
+            match self.approvals.recv_timeout(APPROVAL_POLL_INTERVAL) {
                 Ok((answered, allow)) if answered == call => break allow,
                 // Not for this call: a stale or duplicated decision.
                 Ok(_) => continue,
                 // The interface is gone; a withheld decision is never
                 // permission.
-                Err(_) => break false,
+                Err(RecvTimeoutError::Disconnected) => break false,
+                // No decision yet. Rechecked here rather than relied on
+                // solely via the sentinel `UNPARK` send, because that
+                // send can itself be dropped (E9): a 1-slot channel's
+                // `try_send` fails silently if a stale decision already
+                // occupies it, and a dropped UNPARK must not mean a
+                // cancelled task waits forever.
+                Err(RecvTimeoutError::Timeout) => {
+                    if self.is_cancelled() {
+                        break false;
+                    }
+                    continue;
+                }
             }
         };
         let span = waiting.finish();
@@ -366,6 +390,42 @@ mod tests {
         assert!(
             !sink.request_approval("run_shell", "rm -rf /"),
             "a cancelled task must not act on a stale approval"
+        );
+        let _rx = joined.join().unwrap();
+    }
+
+    #[test]
+    fn a_dropped_unpark_does_not_leave_a_cancelled_task_waiting_forever() {
+        // E9: the supervisor's interrupt path sends UNPARK via a
+        // `try_send` to a 1-slot channel. If a stale decision from an
+        // *earlier* call is still sitting in that slot, the send
+        // silently fails and no UNPARK ever arrives -- simulated here
+        // by filling the slot with a decision for a call id that does
+        // not exist and never sending anything else. Only the
+        // cancellation flag is set, exactly as it would be if the
+        // UNPARK send had been dropped. Before the fix this hung
+        // forever on a bare `recv()`; now the periodic recheck inside
+        // `request_approval` must still notice the flag and return.
+        let (mut sink, rx, approvals, cancelled) = sink();
+        let stale_call = ToolCallId::next();
+        approvals.send((stale_call, true)).unwrap();
+        let joined = std::thread::spawn(move || {
+            let request = rx.recv().unwrap();
+            cancelled.store(true, Ordering::SeqCst);
+            // Deliberately nothing else sent: the real UNPARK is the
+            // thing this test treats as lost.
+            let _ = requested_call(&request);
+            rx
+        });
+        let started = std::time::Instant::now();
+        assert!(
+            !sink.request_approval("run_shell", "anything"),
+            "a cancelled task must not hang waiting for an UNPARK that never arrives"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the poll must notice cancellation well within a couple of intervals, took {:?}",
+            started.elapsed()
         );
         let _rx = joined.join().unwrap();
     }
