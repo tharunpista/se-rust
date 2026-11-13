@@ -60,6 +60,7 @@ pub fn run<B: Backend>(
     banner: Option<String>,
 ) -> io::Result<()> {
     let mut state = AppState::new();
+    discover_and_register_commands(&mut state);
     state.banner = banner;
     let mut dirty = true;
 
@@ -117,6 +118,15 @@ fn dispatch(state: &mut AppState, core: &CoreHandle, action: Action) -> bool {
         Action::Nothing => false,
         Action::Submit(text) => {
             apply_local(state, &action);
+            // Charter §3.1: a registry-known slash path is never sent
+            // to the model, whether it was accepted from the picker or
+            // typed out in full and submitted directly -- the picker
+            // only ever closes on whitespace, so a command with
+            // arguments reaches here, not `Action::PickerAccept`.
+            if let Some((path, raw_args)) = leading_command(text, &state.commands) {
+                run_command(state, core, &path, &raw_args);
+                return true;
+            }
             match core.submit(text, Vec::new()) {
                 Ok(_task) => {}
                 Err(e) => {
@@ -155,7 +165,7 @@ fn dispatch(state: &mut AppState, core: &CoreHandle, action: Action) -> bool {
             if let Some(path) = state.highlighted_command_path() {
                 state.picker.close();
                 state.composer.clear();
-                run_command(state, &path);
+                run_command(state, core, &path, "");
             } else {
                 // Nothing matched; leave the draft alone so the user
                 // can correct it rather than losing what they typed.
@@ -181,19 +191,97 @@ fn dispatch(state: &mut AppState, core: &CoreHandle, action: Action) -> bool {
     }
 }
 
+/// Loads custom commands from the project and global command
+/// directories and registers them over the builtins already in
+/// `state.commands`.
+///
+/// `.se/commands` in the current directory is `Provenance::Project`;
+/// `~/.se/commands` (`%USERPROFILE%` on Windows, `$HOME` elsewhere) is
+/// `Provenance::Global`. Neither directory existing is the ordinary
+/// case, not a failure (`se_command::discovery::scan` already treats a
+/// missing directory as empty). A file that failed to parse is
+/// reported as a notice naming the real path, per charter §5.1's "an
+/// invalid [definition] is reported, not silently skipped" -- applied
+/// here to commands as it is to agents.
+pub fn discover_and_register_commands(state: &mut AppState) {
+    let mut load = |root: std::path::PathBuf, provenance: se_command::Provenance| {
+        let (loaded, errors) = se_command::discovery::scan(&root, provenance);
+        for se_command::discovery::Loaded { spec, def } in loaded {
+            let id = spec.id.clone();
+            // A collision is itself worth surfacing: the registry
+            // already decides the winner by precedence, but silence
+            // here would hide that two sources defined the same path.
+            match state.commands.register(spec) {
+                Ok(se_command::RegisterOutcome::Shadowed { winner_id }) => {
+                    state.push(Entry::Notice(format!(
+                        "a loaded command was shadowed by {winner_id} (higher precedence already owns that path)"
+                    )));
+                }
+                Ok(_) => {
+                    state.templates.insert(id, def);
+                }
+                Err(se_command::RegisterError::SecurityCriticalShadowed { path, builtin_id }) => {
+                    state.push(Entry::Notice(format!(
+                        "/{path} cannot be redefined -- it belongs to the built-in {builtin_id}"
+                    )));
+                }
+            }
+        }
+        for e in errors {
+            state.push(Entry::Notice(format!("command file skipped: {e}")));
+        }
+    };
+
+    if let Ok(cwd) = std::env::current_dir() {
+        load(
+            cwd.join(".se").join("commands"),
+            se_command::Provenance::Project,
+        );
+    }
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok();
+    if let Some(home) = home {
+        load(
+            std::path::PathBuf::from(home).join(".se").join("commands"),
+            se_command::Provenance::Global,
+        );
+    }
+}
+
+/// If `text` names a registered command, returns its path and the
+/// remaining text as raw arguments. Returns `None` for ordinary prose,
+/// including prose that happens to contain a slash -- only a leading
+/// `/<known-path>` counts.
+fn leading_command(text: &str, commands: &se_command::Registry) -> Option<(String, String)> {
+    let after_slash = text.trim_start().strip_prefix('/')?;
+    let (word, rest) = match after_slash.find(char::is_whitespace) {
+        Some(i) => (&after_slash[..i], after_slash[i..].trim_start()),
+        None => (after_slash, ""),
+    };
+    commands.resolve(word).ok()?;
+    Some((word.to_string(), rest.to_string()))
+}
+
 /// Executes a resolved slash command.
 ///
 /// Phase 1 scope: every command resolves and reports honestly. A
 /// command whose subsystem is not built yet says so with the reason
 /// from its builtin definition, which is charter §1's requirement that
-/// nothing appear to work when it does not. No command on this path
-/// reaches the model as a prompt.
-pub fn run_command(state: &mut AppState, path: &str) {
+/// nothing appear to work when it does not. A loaded prompt-template
+/// command renders its body with `raw_args` and submits the *rendered*
+/// text as the turn -- the command path and arguments themselves never
+/// reach the model.
+pub fn run_command(state: &mut AppState, core: &CoreHandle, path: &str, raw_args: &str) {
     let Ok(spec) = state.commands.resolve(path) else {
         state.push(Entry::Notice(format!("unknown command: /{path}")));
         return;
     };
     let id = spec.id.clone();
+    if spec.handler == se_command::HandlerKind::PromptTemplate {
+        run_prompt_template(state, core, &id, path, raw_args);
+        return;
+    }
     match se_command::builtins::availability(&id) {
         Some(se_command::builtins::Availability::Ready) => match id.as_str() {
             "exit" => state.should_quit = true,
@@ -236,6 +324,32 @@ pub fn run_command(state: &mut AppState, path: &str) {
         None => state.push(Entry::Notice(format!(
             "/{path} has no availability record — this is a bug in the builtin table"
         ))),
+    }
+}
+
+/// Renders a loaded command's template against `raw_args` and submits
+/// the result as a normal turn. The template body is cached at
+/// discovery time in `state.templates`; its absence here means the
+/// registry and the cache disagree, which is a bug in the wiring
+/// between `discover_and_register_commands` and this function, not a
+/// user-facing condition -- reported rather than panicking, since a
+/// bug in the TUI is still not a reason to crash it.
+fn run_prompt_template(
+    state: &mut AppState,
+    core: &CoreHandle,
+    id: &str,
+    path: &str,
+    raw_args: &str,
+) {
+    let Some(def) = state.templates.get(id).cloned() else {
+        state.push(Entry::Notice(format!(
+            "/{path} is registered as a template command but its body was not cached — this is a bug"
+        )));
+        return;
+    };
+    let rendered = se_command::markdown::render(&def, raw_args);
+    if let Err(e) = core.submit(&rendered, Vec::new()) {
+        state.push(Entry::Notice(e.to_string()));
     }
 }
 
@@ -529,6 +643,120 @@ mod tests {
         core.shutdown();
     }
 
+    /// A command directory under the OS temp dir, removed on drop.
+    struct TempCommandDir(std::path::PathBuf);
+
+    impl TempCommandDir {
+        fn new() -> Self {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let path = std::env::temp_dir()
+                .join(format!("se-tui-command-test-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            TempCommandDir(path)
+        }
+
+        fn write(&self, name: &str, contents: &str) -> &Self {
+            std::fs::write(self.0.join(name), contents).unwrap();
+            self
+        }
+    }
+
+    impl Drop for TempCommandDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_loaded_template_command_renders_its_body_and_submits_that_not_the_invocation() {
+        let dir = TempCommandDir::new();
+        dir.write("hello.md", "Translate $0 to $1.");
+        let (loaded, errors) = se_command::discovery::scan(&dir.0, se_command::Provenance::Project);
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let core = se_core::start(EchoRunner::instant());
+        let mut state = AppState::new();
+        let id = loaded[0].spec.id.clone();
+        state.commands.register(loaded[0].spec.clone()).unwrap();
+        state.templates.insert(id, loaded[0].def.clone());
+
+        run_command(&mut state, &core, "hello", "world French");
+        pump_until_idle(&mut state, &core, Duration::from_secs(2));
+
+        let sent = state
+            .transcript
+            .iter()
+            .find_map(|e| match e {
+                Entry::User(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("the rendered template must be submitted as a turn");
+        assert_eq!(sent, "Translate world to French.");
+        // The literal invocation text never appears anywhere.
+        assert!(!state
+            .transcript
+            .iter()
+            .any(|e| matches!(e, Entry::User(t) if t.contains("$0"))));
+        core.shutdown();
+    }
+
+    #[test]
+    fn typing_a_known_command_with_arguments_and_pressing_enter_runs_it_not_the_model() {
+        // The picker closes the moment whitespace is typed, so a
+        // command with arguments reaches Submit, not PickerAccept --
+        // this is the path that matters for every real invocation.
+        let dir = TempCommandDir::new();
+        dir.write("echo-arg.md", "You said: $0");
+        let (loaded, _) = se_command::discovery::scan(&dir.0, se_command::Provenance::Project);
+
+        let core = se_core::start(EchoRunner::instant());
+        let mut state = AppState::new();
+        let id = loaded[0].spec.id.clone();
+        state.commands.register(loaded[0].spec.clone()).unwrap();
+        state.templates.insert(id, loaded[0].def.clone());
+
+        let text = "/echo-arg hooray";
+        for c in text.chars() {
+            crate::input::apply_local(&mut state, &Action::InsertChar(c));
+        }
+        // The space after the command word already closed the picker.
+        assert!(!state.picker.is_open());
+        dispatch(&mut state, &core, Action::Submit(text.to_string()));
+        pump_until_idle(&mut state, &core, Duration::from_secs(2));
+
+        let sent = state
+            .transcript
+            .iter()
+            .find_map(|e| match e {
+                Entry::User(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("the rendered command must reach the model");
+        assert_eq!(sent, "You said: hooray");
+        core.shutdown();
+    }
+
+    #[test]
+    fn an_unknown_leading_slash_word_is_not_mistaken_for_a_command() {
+        let reg = se_command::builtins::registry_with_builtins();
+        assert_eq!(leading_command("/not-a-real-command hi", &reg), None);
+        assert_eq!(leading_command("no leading slash here", &reg), None);
+    }
+
+    #[test]
+    fn a_known_command_with_no_arguments_splits_cleanly() {
+        let reg = se_command::builtins::registry_with_builtins();
+        assert_eq!(
+            leading_command("/doctor", &reg),
+            Some(("doctor".to_string(), String::new()))
+        );
+        assert_eq!(
+            leading_command("/doctor   ", &reg),
+            Some(("doctor".to_string(), String::new()))
+        );
+    }
+
     #[test]
     fn an_unavailable_command_explains_why_instead_of_failing_silently() {
         let core = se_core::start(EchoRunner::instant());
@@ -558,8 +786,10 @@ mod tests {
     fn help_lists_every_registered_command_grouped_by_category() {
         // /help is a projection of the registry, so this also pins that
         // no command can exist in the registry and be missing from help.
+        let core = se_core::start(EchoRunner::instant());
         let mut state = AppState::new();
-        run_command(&mut state, "help");
+        run_command(&mut state, &core, "help", "");
+        core.shutdown();
         let notice = state
             .transcript
             .iter()
@@ -579,8 +809,10 @@ mod tests {
 
     #[test]
     fn the_keys_command_reports_what_this_terminal_delivers() {
+        let core = se_core::start(EchoRunner::instant());
         let mut state = AppState::new();
-        run_command(&mut state, "keys");
+        run_command(&mut state, &core, "keys", "");
+        core.shutdown();
         let notice = state
             .transcript
             .iter()
@@ -609,9 +841,11 @@ mod tests {
 
     #[test]
     fn exit_quits_through_the_command_path() {
+        let core = se_core::start(EchoRunner::instant());
         let mut state = AppState::new();
         assert!(!state.should_quit);
-        run_command(&mut state, "exit");
+        run_command(&mut state, &core, "exit", "");
         assert!(state.should_quit);
+        core.shutdown();
     }
 }

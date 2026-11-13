@@ -1,14 +1,18 @@
 //! A typed registry for SE's `/` commands.
 //!
-//! This crate is deliberately inert: it holds metadata and resolves a
-//! typed path or alias to a [`CommandSpec`], and does nothing else. It
-//! has no I/O, starts nothing, and depends on no other SE crate, so a
-//! collision rule or a fuzzy-filter rule can be unit-tested without a
-//! running core or a terminal. Turning a resolved command into an
-//! effect -- a `CoreOp`, a prompt template substitution, a UI action --
-//! is the caller's job, not this crate's.
+//! This crate holds command metadata and resolves a typed path or alias
+//! to a [`CommandSpec`]; it starts nothing and depends on no other SE
+//! crate, so a collision rule or a fuzzy-filter rule can be unit-tested
+//! without a running core or a terminal. Its one I/O surface is
+//! [`discovery`], which reads local command `.md` files -- the same
+//! kind of file [`markdown`] already parses from a string -- and is
+//! still not a runtime: it never executes a command, only reads the
+//! files that describe one. Turning a resolved command into an effect
+//! -- a `CoreOp`, a prompt template substitution, a UI action -- is the
+//! caller's job, not this crate's.
 
 pub mod builtins;
+pub mod discovery;
 pub mod markdown;
 
 use std::collections::HashMap;
@@ -53,12 +57,32 @@ pub enum HandlerKind {
     PromptTemplate,
 }
 
+/// Builds the stable id for a loaded (non-builtin) command: its
+/// provenance and path together.
+///
+/// `register`'s reload rule treats two specs with the same id as the
+/// same command being reloaded, regardless of provenance rank (see its
+/// comment) -- which is correct only if a bare path can never collide
+/// with a *different* command from a different source. A loaded
+/// command's path alone cannot guarantee that (a project file and a
+/// global file can legitimately share a path, and should compete on
+/// provenance, not silently merge into one "reload"), so this function
+/// is the one place a loaded `CommandSpec::id` is built, and every
+/// caller that discovers a command from disk must go through it rather
+/// than using the bare path as the id.
+pub fn loaded_id(provenance: Provenance, path: &str) -> String {
+    format!("{provenance:?}:{path}").to_lowercase()
+}
+
 /// A registered command's metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
-    /// Stable identifier, independent of path or provenance. Two
-    /// commands with the same id are the same command re-registered,
-    /// not a collision.
+    /// Stable identifier, independent of path. Two commands with the
+    /// same id are the same command re-registered, not a collision --
+    /// true for a builtin's fixed id, and true for a loaded command
+    /// only when built through [`loaded_id`], which folds provenance in
+    /// so a same-path command from a *different* source gets a
+    /// different id and competes on provenance instead of merging.
     pub id: String,
     /// Canonical slash path, without the leading `/`. Namespaced paths
     /// use `:`, e.g. `frontend:component`.

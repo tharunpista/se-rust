@@ -82,6 +82,13 @@ pub struct AppState {
     /// The single command metadata source both the picker and `/help`
     /// read, so the two cannot disagree about what exists.
     pub commands: se_command::Registry,
+    /// Parsed template bodies for loaded (non-builtin) prompt-template
+    /// commands, keyed by `CommandSpec::id`. Populated once at
+    /// discovery time rather than re-read from disk on every
+    /// invocation: the file was already parsed to build the registry
+    /// entry, and discarding that parse just to redo it on first use
+    /// would be pure waste, not stricter just-in-time loading.
+    pub templates: std::collections::HashMap<String, se_command::markdown::CommandDef>,
     /// What this terminal has been observed to deliver. Fills in as the
     /// user types, so the help bar advertises a newline chord that
     /// actually arrives rather than one that ought to.
@@ -120,6 +127,7 @@ impl Default for AppState {
             composer: crate::composer::Composer::new(),
             picker: crate::picker::Picker::default(),
             commands: se_command::builtins::registry_with_builtins(),
+            templates: std::collections::HashMap::new(),
             keys: crate::keys::Probe::new(),
             activity: Activity::Idle,
             status: String::new(),

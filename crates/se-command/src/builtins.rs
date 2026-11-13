@@ -44,6 +44,11 @@ pub const CATEGORIES: &[&str] = &[
     "Team",
     "Tools & connectors",
     "Diagnostics",
+    // Every command `discovery` loads from a project or global
+    // directory lands here (`discovery::CATEGORY`), so a picker that
+    // groups strictly by this list does not silently drop a loaded
+    // command the moment one exists.
+    "Custom",
 ];
 
 /// Every builtin command SE knows about.
