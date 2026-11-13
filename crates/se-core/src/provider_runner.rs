@@ -865,7 +865,7 @@ mod tests {
 
     #[test]
     fn a_deadline_that_fires_before_any_token_is_a_failure_not_a_partial_answer() {
-        // One frame per 50ms against a 20ms deadline: the deadline is
+        // One frame per 50ms against a 1ms deadline: the deadline is
         // seen on the first poll, before anything is streamed.
         let (runner, _r) = runner_that_never_stops(Duration::from_millis(50));
         let runner = runner

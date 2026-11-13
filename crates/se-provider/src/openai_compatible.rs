@@ -818,6 +818,31 @@ fn is_timeout_io(e: &std::io::Error) -> bool {
 /// word" rule would redact model ids and request ids as well.
 const CREDENTIAL_PREFIXES: [&str; 5] = ["sk-", "sk_", "gsk_", "nvapi-", "AIza"];
 
+/// Replaces every credential-shaped run inside one word. A prefix counts
+/// only at a non-alphanumeric boundary -- error bodies are JSON, so a key
+/// usually follows `"` or `:` rather than a space, while `task-runner`
+/// and `risk-free` contain `sk-` after a letter and must survive.
+fn redact_credentials(word: &str) -> String {
+    let bytes = word.as_bytes();
+    let mut out = String::with_capacity(word.len());
+    let mut i = 0;
+    while i < word.len() {
+        let at = &word[i..];
+        let at_a_boundary = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+        if at_a_boundary && CREDENTIAL_PREFIXES.iter().any(|p| at.starts_with(p)) {
+            out.push_str("[redacted]");
+            i += at
+                .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+                .unwrap_or(at.len());
+            continue;
+        }
+        let c = at.chars().next().expect("inside the string");
+        out.push(c);
+        i += c.len_utf8();
+    }
+    out
+}
+
 /// A provider's error body is text this process does not control, and it
 /// reaches both the interface and any log: control characters (ANSI
 /// escapes among them) are flattened, and anything shaped like a
@@ -830,16 +855,16 @@ fn first_line(text: &str, max: usize) -> String {
     let mut words: Vec<String> = Vec::new();
     let mut after_bearer = false;
     for word in flat.split_whitespace() {
-        let looks_like_a_key = after_bearer
-            || CREDENTIAL_PREFIXES
-                .iter()
-                .any(|p| word.trim_start_matches(['"', '\'']).starts_with(p));
-        after_bearer = word.eq_ignore_ascii_case("bearer");
-        words.push(if looks_like_a_key {
+        // Trailing punctuation only, and `ends_with`: the scheme name
+        // can arrive as `Bearer`, `Bearer:`, or glued to a JSON key as
+        // `{"authorization":"Bearer`.
+        let bare = word.trim_end_matches(|c: char| !c.is_alphanumeric());
+        words.push(if after_bearer {
             "[redacted]".to_string()
         } else {
-            word.to_string()
+            redact_credentials(word)
         });
+        after_bearer = bare.to_ascii_lowercase().ends_with("bearer");
     }
     let joined = words.join(" ");
     if joined.chars().count() <= max {
@@ -870,6 +895,35 @@ mod tests {
         let shown = first_line("bad \u{1b}[31mrequest\u{1b}[0m", 300);
         assert!(!shown.contains('\u{1b}'), "{shown:?}");
         assert!(shown.contains("request"), "{shown:?}");
+    }
+
+    #[test]
+    fn a_key_sitting_against_json_punctuation_is_still_redacted() {
+        for body in [
+            r#"{"api_key":"sk-abc123secret"}"#,
+            "key=sk-abc123secret",
+            r#"{"token":"gsk_abc123secret","x":1}"#,
+            "Authorization=Bearer nvapi-abc123secret",
+        ] {
+            let shown = first_line(body, 300);
+            assert!(
+                !shown.contains("abc123secret"),
+                "{body} leaked as {shown:?}"
+            );
+            assert!(shown.contains("[redacted]"), "{body} gave {shown:?}");
+        }
+    }
+
+    #[test]
+    fn a_bearer_token_is_redacted_even_when_the_word_carries_punctuation() {
+        let shown = first_line(r#"{"header":"Bearer" "abc123secret"}"#, 300);
+        assert!(!shown.contains("abc123secret"), "{shown:?}");
+    }
+
+    #[test]
+    fn an_ordinary_word_containing_a_key_prefix_survives() {
+        let shown = first_line("task-runner for risk-free retries", 300);
+        assert_eq!(shown, "task-runner for risk-free retries");
     }
 
     #[test]
