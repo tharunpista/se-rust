@@ -98,9 +98,52 @@ pub fn header_safe(secret: &str) -> bool {
     !secret.is_empty() && secret.is_ascii()
 }
 
+/// A credential that has been checked and may be placed in an HTTP
+/// header.
+///
+/// Constructible **only** through [`HeaderSafeKey::from_raw`], which
+/// runs `header_safe`. The provider request path takes `&HeaderSafeKey`,
+/// not `&str`, so a non-ASCII (or empty) value cannot reach
+/// `set("Authorization", ...)` by any path -- the compiler, not a
+/// reviewer, enforces it. This closes a verified defect: the earlier
+/// version of this module defined `header_safe` but never called it on
+/// the request path, so a non-ASCII key reached `ureq` and leaked back
+/// through the invalid-header error (I8).
+///
+/// No `Debug` or `Display`: a secret must never appear in a `{:?}` or a
+/// `{}`-formatted log line.
+pub struct HeaderSafeKey(String);
+
+impl HeaderSafeKey {
+    /// `Err` carries a one-line, value-free reason. Never contains any
+    /// part of `raw`.
+    pub fn from_raw(raw: &str) -> Result<Self, &'static str> {
+        if raw.is_empty() {
+            return Err("the credential is empty");
+        }
+        if !header_safe(raw) {
+            return Err(
+                "the credential contains non-ASCII characters and cannot be sent as an HTTP header",
+            );
+        }
+        Ok(HeaderSafeKey(raw.to_string()))
+    }
+
+    /// The exact header value, including the `Bearer ` prefix every
+    /// catalogued service uses.
+    pub fn as_bearer(&self) -> String {
+        format!("Bearer {}", self.0)
+    }
+}
+
 pub fn source(id: &str, env_var: &str) -> Source {
+    // Same `sanitise` rule as `load` -- otherwise a whitespace-only env
+    // var reports `Environment` (configured) while `load` returns None
+    // and falls through to the keyring, so the user thinks they
+    // scoped a key to this shell while the keyring key is actually
+    // being used. A silent account substitution.
     if std::env::var(env_var)
-        .map(|v| !v.is_empty())
+        .map(|v| !sanitise(&v).is_empty())
         .unwrap_or(false)
     {
         return Source::Environment;
@@ -271,6 +314,57 @@ mod tests {
 
         // Whitespace only is not a credential at all.
         std::env::set_var(&var, "   \n  ");
+        assert!(load(&id, &var).is_none());
+        std::env::remove_var(&var);
+    }
+
+    /// A sanity check that the token type's error messages never
+    /// contain any part of the input. The earlier version of this
+    /// module defined `header_safe` but never called it on the request
+    /// path, so a non-ASCII key reached ureq and leaked back through
+    /// the invalid-header error. `HeaderSafeKey::from_raw` is the one
+    /// place that check now lives, and this test guards it.
+    #[test]
+    fn a_header_safe_key_rejects_non_ascii_and_empty_without_echoing_the_value() {
+        // `HeaderSafeKey` deliberately has no `Debug` (I8: a secret
+        // must never appear in a `{:?}` rendering), so the result is
+        // `match`ed here rather than `.expect_err()`-ed, which would
+        // need `Debug` on the `Ok` side.
+        match HeaderSafeKey::from_raw("sk-caf\u{e9}-key") {
+            Err(err) => {
+                assert!(!err.contains("caf"), "{err}");
+                assert!(!err.contains('\u{e9}'), "{err}");
+                assert!(err.contains("non-ASCII"));
+            }
+            Ok(_) => panic!("non-ASCII must be refused"),
+        }
+        match HeaderSafeKey::from_raw("") {
+            Err(err) => assert!(!err.is_empty()),
+            Ok(_) => panic!("empty must be refused"),
+        }
+        // A good key builds a header value with a deterministic prefix
+        // and no surprise additions.
+        let Ok(key) = HeaderSafeKey::from_raw("sk-ascii") else {
+            panic!("ascii is fine");
+        };
+        assert_eq!(key.as_bearer(), "Bearer sk-ascii");
+    }
+
+    /// Regression for a confirmed defect in the previous release:
+    /// `source()` tested the raw env value while `load()` sanitised it,
+    /// so a whitespace-only env var reported Environment-configured
+    /// while the keyring key was actually used. A silent account
+    /// substitution where the user thought they had scoped a shell key.
+    #[test]
+    fn a_whitespace_only_env_var_is_not_reported_as_an_env_credential() {
+        let _guard = test_lock();
+        let id = scratch_id("source-blank-env");
+        let var = format!("SE_TEST_BLANK_{}", std::process::id());
+        std::env::set_var(&var, "   \n\t  ");
+        // load() returns None (sanitise strips the whitespace), so
+        // source() must agree -- otherwise the UI shows one state and
+        // the next call uses a different one.
+        assert_eq!(source(&id, &var), Source::None);
         assert!(load(&id, &var).is_none());
         std::env::remove_var(&var);
     }

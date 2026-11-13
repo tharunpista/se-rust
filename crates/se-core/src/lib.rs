@@ -33,5 +33,10 @@ pub use sink::{Disconnected, TurnSink};
 // Re-exported so an interface needs one dependency, not two, for the
 // common types. The protocol crate stays separately usable for anything
 // that only wants the vocabulary (a log reader, a replay tool).
+//
+// `se-provider` is deliberately **not** re-exported: a reachable
+// `se_core::provider::Registry` from `se-tui` would mean the UI could
+// call blocking `stream()` on its own thread, violating I1. Any crate
+// that genuinely needs the provider depends on `se-provider` directly
+// (the binary does; the UI does not).
 pub use se_protocol as protocol;
-pub use se_provider as provider;

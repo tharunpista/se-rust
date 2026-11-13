@@ -37,6 +37,11 @@ fn agent() -> &'static ureq::Agent {
         ureq::AgentBuilder::new()
             .timeout_connect(CONNECT_TIMEOUT)
             .timeout_read(IDLE_TIMEOUT)
+            // A 302 from a provider can carry Authorization to another
+            // host. Never follow a redirect on an authenticated request.
+            // The provider's own canonical endpoint is the only URL that
+            // ever receives a credential.
+            .redirects(0)
             .build()
     })
 }
@@ -188,10 +193,22 @@ impl OpenAiCompatible {
         }
     }
 
-    fn api_key(&self) -> Option<String> {
-        match &self.fixed_key {
+    /// The credential, as a value usable in an HTTP header.
+    ///
+    /// Returns `Err` if a credential exists but cannot be placed in a
+    /// header (non-ASCII, empty after sanitising). Reporting that
+    /// explicitly rather than "no credential" is what lets the user fix
+    /// a paste-corrupted key without reading the keyring.
+    fn api_key(&self) -> Result<Option<credentials::HeaderSafeKey>, ProviderError> {
+        let raw = match &self.fixed_key {
             Some(k) => Some(k.clone()),
             None => credentials::load(self.service.id, self.service.key_var),
+        };
+        match raw {
+            None => Ok(None),
+            Some(r) => credentials::HeaderSafeKey::from_raw(&r)
+                .map(Some)
+                .map_err(|why| ProviderError::NotConfigured(format!("{}: {why}", self.service.id))),
         }
     }
 
@@ -219,18 +236,37 @@ impl OpenAiCompatible {
                 self.service.id, self.service.base_url_var
             ))
         })?;
+        // Any service that sends a credential must do so over TLS. An
+        // attacker-set `*_BASE_URL=http://attacker/v1` would otherwise
+        // exfiltrate the stored key on the next turn, with no prompt.
+        // Loopback is exempted so local proxies and the raw-socket mock
+        // servers used in tests continue to work.
+        if self.service.key_required && !is_safe_origin(&base) {
+            return Err(ProviderError::NotConfigured(format!(
+                "{} requires https:// (or a loopback http:// address); refusing to send a credential over an insecure URL",
+                self.service.id
+            )));
+        }
         Ok(format!("{base}{path}"))
     }
 
     /// The credential, if this service needs one.
     ///
-    /// `Ok(None)` is a valid, fully-configured state for a service with
-    /// `key_required: false` (a local Ollama). Callers must then send no
-    /// `Authorization` header at all.
-    fn key_or_error(&self) -> Result<Option<String>, ProviderError> {
-        match self.api_key() {
-            Some(key) => Ok(Some(key)),
-            None if !self.service.key_required => Ok(None),
+    /// Short-circuits on `key_required: false` *before* `api_key()` is
+    /// consulted at all. That is the fix for a verified credential-
+    /// disclosure defect: Ollama used to receive `Authorization: Bearer
+    /// <whatever>` if a stray `OLLAMA_API_KEY` happened to be set, and
+    /// sending a nonsense bearer to `http://localhost:11434` is strictly
+    /// worse than sending none -- a local process credential leak.
+    ///
+    /// `Ok(None)` is a valid, fully-configured state. Callers must then
+    /// send no `Authorization` header at all.
+    fn key_or_error(&self) -> Result<Option<credentials::HeaderSafeKey>, ProviderError> {
+        if !self.service.key_required {
+            return Ok(None);
+        }
+        match self.api_key()? {
+            Some(k) => Ok(Some(k)),
             None => Err(ProviderError::NotConfigured(format!(
                 "no credential for {} — run `se connect {}`, or set {}",
                 self.service.id, self.service.id, self.service.key_var
@@ -474,7 +510,7 @@ impl ModelProvider for OpenAiCompatible {
             .set("Content-Type", "application/json")
             .set("Accept", "text/event-stream");
         if let Some(key) = &key {
-            request = request.set("Authorization", &format!("Bearer {key}"));
+            request = request.set("Authorization", &key.as_bearer());
         }
         let response = request.send_json(body);
 
@@ -574,7 +610,7 @@ impl ModelProvider for OpenAiCompatible {
         let url = self.endpoint("/models")?;
         let mut request = agent().get(&url).timeout(METADATA_TIMEOUT);
         if let Some(key) = &key {
-            request = request.set("Authorization", &format!("Bearer {key}"));
+            request = request.set("Authorization", &key.as_bearer());
         }
         let response = request.call();
 
@@ -597,6 +633,32 @@ impl ModelProvider for OpenAiCompatible {
 }
 
 /// Trims a provider's error body to something displayable, on one line.
+/// Whether this URL may receive a credential.
+///
+/// `https://` is always safe. `http://` is accepted only for a loopback
+/// host, so a local Ollama and the raw-socket mock servers used in
+/// tests work -- but not a hostile `http://attacker.example.com/v1`
+/// that an attacker-set `*_BASE_URL` could point at.
+fn is_safe_origin(url: &str) -> bool {
+    if url.starts_with("https://") {
+        return true;
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    // Authority = everything up to the first path separator.
+    let authority = rest.split('/').next().unwrap_or("");
+    // Strip user-info ("user:pass@host").
+    let hostport = authority.rsplit('@').next().unwrap_or("");
+    // Bracketed IPv6 ("[::1]:port") must not split on the inner colons.
+    let host = if let Some(bracketed) = hostport.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or("")
+    } else {
+        hostport.split(':').next().unwrap_or("")
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
 fn first_line(text: &str, max: usize) -> String {
     let flat: String = text
         .chars()
@@ -1111,8 +1173,109 @@ mod tests {
         );
     }
 
-    /// Ollama in the real catalogue must be keyless; everything else
-    /// must still require a credential.
+    /// Regression for a confirmed credential-disclosure defect:
+    /// `api_key()` was consulted before `key_required`, so a stray
+    /// `OLLAMA_API_KEY` in the environment made SE send a bearer token
+    /// to a local Ollama. A nonsense `Bearer` to `http://localhost:11434`
+    /// is strictly worse than sending none -- a local process
+    /// credential leak. `key_or_error` must short-circuit on
+    /// `key_required: false` before anything reads the environment.
+    #[test]
+    fn a_keyless_service_never_reads_the_key_var_at_all() {
+        const KEYLESS: Service = Service {
+            id: "keyless-ordering",
+            display_name: "Keyless",
+            key_var: "SE_TEST_KEYLESS_ORDERING_KEY",
+            default_base_url: "",
+            base_url_var: "SE_TEST_KEYLESS_ORDERING_BASE",
+            key_required: false,
+        };
+        const BODY: &str = "data: [DONE]\n\n";
+        let (base, requests) = serve("HTTP/1.1 200 OK", "text/event-stream", BODY);
+
+        // A hostile env var is explicitly set. If the fix has regressed
+        // it will be read and forwarded.
+        std::env::set_var(KEYLESS.key_var, "nvapi-this-must-never-leave-the-machine");
+        let p = OpenAiCompatible {
+            service: KEYLESS,
+            fixed_key: None,
+            fixed_base_url: Some(base),
+        };
+        p.stream(&request(), &|| false, &mut |_| true).unwrap();
+        let seen = requests.lock().unwrap().join("\n");
+        assert!(
+            !seen.to_lowercase().contains("authorization"),
+            "a keyless service must not send any Authorization header: {seen}"
+        );
+        assert!(
+            !seen.contains("nvapi-this-must-never-leave-the-machine"),
+            "the stray key must not appear anywhere in the request: {seen}"
+        );
+        std::env::remove_var(KEYLESS.key_var);
+    }
+
+    /// Any service that sends a credential must do so over TLS, or over
+    /// a loopback address (for local models and the mock servers used
+    /// in these tests). Regression for a verified credential-exfil
+    /// path: `OPENAI_BASE_URL=http://attacker/v1` would otherwise send
+    /// the stored key to an attacker-controlled host on the next turn.
+    #[test]
+    fn a_credential_bearing_service_refuses_http_to_a_non_loopback_host() {
+        let p =
+            OpenAiCompatible::with_fixed(TEST_SERVICE, "sk-test", "http://attacker.example.com/v1");
+        let err = p
+            .stream(&request(), &|| false, &mut |_| true)
+            .expect_err("http:// to a non-loopback host must be refused");
+        match err {
+            ProviderError::NotConfigured(detail) => {
+                assert!(detail.contains("https"), "{detail}");
+                assert!(detail.contains("loopback"), "{detail}");
+                assert!(
+                    !detail.contains("sk-test"),
+                    "the key must not appear: {detail}"
+                );
+            }
+            other => panic!("expected NotConfigured, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn https_and_loopback_http_are_both_accepted() {
+        // Loopback http is permitted -- the tests themselves rely on it.
+        assert!(is_safe_origin("http://127.0.0.1:8080"));
+        assert!(is_safe_origin("http://localhost/v1"));
+        assert!(is_safe_origin("http://[::1]:11434"));
+        // Any https destination is safe.
+        assert!(is_safe_origin("https://api.openai.com/v1"));
+        // Non-loopback http and other schemes are not.
+        assert!(!is_safe_origin("http://attacker.example.com/v1"));
+        assert!(!is_safe_origin("http://127.0.0.1.attacker.com/"));
+        assert!(!is_safe_origin("file:///etc/passwd"));
+        assert!(!is_safe_origin("ftp://example.com/"));
+        assert!(!is_safe_origin(""));
+    }
+
+    /// Guards against a regression of the "dead `header_safe`" defect:
+    /// a non-ASCII credential must not reach `ureq` and must not leak
+    /// back through a transport error.
+    #[test]
+    fn a_non_ascii_credential_is_refused_before_the_network_is_touched() {
+        let p =
+            OpenAiCompatible::with_fixed(TEST_SERVICE, "sk-caf\u{e9}-key", "http://127.0.0.1:1");
+        let err = p
+            .stream(&request(), &|| false, &mut |_| true)
+            .expect_err("non-ASCII must be refused");
+        match err {
+            ProviderError::NotConfigured(detail) => {
+                assert!(detail.contains("non-ASCII"), "{detail}");
+                assert!(!detail.contains("caf"), "key must not appear: {detail}");
+            }
+            // Must not be a Transport error, which is how the pre-fix
+            // code leaked the header value back through ureq.
+            other => panic!("expected NotConfigured, got {other:?}"),
+        }
+    }
+
     #[test]
     fn only_ollama_is_keyless_in_the_catalogue() {
         for s in CATALOGUE {
