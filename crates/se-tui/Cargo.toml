@@ -9,5 +9,6 @@ description = "SE's terminal interface: an event consumer. Performs no I/O other
 [dependencies]
 se-protocol = { path = "../se-protocol" }
 se-core = { path = "../se-core" }
+se-command = { path = "../se-command" }
 ratatui = { workspace = true }
 crossterm = { workspace = true }

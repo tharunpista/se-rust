@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/se-protocol",
     "crates/se-provider",
+    "crates/se-command",
     "crates/se-core",
     "crates/se-tui",
     "crates/se",

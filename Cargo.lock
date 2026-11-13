@@ -825,11 +825,16 @@ dependencies = [
  "clap",
  "crossterm",
  "ratatui",
+ "se-command",
  "se-core",
  "se-protocol",
  "se-provider",
  "se-tui",
 ]
+
+[[package]]
+name = "se-command"
+version = "0.1.0"
 
 [[package]]
 name = "se-core"
@@ -863,6 +868,7 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "ratatui",
+ "se-command",
  "se-core",
  "se-protocol",
 ]

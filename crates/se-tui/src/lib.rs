@@ -21,6 +21,7 @@
 
 pub mod composer;
 pub mod input;
+pub mod picker;
 pub mod render;
 pub mod state;
 
@@ -140,6 +141,23 @@ fn dispatch(state: &mut AppState, core: &CoreHandle, action: Action) -> bool {
             }
             true
         }
+        Action::PickerAccept => {
+            // Charter §3.1: a command is never submitted to the model
+            // as a prompt. The composer is cleared here and no
+            // `core.submit` happens on this path at all, which is the
+            // structural guarantee -- not a string check before
+            // sending.
+            if let Some(path) = state.highlighted_command_path() {
+                state.picker.close();
+                state.composer.clear();
+                run_command(state, &path);
+            } else {
+                // Nothing matched; leave the draft alone so the user
+                // can correct it rather than losing what they typed.
+                state.picker.close();
+            }
+            true
+        }
         Action::Decide(allow) => {
             if let Some(call) = state.awaiting_approval() {
                 core.approve(ApprovalDecision {
@@ -155,6 +173,60 @@ fn dispatch(state: &mut AppState, core: &CoreHandle, action: Action) -> bool {
             apply_local(state, &action);
             true
         }
+    }
+}
+
+/// Executes a resolved slash command.
+///
+/// Phase 1 scope: every command resolves and reports honestly. A
+/// command whose subsystem is not built yet says so with the reason
+/// from its builtin definition, which is charter §1's requirement that
+/// nothing appear to work when it does not. No command on this path
+/// reaches the model as a prompt.
+pub fn run_command(state: &mut AppState, path: &str) {
+    let Ok(spec) = state.commands.resolve(path) else {
+        state.push(Entry::Notice(format!("unknown command: /{path}")));
+        return;
+    };
+    let id = spec.id.clone();
+    match se_command::builtins::availability(&id) {
+        Some(se_command::builtins::Availability::Ready) => match id.as_str() {
+            "exit" => state.should_quit = true,
+            "help" | "commands" => {
+                let mut lines = vec!["commands:".to_string()];
+                for category in se_command::builtins::CATEGORIES {
+                    let in_category: Vec<&se_command::CommandSpec> = state
+                        .commands
+                        .query("")
+                        .into_iter()
+                        .filter(|c| c.category == *category)
+                        .collect();
+                    if in_category.is_empty() {
+                        continue;
+                    }
+                    lines.push(format!("  {category}"));
+                    for c in in_category {
+                        lines.push(format!("    /{:<12} {}", c.path, c.description));
+                    }
+                }
+                state.push(Entry::Notice(lines.join("\n")));
+            }
+            // Ready, but its panel is Phase 1's honest-empty state: the
+            // registry and providers exist, the browser UI does not.
+            other => state.push(Entry::Notice(format!(
+                "/{other} is available but its panel is not built yet — \
+                 use the equivalent `se {other}` subcommand for now"
+            ))),
+        },
+        Some(se_command::builtins::Availability::NotImplemented(reason))
+        | Some(se_command::builtins::Availability::Unconfigured(reason)) => {
+            state.push(Entry::Notice(format!(
+                "/{path} is not available yet: {reason}"
+            )));
+        }
+        None => state.push(Entry::Notice(format!(
+            "/{path} has no availability record — this is a bug in the builtin table"
+        ))),
     }
 }
 
@@ -399,5 +471,108 @@ mod tests {
             crossterm::event::KeyCode::Char(c),
             crossterm::event::KeyModifiers::CONTROL,
         )
+    }
+
+    #[test]
+    fn accepting_a_command_never_submits_it_to_the_model() {
+        // The charter's hardest slash-command requirement: `/models`
+        // must not be sent as a prompt. Proven against a real core --
+        // if the command reached `submit`, the echo runner would put
+        // the text in the transcript as a reply and the core would
+        // report itself busy.
+        let core = se_core::start(EchoRunner::instant());
+        let mut state = AppState::new();
+        for c in "/models".chars() {
+            crate::input::apply_local(&mut state, &Action::InsertChar(c));
+        }
+        assert!(state.picker.is_open());
+        dispatch(&mut state, &core, Action::PickerAccept);
+
+        assert!(!core.is_busy(), "no turn may have been submitted");
+        pump(&mut state, &core);
+        // Nothing the user "said" and nothing the model "replied".
+        let has_user_turn = state.transcript.iter().any(|e| matches!(e, Entry::User(_)));
+        assert!(!has_user_turn, "the command must not appear as a user turn");
+        // And the composer was cleared rather than left dirty.
+        assert!(state.composer.is_empty());
+        core.shutdown();
+    }
+
+    #[test]
+    fn an_ordinary_prompt_containing_a_slash_still_reaches_the_model() {
+        // The guard above must not have made plain prompts unsendable.
+        let core = se_core::start(EchoRunner::instant());
+        let mut state = AppState::new();
+        let text = "please read src/lib.rs";
+        for c in text.chars() {
+            crate::input::apply_local(&mut state, &Action::InsertChar(c));
+        }
+        assert!(!state.picker.is_open());
+        dispatch(&mut state, &core, Action::Submit(text.to_string()));
+        pump_until_idle(&mut state, &core, Duration::from_secs(2));
+        assert!(
+            state
+                .transcript
+                .iter()
+                .any(|e| matches!(e, Entry::User(t) if t.contains("src/lib.rs"))),
+            "a prompt with a path in it is not a command"
+        );
+        core.shutdown();
+    }
+
+    #[test]
+    fn an_unavailable_command_explains_why_instead_of_failing_silently() {
+        let core = se_core::start(EchoRunner::instant());
+        let mut state = AppState::new();
+        // `/agents` is honest-unavailable until the Phase 3 loader.
+        for c in "/agents".chars() {
+            crate::input::apply_local(&mut state, &Action::InsertChar(c));
+        }
+        dispatch(&mut state, &core, Action::PickerAccept);
+        let notice = state
+            .transcript
+            .iter()
+            .find_map(|e| match e {
+                Entry::Notice(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("an unavailable command must say something");
+        assert!(notice.contains("not available yet"), "got {notice:?}");
+        assert!(
+            notice.contains("Phase 3"),
+            "the reason must be specific: {notice:?}"
+        );
+        core.shutdown();
+    }
+
+    #[test]
+    fn help_lists_every_registered_command_grouped_by_category() {
+        // /help is a projection of the registry, so this also pins that
+        // no command can exist in the registry and be missing from help.
+        let mut state = AppState::new();
+        run_command(&mut state, "help");
+        let notice = state
+            .transcript
+            .iter()
+            .find_map(|e| match e {
+                Entry::Notice(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("help must print something");
+        for spec in state.commands.query("") {
+            assert!(
+                notice.contains(&format!("/{}", spec.path)),
+                "/{} is registered but missing from /help",
+                spec.path
+            );
+        }
+    }
+
+    #[test]
+    fn exit_quits_through_the_command_path() {
+        let mut state = AppState::new();
+        assert!(!state.should_quit);
+        run_command(&mut state, "exit");
+        assert!(state.should_quit);
     }
 }

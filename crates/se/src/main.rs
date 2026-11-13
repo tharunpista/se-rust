@@ -65,6 +65,12 @@ enum Command {
     Models { provider: Option<String> },
     /// Report what this build can and cannot do, honestly.
     Doctor,
+    /// List every slash command the interface offers.
+    ///
+    /// Projected from the same `se-command` registry the TUI picker and
+    /// `/help` read, so the two surfaces cannot disagree about what
+    /// exists (charter §12).
+    Commands,
 }
 
 fn main() -> std::process::ExitCode {
@@ -72,6 +78,10 @@ fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
 
     match &cli.command {
+        Some(Command::Commands) => {
+            commands();
+            std::process::ExitCode::SUCCESS
+        }
         Some(Command::Exec { request }) => exec(&cli, request),
         Some(Command::Connect { provider, from_env }) => {
             connect(provider.as_deref(), from_env.as_deref())
@@ -448,6 +458,54 @@ fn models(cli: &Cli, provider: Option<&str>) -> std::process::ExitCode {
             eprintln!("se: {e}");
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+/// Prints the slash-command surface, grouped by category.
+///
+/// Reads `se_command::builtins::registry_with_builtins()` -- the same
+/// construction the TUI uses -- so this output and the picker's list are
+/// two projections of one source rather than two lists to keep in sync.
+fn commands() {
+    let registry = se_command::builtins::registry_with_builtins();
+    println!(
+        "SE slash commands (also available in the TUI by typing `/`)
+"
+    );
+    for category in se_command::builtins::CATEGORIES {
+        let in_category: Vec<&se_command::CommandSpec> = registry
+            .query("")
+            .into_iter()
+            .filter(|c| c.category == *category)
+            .collect();
+        if in_category.is_empty() {
+            continue;
+        }
+        println!("{category}:");
+        for spec in in_category {
+            // State is reported, never implied: a command that cannot
+            // run yet says so here exactly as it does in the TUI.
+            let state = match se_command::builtins::availability(&spec.id) {
+                Some(se_command::builtins::Availability::Ready) => String::new(),
+                Some(se_command::builtins::Availability::NotImplemented(r))
+                | Some(se_command::builtins::Availability::Unconfigured(r)) => {
+                    format!("  [unavailable: {r}]")
+                }
+                None => "  [no availability record]".to_string(),
+            };
+            let aliases = if spec.aliases.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", spec.aliases.join(", "))
+            };
+            println!(
+                "  /{:<13}{:<58}{}",
+                format!("{}{}", spec.path, aliases),
+                spec.description,
+                state
+            );
+        }
+        println!();
     }
 }
 

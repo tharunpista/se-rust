@@ -47,6 +47,18 @@ impl Composer {
         self.cursor = 0;
     }
 
+    /// Moves the cursor to a byte offset. Clamped into range and
+    /// snapped to the next `char` boundary, because the invariant that
+    /// the cursor is always on a boundary is what keeps every slicing
+    /// operation in this type panic-free.
+    pub fn set_cursor(&mut self, offset: usize) {
+        let mut offset = offset.min(self.text.len());
+        while offset < self.text.len() && !self.text.is_char_boundary(offset) {
+            offset += 1;
+        }
+        self.cursor = offset;
+    }
+
     /// Takes the contents, leaving the composer empty.
     pub fn take(&mut self) -> String {
         self.cursor = 0;

@@ -75,6 +75,13 @@ const CTRL_C_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500
 pub struct AppState {
     pub transcript: Vec<Entry>,
     pub composer: crate::composer::Composer,
+    /// The `/` command picker. Composer state, not a separate dialog:
+    /// it holds only a trigger offset and a highlight, and the
+    /// candidate rows are recomputed from `commands` each frame.
+    pub picker: crate::picker::Picker,
+    /// The single command metadata source both the picker and `/help`
+    /// read, so the two cannot disagree about what exists.
+    pub commands: se_command::Registry,
     pub activity: Activity,
     pub status: String,
     pub should_quit: bool,
@@ -107,6 +114,8 @@ impl Default for AppState {
         AppState {
             transcript: Vec::new(),
             composer: crate::composer::Composer::new(),
+            picker: crate::picker::Picker::default(),
+            commands: se_command::builtins::registry_with_builtins(),
             activity: Activity::Idle,
             status: String::new(),
             should_quit: false,
@@ -193,6 +202,52 @@ impl AppState {
 
     /// Clamps `scroll` so it can never go past the oldest content. Uses
     /// the real measurements the renderer recorded.
+    /// The commands the picker should currently show, recomputed from
+    /// the registry and the live query every frame.
+    ///
+    /// Deliberately not cached: a stored candidate list is how "what
+    /// is highlighted" and "what Enter runs" drift apart.
+    pub fn picker_candidates(&self) -> Vec<&se_command::CommandSpec> {
+        match self
+            .picker
+            .query(self.composer.text(), self.composer.cursor())
+        {
+            Some(query) => self.commands.query(query),
+            None => Vec::new(),
+        }
+    }
+
+    /// The canonical path of the highlighted candidate, if any.
+    pub fn highlighted_command_path(&self) -> Option<String> {
+        let candidates = self.picker_candidates();
+        if candidates.is_empty() {
+            return None;
+        }
+        // The stored index is clamped on read rather than on write,
+        // because the list shrinks as the user types and a stored
+        // index would otherwise point past the end for one frame.
+        let idx = self.picker.selected().min(candidates.len() - 1);
+        Some(candidates[idx].path.clone())
+    }
+
+    /// Replaces the partially-typed command word with `path`, leaving
+    /// the leading `/` in place and the cursor after the inserted text.
+    pub fn replace_command_word(&mut self, path: &str) {
+        let Some(trigger) = self.picker.trigger() else {
+            return;
+        };
+        let cursor = self.composer.cursor();
+        let start = trigger + 1;
+        if cursor < start || cursor > self.composer.text().len() {
+            return;
+        }
+        let mut text = self.composer.text().to_string();
+        text.replace_range(start..cursor, path);
+        let new_cursor = start + path.len();
+        self.composer.set(text);
+        self.composer.set_cursor(new_cursor);
+    }
+
     pub fn clamp_scroll(&mut self) {
         let max = self.last_total_rows.saturating_sub(self.last_viewport_rows);
         if (self.scroll as usize) > max {

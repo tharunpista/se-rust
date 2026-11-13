@@ -67,6 +67,86 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     draw_transcript(f, chunks[2], state);
     draw_composer(f, chunks[3], state);
     draw_help_bar(f, chunks[4], state);
+    // Drawn last, over the transcript, so opening the picker never
+    // reflows the conversation or moves the composer under the user's
+    // cursor.
+    if state.picker.is_open() {
+        draw_picker(f, chunks[2], state);
+    }
+}
+
+/// The `/` command picker, as an overlay anchored to the bottom of the
+/// transcript area -- next to the composer, where the user is looking.
+fn draw_picker(f: &mut Frame, transcript_area: Rect, state: &AppState) {
+    let candidates = state.picker_candidates();
+    // Cap the visible rows so a long list cannot cover the whole
+    // conversation, and keep the highlighted row in view.
+    const MAX_ROWS: usize = 8;
+    let visible = candidates.len().min(MAX_ROWS);
+    let height = (visible as u16)
+        .saturating_add(2)
+        .min(transcript_area.height);
+    if height < 3 {
+        return;
+    }
+    let area = Rect {
+        x: transcript_area.x,
+        y: transcript_area.y + transcript_area.height - height,
+        width: transcript_area.width,
+        height,
+    };
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::LAVENDER).bg(theme::CHARCOAL))
+            .style(Style::default().bg(theme::CHARCOAL)),
+        area,
+    );
+
+    if candidates.is_empty() {
+        let inner = Rect {
+            x: area.x + 1,
+            y: area.y + 1,
+            width: area.width.saturating_sub(2),
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "no command matches — Esc to keep typing",
+                theme::muted(),
+            )))
+            .style(theme::base()),
+            inner,
+        );
+        return;
+    }
+
+    let selected = state.picker.selected().min(candidates.len() - 1);
+    // Scroll the window so the highlight is always inside it.
+    let first = selected.saturating_sub(MAX_ROWS - 1);
+    let mut lines: Vec<Line> = Vec::with_capacity(visible);
+    for (offset, spec) in candidates.iter().skip(first).take(visible).enumerate() {
+        let idx = first + offset;
+        let is_selected = idx == selected;
+        let marker = if is_selected { "▌" } else { " " };
+        let name_style = if is_selected {
+            theme::accent_bold()
+        } else {
+            theme::base()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, Style::default().fg(theme::LAVENDER)),
+            Span::styled(format!(" /{:<13}", spec.path), name_style),
+            Span::styled(spec.description.clone(), theme::muted()),
+        ]));
+    }
+    let inner = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    f.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 }
 
 fn composer_height(state: &AppState, width: u16) -> u16 {
@@ -425,9 +505,16 @@ fn draw_composer(f: &mut Frame, area: Rect, state: &AppState) {
 fn draw_help_bar(f: &mut Frame, area: Rect, state: &AppState) {
     let hint = if state.awaiting_approval().is_some() {
         "y Allow   n Deny   Ctrl+C Exit"
+    } else if state.picker.is_open() {
+        // While the picker owns the keyboard, advertise its keys rather
+        // than the composer's -- the keybinding hints and the actual
+        // keymap must not disagree (charter §4).
+        "↑↓ Select   Enter Run   Tab Complete   Esc Cancel"
     } else {
         match state.activity {
-            Activity::Idle => "Enter Send   Shift+Enter Newline   Ctrl+D Diag   Ctrl+C Exit",
+            Activity::Idle => {
+                "/ Commands   Enter Send   Alt+Enter Newline   Ctrl+D Diag   Ctrl+C Exit"
+            }
             Activity::Working { .. } => "Esc Interrupt   Ctrl+C Exit   PgUp/PgDn Scroll",
             Activity::AwaitingApproval { .. } => unreachable!("handled above"),
         }
