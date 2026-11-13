@@ -59,6 +59,65 @@ fn entry(id: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new(SERVICE, id).map_err(|e| e.to_string())
 }
 
+/// A separate keyring row recording which origin a credential may be
+/// sent to. `#origin` cannot collide with a real provider id (ids are
+/// alphanumeric), and an origin is not a secret -- it is stored for
+/// detection, not confidentiality.
+fn origin_entry(id: &str) -> Result<keyring::Entry, String> {
+    entry(&format!("{id}#origin"))
+}
+
+/// Normalises a URL to its origin: scheme + authority (host and port,
+/// if given), lowercased. Enough to detect "this credential is now
+/// being sent somewhere new" without caring about the request path.
+pub fn origin_of(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let authority = rest.split('/').next().unwrap_or("");
+    if authority.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}://{}",
+        scheme.to_ascii_lowercase(),
+        authority.to_ascii_lowercase()
+    ))
+}
+
+/// Records the origin a newly stored credential is pinned to.
+fn pin_origin(id: &str, origin: &str) -> Result<(), String> {
+    origin_entry(id)?
+        .set_password(origin)
+        .map_err(|e| e.to_string())
+}
+
+fn pinned_origin(id: &str) -> Option<String> {
+    origin_entry(id).ok()?.get_password().ok()
+}
+
+/// Checked before a stored credential is attached to a request.
+///
+/// Fix for a verified exfiltration path (E2): a credential used to be
+/// keyed only by provider id, with no record of where it was meant to
+/// go. Changing `*_BASE_URL` -- including by an attacker who can set
+/// one environment variable -- silently redirected an already-stored
+/// key to a new host on the very next request, no prompt. A credential
+/// now carries the origin it was pinned to when stored; a later mismatch
+/// is refused rather than silently honoured.
+///
+/// No pin recorded (a keyless service, or a credential stored before
+/// this check existed) is not a mismatch -- `store` pins the origin
+/// going forward, so this converges rather than locking existing users
+/// out.
+pub fn check_origin(id: &str, current_origin: &str) -> Result<(), String> {
+    match pinned_origin(id) {
+        None => Ok(()),
+        Some(pinned) if pinned == current_origin => Ok(()),
+        Some(pinned) => Err(format!(
+            "this credential is pinned to {pinned}, but the configured endpoint is now {current_origin} — run `se connect` again to confirm and re-pin it"
+        )),
+    }
+}
+
 /// Reads a credential: environment first, then the secure store.
 ///
 /// Consulted on every call by design -- see the module note.
@@ -94,8 +153,16 @@ fn sanitise(raw: &str) -> String {
 ///
 /// Checked before building the header so the failure is a clear message
 /// rather than a transport error that might echo the value.
+///
+/// Rejects control characters (including CR/LF) as well as non-ASCII.
+/// `sanitise` already strips these before a key reaches `from_raw` on
+/// every production path, but `HeaderSafeKey::from_raw` is a public
+/// constructor -- a future caller that builds one from an un-sanitised
+/// source must not be able to smuggle a header-injection payload
+/// (`"key\r\nX-Injected: 1"` is ASCII) past a check whose name claims
+/// the value is header-safe. The type should guarantee its own name.
 pub fn header_safe(secret: &str) -> bool {
-    !secret.is_empty() && secret.is_ascii()
+    !secret.is_empty() && secret.is_ascii() && !secret.chars().any(|c| c.is_control())
 }
 
 /// A credential that has been checked and may be placed in an HTTP
@@ -163,7 +230,14 @@ const VISIBILITY_PAUSE: std::time::Duration = std::time::Duration::from_millis(1
 ///
 /// See the module note: returning as soon as the OS call succeeds made a
 /// subsequent validation fail intermittently on Windows.
-pub fn store(id: &str, secret: &str) -> Result<(), String> {
+///
+/// `origin`, when given, is pinned (E2): every later use of this
+/// credential is checked against it via [`check_origin`], and a mismatch
+/// is refused rather than silently honoured. Pass `None` only for a
+/// service that genuinely has no fixed endpoint to pin (there are
+/// none in the current catalogue -- every credential-bearing service
+/// has a configured endpoint by the time `store` is called).
+pub fn store(id: &str, secret: &str, origin: Option<&str>) -> Result<(), String> {
     if secret.trim().is_empty() {
         return Err("refusing to store an empty credential".to_string());
     }
@@ -172,6 +246,9 @@ pub fn store(id: &str, secret: &str) -> Result<(), String> {
 
     for _ in 0..VISIBILITY_ATTEMPTS {
         if entry.get_password().ok().as_deref() == Some(secret) {
+            if let Some(origin) = origin {
+                pin_origin(id, origin)?;
+            }
             return Ok(());
         }
         std::thread::sleep(VISIBILITY_PAUSE);
@@ -181,9 +258,16 @@ pub fn store(id: &str, secret: &str) -> Result<(), String> {
     ))
 }
 
-/// Removes a credential. Absent is success: the caller asked for "no
-/// credential stored", which is the end state either way.
+/// Removes a credential, and the origin it was pinned to. Absent is
+/// success: the caller asked for "no credential stored", which is the
+/// end state either way.
 pub fn delete(id: &str) -> Result<(), String> {
+    // Best-effort: a missing or already-absent pin must never block
+    // removing the credential itself.
+    let _ = origin_entry(id).and_then(|e| match e.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    });
     match entry(id)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(e.to_string()),
@@ -234,7 +318,7 @@ mod tests {
         assert_eq!(source(&id, unset), Source::None);
         assert!(load(&id, unset).is_none());
 
-        store(&id, "secret-value").unwrap();
+        store(&id, "secret-value", None).unwrap();
         assert_eq!(source(&id, unset), Source::SecureStore);
         assert_eq!(load(&id, unset).as_deref(), Some("secret-value"));
 
@@ -250,7 +334,7 @@ mod tests {
         // so an unconfirmed write made a good key look rejected.
         let _guard = test_lock();
         let id = scratch_id("visibility");
-        store(&id, "just-written").unwrap();
+        store(&id, "just-written", None).unwrap();
         assert_eq!(
             load(&id, "SE_TEST_VAR_UNSET_ON_PURPOSE").as_deref(),
             Some("just-written"),
@@ -264,7 +348,7 @@ mod tests {
         let _guard = test_lock();
         let id = scratch_id("precedence");
         let var = format!("SE_TEST_VAR_{}", std::process::id());
-        store(&id, "from-store").unwrap();
+        store(&id, "from-store", None).unwrap();
 
         std::env::set_var(&var, "from-env");
         assert_eq!(source(&id, &var), Source::Environment);
@@ -292,8 +376,8 @@ mod tests {
     fn an_empty_credential_is_refused_rather_than_stored() {
         let _guard = test_lock();
         let id = scratch_id("empty");
-        assert!(store(&id, "   ").is_err());
-        assert!(store(&id, "").is_err());
+        assert!(store(&id, "   ", None).is_err());
+        assert!(store(&id, "", None).is_err());
         assert_eq!(source(&id, "SE_TEST_VAR_UNSET_ON_PURPOSE"), Source::None);
     }
 
@@ -367,6 +451,88 @@ mod tests {
         assert_eq!(source(&id, &var), Source::None);
         assert!(load(&id, &var).is_none());
         std::env::remove_var(&var);
+    }
+
+    /// E2: a credential pinned to one origin at store time must be
+    /// refused when the configured endpoint later points somewhere
+    /// else. This is the fix for a live exfiltration path: an
+    /// attacker-set `*_BASE_URL` env var used to silently redirect an
+    /// already-stored key to a new host on the very next request.
+    #[test]
+    fn a_credential_is_pinned_and_a_later_origin_change_is_refused() {
+        let _guard = test_lock();
+        let id = scratch_id("origin-pin");
+        store(&id, "secret-value", Some("https://api.example.com")).unwrap();
+
+        // Same origin: fine.
+        assert!(check_origin(&id, "https://api.example.com").is_ok());
+
+        // A different origin: refused, and the message names neither
+        // the secret nor anything that could be mistaken for it.
+        let err = check_origin(&id, "https://attacker.example.com").unwrap_err();
+        assert!(err.contains("api.example.com"), "{err}");
+        assert!(err.contains("attacker.example.com"), "{err}");
+        assert!(!err.contains("secret-value"), "{err}");
+
+        delete(&id).unwrap();
+    }
+
+    /// No pin recorded (a credential stored before this check existed,
+    /// or a keyless service) must not lock the user out -- it converges
+    /// by pinning going forward, rather than failing closed on
+    /// everyone's existing setup.
+    #[test]
+    fn a_credential_with_no_pinned_origin_is_allowed_through() {
+        let _guard = test_lock();
+        let id = scratch_id("origin-unpinned");
+        // Stored with no origin -- as `store` allows.
+        store(&id, "secret-value", None).unwrap();
+        assert!(check_origin(&id, "https://anything.example.com").is_ok());
+        delete(&id).unwrap();
+    }
+
+    /// Deleting a credential must also forget its pin, so a later
+    /// `connect` to the same id starts clean rather than inheriting a
+    /// stale origin from a previous, unrelated setup.
+    #[test]
+    fn deleting_a_credential_also_forgets_its_pinned_origin() {
+        let _guard = test_lock();
+        let id = scratch_id("origin-delete");
+        store(&id, "secret-value", Some("https://api.example.com")).unwrap();
+        delete(&id).unwrap();
+        // Re-store under a different origin: must not be refused by a
+        // pin that should have been removed.
+        store(&id, "secret-value", Some("https://other.example.com")).unwrap();
+        assert!(check_origin(&id, "https://other.example.com").is_ok());
+        delete(&id).unwrap();
+    }
+
+    #[test]
+    fn origin_of_normalises_scheme_and_authority_and_ignores_the_path() {
+        assert_eq!(
+            origin_of("https://API.Example.com:443/v1/models"),
+            Some("https://api.example.com:443".to_string())
+        );
+        assert_eq!(
+            origin_of("http://127.0.0.1:11434/v1/chat/completions"),
+            Some("http://127.0.0.1:11434".to_string())
+        );
+        assert_eq!(origin_of("not-a-url"), None);
+        assert_eq!(origin_of(""), None);
+    }
+
+    /// A control character hidden in an otherwise-ASCII secret must be
+    /// refused too, not only non-ASCII. Closes a defense-in-depth gap:
+    /// `HeaderSafeKey::from_raw` is a public constructor, and CR/LF are
+    /// ASCII, so a header-injection payload like
+    /// `"key\r\nX-Injected: 1"` would otherwise pass the ASCII check
+    /// even though production `sanitise` already strips it upstream.
+    #[test]
+    fn header_safe_rejects_control_characters_even_though_they_are_ascii() {
+        assert!(!header_safe("key\r\nX-Injected: 1"));
+        assert!(!header_safe("key\nbody"));
+        assert!(!header_safe("key\u{7}bell"));
+        assert!(header_safe("key-with-no-control-chars"));
     }
 
     #[test]

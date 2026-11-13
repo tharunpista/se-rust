@@ -156,6 +156,17 @@ pub trait ModelProvider: Send + Sync {
     fn validate(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         self.list_models()
     }
+
+    /// The origin (scheme + host + port) this provider's credential
+    /// will be sent to right now, if it has a fixed endpoint.
+    ///
+    /// Used only at `/connect` time, to pin the credential to the
+    /// endpoint it was stored for (see `credentials::check_origin`).
+    /// `None` by default: a provider with no configured endpoint has
+    /// nothing to pin yet.
+    fn current_origin(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The providers SE knows how to look for.

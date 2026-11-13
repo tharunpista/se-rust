@@ -332,7 +332,14 @@ fn connect(provider: Option<&str>, from_env: Option<&str>) -> std::process::Exit
         return std::process::ExitCode::from(2);
     }
 
-    if let Err(e) = credentials::store(id, &secret) {
+    // Pins the credential to the endpoint it is being connected to now
+    // (E2): a later change to the service's base URL -- including by an
+    // attacker-set environment variable -- is refused rather than
+    // silently honoured. `current_origin()` is `None` only for a
+    // service with no resolvable endpoint, which `store` treats as
+    // "nothing to pin yet".
+    let origin = provider.current_origin();
+    if let Err(e) = credentials::store(id, &secret, origin.as_deref()) {
         eprintln!("se: could not store the credential: {e}");
         return std::process::ExitCode::FAILURE;
     }

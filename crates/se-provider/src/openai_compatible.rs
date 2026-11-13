@@ -273,6 +273,21 @@ impl OpenAiCompatible {
             ))),
         }
     }
+
+    /// Refuses to proceed if this credential is pinned to a different
+    /// origin than `url` resolves to (E2). Called with the exact URL a
+    /// request is about to be sent to, after `key_or_error` -- a
+    /// keyless service has nothing pinned and this is always `Ok`.
+    fn check_pinned_origin(&self, url: &str) -> Result<(), ProviderError> {
+        if self.fixed_key.is_some() {
+            // Test-only construction, never touches the keyring.
+            return Ok(());
+        }
+        let Some(origin) = credentials::origin_of(url) else {
+            return Ok(());
+        };
+        credentials::check_origin(self.service.id, &origin).map_err(ProviderError::NotConfigured)
+    }
 }
 
 /// Parses an OpenAI-shaped `{"data":[{"id":...}]}` model list.
@@ -422,7 +437,14 @@ impl ModelProvider for OpenAiCompatible {
     }
 
     fn detect(&self) -> Status {
-        let source = if self.fixed_key.is_some() {
+        let source = if !self.service.key_required {
+            // A keyless service never reads this env var or the
+            // keyring (see `key_or_error`), so reporting "Environment"
+            // just because it happens to be set would contradict the
+            // fix in key_or_error: the UI must not claim a credential
+            // is in use when the request path provably ignores it.
+            crate::Source::None
+        } else if self.fixed_key.is_some() {
             crate::Source::Environment
         } else {
             credentials::source(self.service.id, self.service.key_var)
@@ -466,6 +488,10 @@ impl ModelProvider for OpenAiCompatible {
         }
     }
 
+    fn current_origin(&self) -> Option<String> {
+        credentials::origin_of(self.base_url()?.as_str())
+    }
+
     fn stream(
         &self,
         request: &ChatRequest,
@@ -474,6 +500,7 @@ impl ModelProvider for OpenAiCompatible {
     ) -> Result<(), ProviderError> {
         let key = self.key_or_error()?;
         let url = self.endpoint("/chat/completions")?;
+        self.check_pinned_origin(&url)?;
 
         let messages: Vec<serde_json::Value> = request
             .messages
@@ -608,6 +635,7 @@ impl ModelProvider for OpenAiCompatible {
     fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         let key = self.key_or_error()?;
         let url = self.endpoint("/models")?;
+        self.check_pinned_origin(&url)?;
         let mut request = agent().get(&url).timeout(METADATA_TIMEOUT);
         if let Some(key) = &key {
             request = request.set("Authorization", &key.as_bearer());
@@ -1212,6 +1240,55 @@ mod tests {
             "the stray key must not appear anywhere in the request: {seen}"
         );
         std::env::remove_var(KEYLESS.key_var);
+    }
+
+    /// E2 end-to-end: a credential stored (pinned) against one origin
+    /// must be refused when the provider is later pointed at a
+    /// different one -- the exact exfiltration path a hostile
+    /// `*_BASE_URL` env var exploited before this fix.
+    #[test]
+    fn a_provider_refuses_to_send_a_credential_pinned_to_a_different_origin() {
+        let _guard = credentials::test_lock();
+        const ID: &str = "origin-pin-e2e";
+        std::env::remove_var("SE_TEST_PIN_BASE");
+
+        const BODY: &str = "data: [DONE]\n\n";
+        let (first_base, _r1) = serve("HTTP/1.1 200 OK", "text/event-stream", BODY);
+        let (second_base, second_requests) = serve("HTTP/1.1 200 OK", "text/event-stream", BODY);
+
+        let service = Service {
+            id: ID,
+            display_name: "Pin test",
+            key_var: "SE_TEST_PIN_KEY_UNSET",
+            default_base_url: "",
+            base_url_var: "SE_TEST_PIN_BASE",
+            key_required: true,
+        };
+
+        // Store exactly as /connect does: through the real credential
+        // path, pinned to the first origin.
+        credentials::store(ID, "test-key-not-real", Some(&first_base)).unwrap();
+
+        // The endpoint changes -- e.g. the env var is now pointed
+        // somewhere else entirely.
+        std::env::set_var("SE_TEST_PIN_BASE", &second_base);
+        let p = OpenAiCompatible::new(service);
+        let err = p
+            .stream(&request(), &|| false, &mut |_| true)
+            .expect_err("a changed origin must be refused");
+        match err {
+            ProviderError::NotConfigured(detail) => {
+                assert!(detail.contains("run `se connect`"), "{detail}");
+            }
+            other => panic!("expected NotConfigured, got {other:?}"),
+        }
+        assert!(
+            second_requests.lock().unwrap().is_empty(),
+            "no request must reach the new origin"
+        );
+
+        credentials::delete(ID).unwrap();
+        std::env::remove_var("SE_TEST_PIN_BASE");
     }
 
     /// Any service that sends a credential must do so over TLS, or over
