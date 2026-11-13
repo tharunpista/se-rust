@@ -9,6 +9,7 @@
 //! is the caller's job, not this crate's.
 
 pub mod builtins;
+pub mod markdown;
 
 use std::collections::HashMap;
 
