@@ -32,6 +32,6 @@ SE's existing workspace (`se-protocol`, `se-provider`, `se-core`, `se-tui`, `se`
 ## Consequences
 
 - Every claim in the parity matrix and target architecture that cites OpenCode must carry a `path@SHA`. A claim without one is not evidence.
-- New Rust crates are added only where charter §9's ownership rules require a new boundary (see `SE_TARGET_ARCHITECTURE.md`), not to mirror upstream's package list one-to-one.
+- New Rust crates are added only where charter §10's ownership rules require a new boundary (see `SE_TARGET_ARCHITECTURE.md`), not to mirror upstream's package list one-to-one.
 - The two highest-risk subsystems — the multi-model task DAG (§6) and the tool permission gateway (§8, blocked on E7) — have **no upstream Rust implementation to lean on at all**; they are original engineering, gated behind mock-provider tests before any live run, per charter §13.
 - This ADR will be revisited if a future need identifies a specific MIT-licensed non-code asset worth reusing verbatim; until then, "port, don't copy" is binding.
