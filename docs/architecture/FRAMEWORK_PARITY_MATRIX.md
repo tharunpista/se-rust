@@ -1,0 +1,77 @@
+# Framework parity matrix
+
+Baseline commit: `1de6ab6`. Upstream reference: OpenCode `v2.2.5` @ `9bbb8ce`. Claude Code behaviour from `code.claude.com/docs/en/*`, fetched 2026-11-13.
+
+Every "current SE" cell cites a file or says **absent**. Status labels are the charter §15 vocabulary:
+`unit-tested` · `integration-tested` · `terminal-verified` · `live-verified` · `partial` · `mock-only` · `designed` · `unsupported`.
+
+## A. Asset inventory — what already exists on this machine
+
+Measured, not assumed.
+
+| Asset | Count | Location | Notes |
+| --- | --- | --- | --- |
+| Canonical specialist definitions | **194** | `%USERPROFILE%\SE\se\agents\<department>\<id>.md` | 196 `.md` files, of which `ownership-matrix.md` and `role-inventory.md` have no frontmatter and are **not agents**. This resolves the 196-vs-194 discrepancy recorded earlier. |
+| Departments | 15 | — | backend-and-data 22, quality-and-testing 19, platform-and-operations 17, ai-and-agent-systems 16, frontend 15, architecture 14, design-and-ux 13, security-and-privacy 13, business-and-product-operations 11, mobile-and-desktop 11, product-and-requirements 10, integration 9, orchestration 9, documentation-and-support 8, agent-platform-engineering 7. |
+| Frontmatter validity | 194 / 194 valid | — | All `schema_version: 1`. All 194 ids unique. All filenames equal their `id`. Zero invalid agents. |
+| Rendered Claude Code agents | 194 | `SE\.claude\agents\*.md` | Exactly the same 194 ids — no additions, no omissions. **Derived output of `se render`, not a second catalogue.** |
+| Rendered slash commands | 194 | `~\.claude\commands\*.md` | Each is a one-line `Agent` dispatch with `$ARGUMENTS`. Also derived. |
+| Skills (SE role skills) | 11 | `SE\.agents\skills\<id>\SKILL.md` | Generated, carrying a `Role hash:` provenance comment. |
+| Skills (first-party) | 1 | `SE\se\skills\atina\SKILL.md` | |
+| Skills (user global) | 3 | `~\.claude\skills\` (`atina`, `learned`, `synced`) | |
+| Skills (plugin) | 12 | `~\.claude\plugins\cache\**\SKILL.md` | Third-party; read-only to SE. |
+| `.opencode` sources | 0 | — | Nothing to import. |
+| Project-level command directories in the SE tree | 0 | — | `SE\.claude\commands` does not exist. |
+
+**Frontmatter keys present across the 194** (count of files carrying each): `schema_version` 194, `id` 194, `name` 194, `department` 194, `tier` 194, `mission` 194, `activation` 194, `tools` 194, `memory_scopes` 194, `owns_artifacts` 194, `contributes_artifacts` 194, `owns_interfaces` 194, `collaborators` 194, `escalates_to` 194, `context_budget_tokens` 194, `max_calls` 194, `enabled` 194, `boundary` 194, `requires_evidence` 194, `writes_files` 194, `escalates_on_failure_to` 192, `verify_commands` 191, `failure_modes` 173, `stack_aware` 137, `status` 42, `participates_interfaces` 32, `lead` 15, `blocked_on` 6, `owns_spec_sections` 3.
+
+This is the decisive finding for §5.1 and §6.6: **the catalogue already carries the execution-profile data the charter asks for.** `tools` is a permission allowlist, `context_budget_tokens` and `max_calls` are budgets, `escalates_to`/`escalates_on_failure_to` are the escalation edges, `collaborators` is a delegation graph, `verify_commands` is acceptance evidence, `writes_files` and `boundary` are isolation inputs, and `memory_scopes` is context policy. SE must **map onto these fields, not invent a parallel schema.**
+
+## B. Capability parity
+
+| # | Capability | OpenCode `v2.2.5` | Claude Code public analogue | Current SE | Target SE | Effort | Risk | Acceptance test |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | `/` opens a picker on the first keystroke | `packages/tui/src/component/prompt/autocomplete.tsx` — in-composer store with trigger index | `/` menu over commands + skills | **absent**; `crates/se-tui/src/input.rs` maps keys to a flat `Action` enum with no picker state | In-composer picker in `se-tui`, query = text between trigger and cursor | M | Low | `/` with empty composer opens the picker in one synthetic key event; `/mod` filters to `/models`; Esc closes and leaves the draft byte-identical |
+| 2 | Typed command registry with metadata | `packages/core/src/command.ts` (thin: name/description/execute) + `packages/schema/src/config/command.ts` | documented frontmatter set, precedence rules | **absent**; `crates/se/src/main.rs:39-65` is a 6-variant clap enum (`exec`, `connect`, `disconnect`, `providers`, `models`, `doctor`) | New `se-command` registry owning id, path, aliases, category, args schema, availability, handler kind, permission, provenance | M | Med — collision rules | Two sources defining one name resolve by documented precedence and emit a collision report; no project command can shadow a security-critical builtin |
+| 3 | Markdown prompt-template commands | `{ template, description?, agent?, model?, subagent? }` | `.claude/commands/<name>.md`, `$ARGUMENTS`/`$ARGUMENTS[N]`/`$N`/`$name` | **absent** | Loader + substitution with **one documented indexing convention** (see `CLAUDE_CODE_PUBLIC_UX_MAP.md` §1) | S | Med — off-by-one in `$1` | Quoted-argument test: `cmd "hello world" second` binds both; a literal `\$1` survives |
+| 4 | Agent registry over Markdown definitions | `packages/schema/src/config/agent.ts`, tolerant partial decode | recursive scan, id-not-path identity | **absent**; no crate reads `SE\se\agents` | New `se-agents` loader: full frontmatter + original body + source path + content hash | M | Low — data already uniform | All 194 load; the 2 non-agent files are reported as skipped-with-reason, not silently dropped; an unquoted colon does not lose a file |
+| 5 | Agent invocation with its real instructions | subagent tool, fresh context | own markdown body as system prompt | **absent**; `crates/se-core/src/provider_runner.rs` sends only the user turn | Inject the agent body as the system prompt; write an invocation record with agent id, content hash, provider/model, task id | S–M | Low | A run record exists naming agent id + hash; changing the file changes the hash; a generic prompt naming the agent is a failing test |
+| 6 | Skills distinct from commands, lazy bodies | `packages/schema/src/skill.ts`, `{id,name,description?,path,content}` | `SKILL.md`, skill beats same-named command | **absent** | Inventory by metadata; body loaded just-in-time; never all bodies in one request | S | Low | Listing 27 skills reads no body; invoking one reads exactly one |
+| 7 | Non-destructive foreign-source discovery | `packages/core/src/config/plugin/compatibility.ts` — scan `<root>/skills`, read-only, skip-one-on-failure | `.claude/**` conventions | **absent** | Read-only scan of `SE\se\agents`, `SE\.agents\skills`, `~\.claude\skills`; never write to them | S | Med — must not become a second source of truth | A scan mutates nothing (hash the trees before and after); the canonical catalogue is the only writable source |
+| 8 | Permission gateway | `packages/schema/src/permission.ts` — rule `{action,resource,effect}`, last match wins; reply carries `requestID` | `disallowedTools` applied before `tools` | **partial**: approval plumbing exists (`crates/se-core/src/sink.rs`, `CoreOp::Approve`) but **finding E7 is open** — the approval is not bound to the call it authorises; no tool system exists | Central gateway keyed on (agent, task, tool, resource); `Approved` token carries task id + argument hash | M | **High** — the security core | A decision for one call cannot approve another (E7 regression test); deny-then-allow cannot re-grant |
+| 9 | Native tools (read/write/edit/shell/search) | `packages/core/src/tool.ts` + `tool/` | documented tool names | **absent** — `se doctor` states this | Behind the gateway, after #8 | L | High | Every tool call has a gateway decision in the audit record |
+| 10 | Provider/model registry | `packages/core/src/provider.ts`, `model-resolver.ts` | — | **present**: `crates/se-provider/src/lib.rs` — 8 services via one `OpenAiCompatible` adapter, OS-native credential storage, origin pinning | Keep; extend per §7 | — | — | already unit-tested; **none live-verified** |
+| 11 | Typed provider errors, deadlines, outcomes | `model-retry.ts` | — | **present and unit-tested**: `ProviderError` taxonomy, `TimeoutKind`, `Outcome::Incomplete`, turn deadline (`1272bfd`), credential redaction (`1de6ab6`) | Preserve unchanged; charter §11 requires it | — | — | 189 workspace tests green at `1de6ab6` |
+| 12 | Session / event / history store | `packages/core/src/session/`, `snapshot.ts` | `/rewind` | **absent**; history is in-memory only (`crates/se-core/src/engine.rs`) | Durable sessions, events, runs, artifacts, migrations | L | Med | Restart restores a session transcript; resume never replays an unknown-outcome side effect |
+| 13 | Bounded scheduler, provider/account semaphores | `packages/core/src/job/`, Effect `Semaphore` | — | **absent**; single-task supervisor. **E8/E9 open** | Bounded worker pool + per-provider/account semaphores + cancellation propagation | M | **High** | 8–32 concurrent streams respect limits; cancel propagates to children; E8 task-id routing test |
+| 14 | Task DAG with durable state | — (upstream has no multi-model team feature) | — | **absent** | §6.3 task record, dependency edges, states, checkpoints | L | **High** | Dependency order respected; one failed task does not erase completed artifacts |
+| 15 | Multi-model ensemble on one subproblem | **not present upstream** | — | **absent** | §6.2B: identical versioned task packets, isolated contexts, separate evaluator, disagreements surfaced | L | **High** — this is the differentiator | Two mock providers with distinct identities receive byte-identical packets; the evaluator reports disagreement with evidence, never a majority vote |
+| 16 | Artifact store + typed message bus | `artifact.ts`, `bus.ts` | — | **absent** | §6.4 typed messages with provenance | M | Med | Two workers cannot silently overwrite one file |
+| 17 | Worktree / file isolation | `worktree.ts`, `workspace.ts` | `isolation` frontmatter field | **absent** | Ownership rules or isolated worktrees, **tested on Windows** | M | **High** on Windows (path length, locked files) | Conflicting writes are detected and refused, not merged by luck |
+| 18 | Usage ledger and budgets | `usage-limits.ts` | `/usage`, `/cost` | **partial**: provider-reported usage forwarded and labelled (`UsageSource::ProviderReported`), never invented | Per run/task/agent/provider/account aggregation; `not reported` ≠ 0 | M | Med — pricing data | A provider that reports nothing shows `not reported`; subscription usage never mixed with API spend |
+| 19 | MCP connectors | `packages/core/src/mcp/` | documented MCP support | **absent** | stdio + Streamable HTTP, Phase 5 | L | Med | A connector's tools appear only after an explicit enable, with output size limits |
+| 20 | Plugins / hooks | `packages/core/src/plugin/` | `hooks` frontmatter | **absent** | Phase 5, explicit capability manifests | L | Med | A plugin cannot widen permissions |
+| 21 | External runtime adapters (`claude`, `codex`) | — | — | **detected only**: `docs/RUNTIME_DETECTION_FINDINGS.md` records `claude.exe` 2.1.323 and `codex.exe` 0.166.0 present, `opencode` present as a `.ps1` that `CreateProcess` cannot execute | Adapters with **ownership boundary documented**: the external runtime owns its own tools and permissions | M | Med — honesty risk | SE never claims its gateway governs an external runtime's side effects |
+| 22 | CLI mirroring the TUI | `packages/cli` | — | **partial**: 6 subcommands (#2) | §12 surface generated from the same registry as `/help` | M | Low | `se help` and `/help` are projections of one registry — proven by a test that diffs them |
+
+## C. Things the charter asks for that upstream does **not** have
+
+Charter §6 (multi-model team orchestration) has **no upstream analogue**. OpenCode has subagents and a job system; it has no task DAG across several providers, no ensemble-on-one-subproblem, and no cross-model adjudication. Rows 14–17 are therefore original design, not a port — the highest-risk work in the plan, and the reason the charter demands mock-provider tests before any live run.
+
+## D. Status of the charter §11 carry-over list
+
+| §11 requirement | Status | Evidence |
+| --- | --- | --- |
+| Typed provider error taxonomy; no substring routing | **unit-tested** | `crates/se-provider/src/lib.rs`, `is_retriable()` matches variants only |
+| No auto-retry of auth/policy/invalid-request | **unit-tested** | `auth_policy_and_bad_request_are_never_retriable` |
+| Credential redaction on request/transport/log paths | **partial** | `first_line()` redacts bodies (`1de6ab6`); **transport error strings embed the URL and bypass it** |
+| Reject URL userinfo | **OPEN** | not implemented; the residual recorded in `docs/SECURITY_FINDINGS_DISPOSITION.md` |
+| Credentials bound to approved origins | **unit-tested** | E2, commit `5ea3ee1` |
+| HTTPS required, loopback exception | **unit-tested** | `is_safe_origin()` |
+| Redirects must not leak credentials | **unit-tested** | agent built with `.redirects(0)` |
+| Request/stream/turn deadlines and outcomes | **unit-tested** | `1272bfd`; bound is turn deadline **plus** idle timeout, because the deadline is cooperative |
+| Deterministic cancel-vs-deadline precedence | **OPEN** | implemented, but asserted only in a comment — no test |
+| Approval correlation IDs | **OPEN (E7)** | no tool system; must land before the gateway |
+| Tool permission gateway, audit, least privilege | **absent** | depends on E7 |
+| Resource limits on MCP/plugin output and child processes | **absent (E10)** | no child process exists yet |
+| E8/E9 concurrency defects | **OPEN** | scheduled for the scheduler phase |
