@@ -258,14 +258,19 @@ impl OpenAiCompatible {
                 self.service.id, self.service.base_url_var
             ))
         })?;
-        // Any service that sends a credential must do so over TLS. An
+        // Every service, keyed or not, must resolve to TLS or a
+        // loopback address. For a service that sends a credential, an
         // attacker-set `*_BASE_URL=http://attacker/v1` would otherwise
-        // exfiltrate the stored key on the next turn, with no prompt.
-        // Loopback is exempted so local proxies and the raw-socket mock
-        // servers used in tests continue to work.
-        if self.service.key_required && !is_safe_origin(&base) {
+        // exfiltrate the stored key with no prompt. For a *keyless*
+        // service -- Ollama's shape -- the same check still matters:
+        // nothing is exfiltrated, but every prompt, file excerpt and
+        // agent instruction sent to it would travel in cleartext to
+        // whatever host the attacker named (E6b). Loopback is exempted
+        // so local proxies and the raw-socket mock servers used in
+        // tests continue to work.
+        if !is_safe_origin(&base) {
             return Err(ProviderError::NotConfigured(format!(
-                "{} requires https:// (or a loopback http:// address); refusing to send a credential over an insecure URL",
+                "{} requires https:// (or a loopback http:// address); refusing to send a request to an insecure or untrusted URL",
                 self.service.id
             )));
         }
@@ -571,7 +576,9 @@ impl ModelProvider for OpenAiCompatible {
             Err(ureq::Error::Transport(t)) if is_timeout(&t) => {
                 return Err(ProviderError::Timeout(TimeoutKind::Idle));
             }
-            Err(ureq::Error::Transport(t)) => return Err(ProviderError::Transport(t.to_string())),
+            Err(ureq::Error::Transport(t)) => {
+                return Err(ProviderError::Transport(first_line(&t.to_string(), 300)))
+            }
         };
 
         let mut reader = BufReader::new(response.into_reader());
@@ -700,7 +707,9 @@ impl ModelProvider for OpenAiCompatible {
             Err(ureq::Error::Transport(t)) if is_timeout(&t) => {
                 return Err(ProviderError::Timeout(TimeoutKind::Idle));
             }
-            Err(ureq::Error::Transport(t)) => return Err(ProviderError::Transport(t.to_string())),
+            Err(ureq::Error::Transport(t)) => {
+                return Err(ProviderError::Transport(first_line(&t.to_string(), 300)))
+            }
         };
         Ok(parse_model_list(&body))
     }
@@ -709,28 +718,46 @@ impl ModelProvider for OpenAiCompatible {
 /// Trims a provider's error body to something displayable, on one line.
 /// Whether this URL may receive a credential.
 ///
-/// `https://` is always safe. `http://` is accepted only for a loopback
-/// host, so a local Ollama and the raw-socket mock servers used in
-/// tests work -- but not a hostile `http://attacker.example.com/v1`
-/// that an attacker-set `*_BASE_URL` could point at.
+/// `https://` is safe, unless the authority carries userinfo. `http://`
+/// is accepted only for a loopback host with no userinfo, so a local
+/// Ollama and the raw-socket mock servers used in tests work -- but not
+/// a hostile `http://attacker.example.com/v1` that an attacker-set
+/// `*_BASE_URL` could point at.
+///
+/// A URL with embedded credentials (`https://user:key@host/...`) is
+/// refused outright, over either scheme, rather than stripped down to
+/// its host and allowed through. The earlier version only stripped
+/// userinfo on the `http://` branch and never looked for it on
+/// `https://` at all, so `https://user:KEY@attacker.example.com/v1`
+/// passed this check and the credential in the URL was sent. Rejecting
+/// is also what keeps a userinfo-bearing URL out of
+/// [`crate::credentials::origin_of`]'s output before it is ever pinned
+/// or echoed in an error message -- this function runs before
+/// `check_pinned_origin`, in [`OpenAiCompatible::endpoint`], so a
+/// userinfo URL never reaches that code at all.
 fn is_safe_origin(url: &str) -> bool {
-    if url.starts_with("https://") {
-        return true;
-    }
-    let Some(rest) = url.strip_prefix("http://") else {
+    let Some((scheme, rest)) = url.split_once("://") else {
         return false;
     };
     // Authority = everything up to the first path separator.
     let authority = rest.split('/').next().unwrap_or("");
-    // Strip user-info ("user:pass@host").
-    let hostport = authority.rsplit('@').next().unwrap_or("");
-    // Bracketed IPv6 ("[::1]:port") must not split on the inner colons.
-    let host = if let Some(bracketed) = hostport.strip_prefix('[') {
-        bracketed.split(']').next().unwrap_or("")
-    } else {
-        hostport.split(':').next().unwrap_or("")
-    };
-    matches!(host, "localhost" | "127.0.0.1" | "::1")
+    if authority.contains('@') {
+        return false;
+    }
+    match scheme {
+        "https" => true,
+        "http" => {
+            // Bracketed IPv6 ("[::1]:port") must not split on the
+            // inner colons.
+            let host = if let Some(bracketed) = authority.strip_prefix('[') {
+                bracketed.split(']').next().unwrap_or("")
+            } else {
+                authority.split(':').next().unwrap_or("")
+            };
+            matches!(host, "localhost" | "127.0.0.1" | "::1")
+        }
+        _ => false,
+    }
 }
 
 /// Whether an error body carries one of the markers vendors use for a
@@ -1639,6 +1666,51 @@ mod tests {
         assert!(!is_safe_origin("file:///etc/passwd"));
         assert!(!is_safe_origin("ftp://example.com/"));
         assert!(!is_safe_origin(""));
+    }
+
+    #[test]
+    fn a_url_carrying_userinfo_is_refused_over_either_scheme() {
+        // The defect this closes: the previous version only looked for
+        // userinfo on the http:// branch, so an https:// URL with a
+        // credential embedded in it -- the more dangerous case, since
+        // https is otherwise trusted outright -- passed unchecked.
+        assert!(!is_safe_origin("https://user:key@attacker.example.com/v1"));
+        assert!(!is_safe_origin("http://user:key@127.0.0.1/v1"));
+        assert!(!is_safe_origin("http://user:key@localhost/v1"));
+        // A bare "@" with no credential shape is still userinfo syntax
+        // and still refused -- the rule is "contains @", not "looks
+        // like a secret".
+        assert!(!is_safe_origin("https://@attacker.example.com/"));
+    }
+
+    #[test]
+    fn a_keyless_service_still_refuses_a_non_loopback_http_endpoint() {
+        // E6b: HTTPS/loopback is a data-confidentiality control, not
+        // only a credential control. A keyless service pointed at a
+        // remote http:// host would ship every prompt in cleartext
+        // even though no credential is involved. The previous version
+        // only ran this check `if self.service.key_required`, so a
+        // keyless service skipped it entirely.
+        const KEYLESS: Service = Service {
+            id: "keyless-remote",
+            display_name: "Keyless",
+            key_var: "SE_TEST_KEYLESS_REMOTE_KEY_UNSET",
+            default_base_url: "",
+            base_url_var: "SE_TEST_KEYLESS_REMOTE_BASE",
+            key_required: false,
+        };
+        let p = OpenAiCompatible {
+            service: KEYLESS,
+            fixed_key: None,
+            fixed_base_url: Some("http://attacker.example.com:11434".to_string()),
+        };
+        let err = p.stream(&request(), &|| false, &mut |_| true).unwrap_err();
+        match err {
+            ProviderError::NotConfigured(detail) => {
+                assert!(detail.contains("insecure"), "{detail}");
+            }
+            other => panic!("expected NotConfigured, got {other:?}"),
+        }
     }
 
     /// Guards against a regression of the "dead `header_safe`" defect:

@@ -448,6 +448,27 @@ mod tests {
     use super::*;
     use crate::EchoRunner;
 
+    /// Ignores cancellation entirely and always reports success, after
+    /// a short delay so a test has time to call `interrupt` first. The
+    /// one thing this type exists to prove: the override at the
+    /// `sink.is_cancelled()` check below does not depend on the runner
+    /// cooperating. A runner that never looks at `is_cancelled` --
+    /// buggy, or simply not written yet -- still cannot make a
+    /// cancelled task report as completed.
+    struct IgnoresCancellationRunner;
+
+    impl Runner for IgnoresCancellationRunner {
+        fn describe(&self) -> (String, String) {
+            ("test".to_string(), "ignores-cancellation".to_string())
+        }
+        fn run(&self, _turn: &UserTurn, _history: &[Message], _sink: &mut TurnSink) -> Outcome {
+            std::thread::sleep(Duration::from_millis(60));
+            Outcome::Completed {
+                final_text: "the runner never checked is_cancelled".to_string(),
+            }
+        }
+    }
+
     fn collect_until_terminal(handle: &CoreHandle, limit: Duration) -> Vec<CoreEvent> {
         let deadline = std::time::Instant::now() + limit;
         let mut all = Vec::new();
@@ -464,6 +485,28 @@ mod tests {
             "no terminal event within {limit:?}; got {} events",
             all.len()
         );
+    }
+
+    #[test]
+    fn a_cancelled_task_reports_cancelled_even_if_the_runner_ignores_cancellation() {
+        let handle = crate::start(IgnoresCancellationRunner);
+        let task = handle.submit("hi", vec![]).unwrap();
+        std::thread::sleep(Duration::from_millis(15));
+        handle.interrupt(task);
+        let events = collect_until_terminal(&handle, Duration::from_secs(5));
+        let outcome = events
+            .iter()
+            .find_map(|e| match &e.payload {
+                Payload::TaskFinished { outcome, .. } => Some(outcome.clone()),
+                _ => None,
+            })
+            .expect("a terminal event must carry an outcome");
+        assert_eq!(
+            outcome,
+            Outcome::Cancelled,
+            "the override must win over whatever the runner itself returned"
+        );
+        handle.shutdown();
     }
 
     #[test]

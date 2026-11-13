@@ -76,6 +76,19 @@ pub fn origin_of(url: &str) -> Option<String> {
     if authority.is_empty() {
         return None;
     }
+    // A URL carrying userinfo is refused, not stripped to its host and
+    // accepted: `is_safe_origin` in `openai_compatible.rs` already
+    // rejects such a URL before any request is built, so returning
+    // `None` here (rather than the host alone) is defense in depth,
+    // not the primary control -- but it matters on its own, because
+    // the caller of a `None` here (`check_pinned_origin`) treats "no
+    // origin to check" as `Ok`. A silently-stripped userinfo origin
+    // would otherwise get pinned and later echoed verbatim in
+    // `check_origin`'s error message, which is exactly how a
+    // credential embedded in a URL used to leak through this path.
+    if authority.contains('@') {
+        return None;
+    }
     Some(format!(
         "{}://{}",
         scheme.to_ascii_lowercase(),
@@ -519,6 +532,23 @@ mod tests {
         );
         assert_eq!(origin_of("not-a-url"), None);
         assert_eq!(origin_of(""), None);
+    }
+
+    #[test]
+    fn origin_of_refuses_rather_than_strips_a_url_carrying_userinfo() {
+        // `is_safe_origin` in openai_compatible.rs is the primary gate
+        // and already refuses such a URL before a request is ever
+        // built, so this is defense in depth -- but it is still load
+        // bearing: `check_pinned_origin` treats `origin_of`'s `None` as
+        // "nothing to check" (Ok), and treats a *stripped* host-only
+        // origin as something to pin and later echo back verbatim in
+        // an error message. Stripping, not refusing, is exactly how a
+        // credential embedded in a URL used to leak through this path.
+        assert_eq!(
+            origin_of("https://user:secret-key@attacker.example.com/v1"),
+            None
+        );
+        assert_eq!(origin_of("http://user:secret-key@127.0.0.1/v1"), None);
     }
 
     /// A control character hidden in an otherwise-ASCII secret must be

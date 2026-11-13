@@ -94,6 +94,41 @@ impl ProviderRunner {
     }
 }
 
+/// How a fired whole-turn deadline and a possible cancellation resolve
+/// against each other, as a decision over three booleans with nothing
+/// else in scope.
+///
+/// A fired deadline and a real user cancellation reach `stream()` as
+/// the same closure returning `true` (a provider has one cancellation
+/// mechanism, not two), so they are indistinguishable from inside the
+/// call. `cancelled` is the tie-breaker precisely because user
+/// cancellation must always win over a deadline that happened to fire
+/// in the same instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeadlinePrecedence {
+    /// The deadline did not fire, or the user also cancelled and that
+    /// takes precedence -- the caller's ordinary `Err`/`Ok` handling
+    /// applies.
+    NotApplicable,
+    Failed,
+    Incomplete,
+}
+
+fn deadline_precedence(
+    deadline_fired: bool,
+    cancelled: bool,
+    answer_is_empty: bool,
+) -> DeadlinePrecedence {
+    if !deadline_fired || cancelled {
+        return DeadlinePrecedence::NotApplicable;
+    }
+    if answer_is_empty {
+        DeadlinePrecedence::Failed
+    } else {
+        DeadlinePrecedence::Incomplete
+    }
+}
+
 impl Runner for ProviderRunner {
     fn describe(&self) -> (String, String) {
         (self.provider_id.clone(), self.model.clone())
@@ -236,23 +271,27 @@ impl Runner for ProviderRunner {
             let _ = sink.usage(usage);
         }
 
-        // Checked before the error-type match below: a fired deadline
-        // and a real user cancellation are indistinguishable to
-        // `stream()` (both reach it as the same closure returning
-        // `true`), and user cancellation must always win. `is_cancelled`
-        // is therefore the tie-breaker; a deadline is only reported as
-        // such when the user did not also ask to stop.
-        if deadline_fired.load(Ordering::SeqCst) && !sink.is_cancelled() {
-            return if answer.is_empty() {
-                Outcome::Failed {
+        // The tie-break is a pure function over three booleans (see
+        // `deadline_precedence` below) specifically so every one of its
+        // input combinations is a named row in a test, rather than a
+        // property inferred from reading this `if`.
+        match deadline_precedence(
+            deadline_fired.load(Ordering::SeqCst),
+            sink.is_cancelled(),
+            answer.is_empty(),
+        ) {
+            DeadlinePrecedence::NotApplicable => {}
+            DeadlinePrecedence::Failed => {
+                return Outcome::Failed {
                     detail: ProviderError::Timeout(TimeoutKind::WholeTurn).to_string(),
-                }
-            } else {
-                Outcome::Incomplete {
+                };
+            }
+            DeadlinePrecedence::Incomplete => {
+                return Outcome::Incomplete {
                     partial_text: answer,
                     reason: ProviderError::Timeout(TimeoutKind::WholeTurn).to_string(),
-                }
-            };
+                };
+            }
         }
 
         match result {
@@ -310,6 +349,35 @@ mod tests {
     use se_protocol::Payload;
     use se_provider::{ModelInfo, ModelProvider, Service, Status};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Every one of the eight (deadline, cancelled, answer-empty)
+    /// combinations, named -- the gap the Phase 0 security review
+    /// found: the precedence logic existed, but no test had ever set
+    /// both a deadline and a cancellation flag at once.
+    #[test]
+    fn deadline_precedence_truth_table() {
+        let cases = [
+            // (deadline_fired, cancelled, answer_is_empty, expected)
+            (false, false, false, DeadlinePrecedence::NotApplicable),
+            (false, false, true, DeadlinePrecedence::NotApplicable),
+            (false, true, false, DeadlinePrecedence::NotApplicable),
+            (false, true, true, DeadlinePrecedence::NotApplicable),
+            // The deadline fired but cancellation still wins, with an
+            // empty or a partial answer -- the exact race the review
+            // flagged as having zero coverage.
+            (true, true, false, DeadlinePrecedence::NotApplicable),
+            (true, true, true, DeadlinePrecedence::NotApplicable),
+            (true, false, true, DeadlinePrecedence::Failed),
+            (true, false, false, DeadlinePrecedence::Incomplete),
+        ];
+        for (deadline_fired, cancelled, answer_is_empty, expected) in cases {
+            assert_eq!(
+                deadline_precedence(deadline_fired, cancelled, answer_is_empty),
+                expected,
+                "deadline_fired={deadline_fired} cancelled={cancelled} answer_is_empty={answer_is_empty}"
+            );
+        }
+    }
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -877,6 +945,19 @@ mod tests {
             other => panic!("an empty timed-out turn is a failure: {other:?}"),
         }
     }
+
+    // A timing-based integration test for the exact simultaneous race
+    // (deadline_fired and is_cancelled both true at the outcome
+    // decision) was attempted and removed: the window between
+    // `stream()` returning and the decision reading `is_cancelled()` is
+    // one synchronous code path, not a sleep-measurable interval, and
+    // every attempt to force it via `thread::sleep` either missed the
+    // window (cancellation too early, correctly reported as Cancelled
+    // by the ordinary `Err(Cancelled)` match arm) or arrived after the
+    // task had already finished from the deadline alone, which only
+    // proves that interrupting a finished task is a no-op -- a true
+    // but uninteresting property. `deadline_precedence_truth_table`
+    // above is the complete, deterministic proof of this property.
 
     #[test]
     fn a_zero_deadline_is_refused_at_construction() {
