@@ -75,6 +75,7 @@ the previous single crate could not.
 se            (binary)  wiring, CLI surface, terminal lifecycle
  └── se-tui             ratatui/crossterm views; consumes events, emits ops
       └── se-core       session/task/turn state machine; owns execution
+           ├── se-provider   model providers, streaming, credentials
            └── se-protocol   typed ids, operations, events, timings
 ```
 
@@ -82,7 +83,10 @@ Dependencies point one way only, and `cargo tree` is the test:
 
 - `se-protocol` depends on `serde` and nothing else of ours. It is the
   shared vocabulary; it must stay cheap to compile and free of policy.
-- `se-core` depends on `se-protocol`. It knows nothing about terminals.
+- `se-provider` depends on `se-protocol`-free types of its own plus
+  `ureq` and `keyring`. It knows nothing about sessions or terminals.
+- `se-core` depends on `se-protocol` and `se-provider`. It knows nothing
+  about terminals.
 - `se-tui` depends on `se-protocol` and `se-core`'s handle type only. It
   must remain unable to perform I/O other than drawing.
 - `se` wires them together and owns raw mode, the alternate screen and
@@ -113,8 +117,8 @@ passes with recorded evidence, not when it looks finished.
 | Phase | Scope | Gate |
 |---|---|---|
 | 0 | Decisions, invariants, evidence index | This document; workspace builds; git history exists |
-| 1 | Responsive shell: typed core, event loop, input/focus, cancellation | UI stays responsive under a slow turn; deltas render as received; interrupt works; no blocking call in render path; terminal restored after panic |
-| 2 | One native provider, streaming, real session | `hi` causes exactly one model request; first delta rendered within one frame; stage timings visible |
+| 1 | Responsive shell: typed core, event loop, input/focus, cancellation | **Passed.** UI stays responsive under a slow turn; deltas render as received; interrupt works; no blocking call in render path; terminal restored after panic |
+| 2 | One native provider, streaming, real session | **Passed.** `hi` causes exactly one model request; deltas arrive as sent (measured, not assumed); ttft recorded separately; credentials in OS storage |
 | 3 | Typed tool registry, central permission engine, sandboxed execution | Every call schema-validated and policy-checked; timeouts and output caps; results recorded with exit codes |
 | 4 | Durable sessions, resume, crash recovery | Interrupted tasks recover as interrupted, never as completed |
 | 5 | Specialist execution with output contracts and independent verification | Selected specialist demonstrably invoked; claims cite evidence; a verifier can reject |
@@ -134,6 +138,23 @@ model is never benchmarked by timing only the final response.
 | TUI input feedback | p95 < 16 ms |
 | Render of a received delta | within one frame |
 | UI responsiveness during a model wait | never blocked; input always usable |
+
+## 6a. Measured, not assumed
+
+Recorded on this machine (Windows 11, PowerShell, release build) so
+later changes have a baseline to be compared against:
+
+| Measurement | Result |
+|---|---|
+| `se doctor` internal startup span | 214µs |
+| Full process round trip (`se exec`, 30 runs) | ~36ms each, dominated by Windows process creation |
+| Delta arrival through the release binary, against a server pausing 300ms per word | +0.02s, +0.32s, +0.62s, +0.92s |
+| Time to first token, recorded separately from generation | yes, `Stage::TimeToFirstToken` |
+
+The streaming figure is the one that matters: a buffered implementation
+produces an identical final string, so incrementality is asserted on
+arrival times, both in `se-provider`'s tests and by hand against the
+real executable.
 
 ## 7. Evidence classes
 

@@ -80,6 +80,17 @@ impl TurnSink {
         self.cancelled.load(Ordering::SeqCst)
     }
 
+    /// A standalone view of the cancellation flag.
+    ///
+    /// A runner that hands a "should I stop?" callback to something else
+    /// (a provider streaming over a socket) needs to ask about
+    /// cancellation while also holding the sink mutably to report
+    /// deltas. Cloning the flag keeps both possible without interior
+    /// mutability or a lock on the hot path.
+    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+        self.cancelled.clone()
+    }
+
     pub(crate) fn emit(&mut self, payload: Payload) -> Result<(), Disconnected> {
         if self.disconnected {
             return Err(Disconnected);

@@ -21,10 +21,12 @@
 //! ```
 
 pub mod engine;
+pub mod provider_runner;
 pub mod runner;
 pub mod sink;
 
 pub use engine::{start, CoreHandle, SubmitError};
+pub use provider_runner::ProviderRunner;
 pub use runner::{ApprovalRunner, EchoRunner, Runner};
 pub use sink::{Disconnected, TurnSink};
 
@@ -32,3 +34,4 @@ pub use sink::{Disconnected, TurnSink};
 // common types. The protocol crate stays separately usable for anything
 // that only wants the vocabulary (a log reader, a replay tool).
 pub use se_protocol as protocol;
+pub use se_provider as provider;

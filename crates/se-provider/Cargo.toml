@@ -1,0 +1,13 @@
+[package]
+name = "se-provider"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Model providers: the trait, OS-native credential storage, and streaming adapters."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+ureq = { workspace = true }
+keyring = { version = "3.6", features = ["windows-native", "apple-native", "sync-secret-service"] }

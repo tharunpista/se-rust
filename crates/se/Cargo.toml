@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 se-protocol = { path = "../se-protocol" }
 se-core = { path = "../se-core" }
+se-provider = { path = "../se-provider" }
 se-tui = { path = "../se-tui" }
 clap = { workspace = true }
 crossterm = { workspace = true }
