@@ -96,6 +96,20 @@ impl CoreHandle {
         text: &str,
         attachments: Vec<std::path::PathBuf>,
     ) -> Result<TaskId, SubmitError> {
+        self.submit_with_model(text, attachments, None)
+    }
+
+    /// Like [`CoreHandle::submit`], with an explicit per-turn model
+    /// override -- routing precedence level 1 in charter §6.6. No
+    /// interface surface sets this yet (there is no `/model` picker and
+    /// no specialist/team profile to read), but the seam exists so one
+    /// can be wired to it without changing this signature again.
+    pub fn submit_with_model(
+        &self,
+        text: &str,
+        attachments: Vec<std::path::PathBuf>,
+        model: Option<se_protocol::ModelRef>,
+    ) -> Result<TaskId, SubmitError> {
         {
             let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(running) = *active {
@@ -114,6 +128,7 @@ impl CoreHandle {
             task,
             text: text.to_string(),
             attachments,
+            model,
         };
         if self.ops.send(CoreOp::SubmitUserTurn(turn)).is_err() {
             let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
@@ -485,6 +500,70 @@ mod tests {
             "no terminal event within {limit:?}; got {} events",
             all.len()
         );
+    }
+
+    /// Echoes back whatever model override it was given, as the
+    /// completed text, so a test can assert on it without a real
+    /// provider.
+    struct RecordsModelRunner;
+
+    impl Runner for RecordsModelRunner {
+        fn describe(&self) -> (String, String) {
+            ("test".to_string(), "records-model".to_string())
+        }
+        fn run(&self, turn: &UserTurn, _history: &[Message], _sink: &mut TurnSink) -> Outcome {
+            let seen = match &turn.model {
+                Some(m) => format!("{}/{}", m.provider, m.model),
+                None => "none".to_string(),
+            };
+            Outcome::Completed { final_text: seen }
+        }
+    }
+
+    #[test]
+    fn submit_with_model_carries_the_override_onto_the_turn_the_runner_sees() {
+        let handle = crate::start(RecordsModelRunner);
+        let model = se_protocol::ModelRef {
+            provider: "anthropic".to_string(),
+            model: "sonnet".to_string(),
+        };
+        handle.submit_with_model("hi", vec![], Some(model)).unwrap();
+        let events = collect_until_terminal(&handle, Duration::from_secs(5));
+        let outcome = events
+            .iter()
+            .find_map(|e| match &e.payload {
+                Payload::TaskFinished { outcome, .. } => Some(outcome.clone()),
+                _ => None,
+            })
+            .expect("a terminal event must carry an outcome");
+        assert_eq!(
+            outcome,
+            Outcome::Completed {
+                final_text: "anthropic/sonnet".to_string()
+            }
+        );
+        handle.shutdown();
+    }
+
+    #[test]
+    fn plain_submit_carries_no_model_override() {
+        let handle = crate::start(RecordsModelRunner);
+        handle.submit("hi", vec![]).unwrap();
+        let events = collect_until_terminal(&handle, Duration::from_secs(5));
+        let outcome = events
+            .iter()
+            .find_map(|e| match &e.payload {
+                Payload::TaskFinished { outcome, .. } => Some(outcome.clone()),
+                _ => None,
+            })
+            .expect("a terminal event must carry an outcome");
+        assert_eq!(
+            outcome,
+            Outcome::Completed {
+                final_text: "none".to_string()
+            }
+        );
+        handle.shutdown();
     }
 
     #[test]

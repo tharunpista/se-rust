@@ -38,6 +38,26 @@ pub struct UserTurn {
     /// and context-budget decision, not a UI one.
     #[serde(default)]
     pub attachments: Vec<std::path::PathBuf>,
+    /// An explicit per-turn model override -- routing precedence level
+    /// 1 in charter §6.6 ("explicit task override"), and the only level
+    /// that travels with the task rather than living in a profile. Any
+    /// other level a future routing phase adds (specialist, team,
+    /// department, global default) is resolved elsewhere, against
+    /// whatever profile store exists then; this field exists so a task
+    /// can carry an override that nothing else can.
+    #[serde(default)]
+    pub model: Option<ModelRef>,
+}
+
+/// A specific provider and model, named rather than inferred. The same
+/// two strings [`Payload::TurnStarted`] already reports for what
+/// actually ran -- this type exists so routing code has one shared
+/// vocabulary for "which model" instead of two loose `String`s per call
+/// site.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRef {
+    pub provider: String,
+    pub model: String,
 }
 
 /// A decision about a tool call that needed one.
@@ -339,9 +359,36 @@ mod tests {
             task: TaskId::from_raw(1),
             text: "hi".into(),
             attachments: vec![],
+            model: None,
         });
         let json = serde_json::to_string(&op).unwrap();
         assert_eq!(op, serde_json::from_str::<CoreOp>(&json).unwrap());
+    }
+
+    #[test]
+    fn a_user_turn_with_a_model_override_round_trips() {
+        let op = CoreOp::SubmitUserTurn(UserTurn {
+            session: SessionId::from_raw(1),
+            task: TaskId::from_raw(1),
+            text: "hi".into(),
+            attachments: vec![],
+            model: Some(ModelRef {
+                provider: "anthropic".into(),
+                model: "sonnet".into(),
+            }),
+        });
+        let json = serde_json::to_string(&op).unwrap();
+        assert_eq!(op, serde_json::from_str::<CoreOp>(&json).unwrap());
+    }
+
+    #[test]
+    fn an_absent_model_override_deserialises_from_json_with_no_model_field_at_all() {
+        // #[serde(default)] matters here: a UserTurn serialised before
+        // this field existed must still deserialise, not fail to parse
+        // a durable session recorded by an older build.
+        let json = r#"{"session":1,"task":1,"text":"hi","attachments":[]}"#;
+        let turn: UserTurn = serde_json::from_str(json).unwrap();
+        assert_eq!(turn.model, None);
     }
 
     #[test]

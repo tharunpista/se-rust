@@ -22,6 +22,7 @@
 
 pub mod engine;
 pub mod provider_runner;
+pub mod routing;
 pub mod runner;
 pub mod sink;
 
