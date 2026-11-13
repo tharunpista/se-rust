@@ -117,8 +117,8 @@ passes with recorded evidence, not when it looks finished.
 | Phase | Scope | Gate |
 |---|---|---|
 | 0 | Decisions, invariants, evidence index | This document; workspace builds; git history exists |
-| 1 | Responsive shell: typed core, event loop, input/focus, cancellation | **Passed.** UI stays responsive under a slow turn; deltas render as received; interrupt works; no blocking call in render path; terminal restored after panic |
-| 2 | One native provider, streaming, real session | **Passed.** `hi` causes exactly one model request; deltas arrive as sent (measured, not assumed); ttft recorded separately; credentials in OS storage |
+| 1 | Responsive shell: typed core, event loop, input/focus, cancellation | **Passed, with two items untested on a real terminal** (below): UI stays responsive under a slow turn; deltas render as received; interrupt works; no blocking call in the render path |
+| 2 | One native provider, streaming, conversation history | **Passed against a mock endpoint, not a live vendor** (below): `hi` causes exactly one model request; deltas arrive as sent (measured, not assumed); ttft recorded separately; credentials in OS storage; a second turn sends the first exchange back |
 | 3 | Typed tool registry, central permission engine, sandboxed execution | Every call schema-validated and policy-checked; timeouts and output caps; results recorded with exit codes |
 | 4 | Durable sessions, resume, crash recovery | Interrupted tasks recover as interrupted, never as completed |
 | 5 | Specialist execution with output contracts and independent verification | Selected specialist demonstrably invoked; claims cite evidence; a verifier can reject |
@@ -155,6 +155,32 @@ The streaming figure is the one that matters: a buffered implementation
 produces an identical final string, so incrementality is asserted on
 arrival times, both in `se-provider`'s tests and by hand against the
 real executable.
+
+## 6b. What is claimed, and what is not
+
+Written down because a gate marked "passed" is worth nothing if its
+scope is left vague.
+
+**Verified by automated test and by running the release binary:**
+streaming incrementality, time-to-first-token as a separate measurement,
+cancellation mid-stream, approval round trips, conversation history
+across turns, credential storage and read-back in Windows Credential
+Manager, endpoint construction for every catalogued service, and refusal
+to start a turn against an unconfigured provider.
+
+**Verified against a local mock HTTP endpoint only.** No live vendor API
+has been called from this build. The provider adapter is exercised
+against mock servers that reproduce the documented SSE shape; whether a
+given vendor's live endpoint agrees with that shape is untested, and
+`doctor` says so rather than listing eight working integrations.
+
+**Not yet exercised at all:**
+
+- the interactive loop and the panic-restore hook on a real terminal
+  (they are reached only by `se` with a tty, which the automated tests
+  cannot provide);
+- mouse input beyond the scroll mapping;
+- any behaviour under a terminal resize.
 
 ## 7. Evidence classes
 

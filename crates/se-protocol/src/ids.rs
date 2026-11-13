@@ -40,7 +40,11 @@ macro_rules! counted_id {
 
             /// For reconstructing an identity when replaying a
             /// persisted event. Not for inventing new ones.
-            pub fn from_raw(raw: u64) -> Self {
+            ///
+            /// `const` so a sentinel can be declared: allocation starts
+            /// at 1, so 0 is never a real identity and can safely stand
+            /// for "no call".
+            pub const fn from_raw(raw: u64) -> Self {
                 $name(raw)
             }
 

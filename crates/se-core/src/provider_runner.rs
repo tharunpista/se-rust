@@ -70,7 +70,7 @@ impl Runner for ProviderRunner {
         (self.provider_id.clone(), self.model.clone())
     }
 
-    fn run(&self, turn: &UserTurn, sink: &mut TurnSink) -> Outcome {
+    fn run(&self, turn: &UserTurn, history: &[Message], sink: &mut TurnSink) -> Outcome {
         let Some(provider) = self.registry.get(&self.provider_id) else {
             return Outcome::Failed {
                 detail: format!("`{}` is no longer registered", self.provider_id),
@@ -84,19 +84,26 @@ impl Runner for ProviderRunner {
 
         // Context assembly is measured even though it is currently
         // trivial, so that it stays visible when it stops being trivial.
-        let request = sink.timed(Stage::ContextBuild, || ChatRequest {
-            model: self.model.clone(),
-            messages: vec![
-                Message {
-                    role: Role::System,
-                    content: SYSTEM_PROMPT.to_string(),
-                },
-                Message {
-                    role: Role::User,
-                    content: turn.text.clone(),
-                },
-            ],
-            max_tokens: MAX_TOKENS,
+        let request = sink.timed(Stage::ContextBuild, || {
+            // System instructions, the conversation so far, then this
+            // turn. The history is passed in by the core rather than
+            // rebuilt here, so what the model sees and what the
+            // transcript shows cannot drift apart.
+            let mut messages = Vec::with_capacity(history.len() + 2);
+            messages.push(Message {
+                role: Role::System,
+                content: SYSTEM_PROMPT.to_string(),
+            });
+            messages.extend_from_slice(history);
+            messages.push(Message {
+                role: Role::User,
+                content: turn.text.clone(),
+            });
+            ChatRequest {
+                model: self.model.clone(),
+                messages,
+                max_tokens: MAX_TOKENS,
+            }
         });
 
         let mut answer = String::new();
@@ -539,6 +546,106 @@ mod tests {
             Err(other) => panic!("expected NotConfigured, got {other:?}"),
             Ok(_) => panic!("an unconfigured provider must be refused"),
         }
+    }
+
+    /// A conversation, not a sequence of amnesiac requests.
+    ///
+    /// The defect this covers: the runner used to send only the system
+    /// prompt and the current message, so the second turn could not see
+    /// the first -- while the phase table claimed a "real session".
+    #[test]
+    fn a_second_turn_sends_the_first_exchange_back_to_the_model() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let recorder = seen.clone();
+
+        struct Recorder {
+            seen: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        }
+        impl ModelProvider for Recorder {
+            fn id(&self) -> &str {
+                "recorder"
+            }
+            fn display_name(&self) -> &str {
+                "Recorder"
+            }
+            fn env_var(&self) -> &str {
+                "SE_TEST_RECORDER_KEY"
+            }
+            fn detect(&self) -> Status {
+                Status {
+                    configured: true,
+                    detail: "recorder".into(),
+                    source: se_provider::Source::Environment,
+                }
+            }
+            fn stream(
+                &self,
+                request: &ChatRequest,
+                _cancelled: &dyn Fn() -> bool,
+                on_event: &mut dyn FnMut(StreamEvent) -> bool,
+            ) -> Result<(), ProviderError> {
+                self.seen.lock().unwrap().push(
+                    request
+                        .messages
+                        .iter()
+                        .map(|m| format!("{:?}:{}", m.role, m.content))
+                        .collect(),
+                );
+                on_event(StreamEvent::TextDelta("ok".into()));
+                on_event(StreamEvent::Done);
+                Ok(())
+            }
+            fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+                Ok(Vec::new())
+            }
+        }
+
+        let mut registry = Registry::empty();
+        registry.register(Box::new(Recorder { seen: recorder }));
+        let runner = ProviderRunner {
+            registry,
+            provider_id: "recorder".into(),
+            model: "m".into(),
+        };
+
+        let core = crate::start(runner);
+        for request in ["first question", "second question"] {
+            core.submit(request, vec![]).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut done = false;
+            while !done && std::time::Instant::now() < deadline {
+                for event in core.drain_blocking(Duration::from_millis(20)) {
+                    if event.is_terminal() {
+                        done = true;
+                    }
+                }
+            }
+            assert!(done, "{request} did not finish");
+        }
+        core.shutdown();
+
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2, "two turns, two requests");
+        // The first turn carries system + the question only.
+        assert_eq!(requests[0].len(), 2, "{:?}", requests[0]);
+        // The second carries system + the whole first exchange + the
+        // new question.
+        assert_eq!(requests[1].len(), 4, "{:?}", requests[1]);
+        assert!(
+            requests[1][1].contains("first question"),
+            "{:?}",
+            requests[1]
+        );
+        assert!(
+            requests[1][2].starts_with("Assistant:") && requests[1][2].contains("ok"),
+            "the model's own previous answer must be included: {:?}",
+            requests[1]
+        );
+        assert!(
+            requests[1][3].contains("second question"),
+            "{:?}",
+            requests[1]
+        );
     }
 
     #[test]

@@ -33,8 +33,9 @@ pub struct TurnSink {
     seq: Arc<SeqCounter>,
     events: SyncSender<CoreEvent>,
     cancelled: Arc<AtomicBool>,
-    /// Decisions arriving back from the supervisor, one at a time.
-    approvals: Receiver<bool>,
+    /// Decisions arriving back from the supervisor, each naming the
+    /// call it answers (see `request_approval`).
+    approvals: Receiver<(ToolCallId, bool)>,
     /// Spans recorded so far, attached to the terminal event.
     pub(crate) timings: se_protocol::Timings,
     /// Set once a disconnect is seen so a runner that ignores the error
@@ -49,7 +50,7 @@ impl TurnSink {
         seq: Arc<SeqCounter>,
         events: SyncSender<CoreEvent>,
         cancelled: Arc<AtomicBool>,
-        approvals: Receiver<bool>,
+        approvals: Receiver<(ToolCallId, bool)>,
     ) -> Self {
         TurnSink {
             session,
@@ -202,7 +203,25 @@ impl TurnSink {
             return false;
         }
         let waiting = se_protocol::Running::start(Stage::ApprovalWait);
-        let decision = self.approvals.recv().unwrap_or(false);
+        // A decision must name the call it answers. Anything else is
+        // discarded and the wait continues.
+        //
+        // The defect this closes, reproduced before it was fixed: a
+        // decision used to be forwarded as a bare boolean into a
+        // one-slot channel. A second keypress while a tool was running
+        // found the slot empty, was kept there, and then answered the
+        // *next* request instantly -- so pressing `y` twice silently
+        // approved a tool the user was never shown.
+        let decision = loop {
+            match self.approvals.recv() {
+                Ok((answered, allow)) if answered == call => break allow,
+                // Not for this call: a stale or duplicated decision.
+                Ok(_) => continue,
+                // The interface is gone; a withheld decision is never
+                // permission.
+                Err(_) => break false,
+            }
+        };
         let span = waiting.finish();
         self.timings.record(span);
         let allowed = decision && !self.is_cancelled();
@@ -235,12 +254,25 @@ mod tests {
     use super::*;
     use std::sync::mpsc::sync_channel;
 
-    fn sink() -> (
+    /// Harness: the sink under test, the events it emits, the channel a
+    /// supervisor would answer decisions on, and the cancellation flag.
+    type Harness = (
         TurnSink,
         Receiver<CoreEvent>,
-        SyncSender<bool>,
+        SyncSender<(ToolCallId, bool)>,
         Arc<AtomicBool>,
-    ) {
+    );
+
+    /// Reads the call id out of an `ApprovalRequired` event, the way the
+    /// interface and supervisor do.
+    fn requested_call(event: &CoreEvent) -> ToolCallId {
+        match event.payload {
+            Payload::ApprovalRequired { call, .. } => call,
+            ref other => panic!("expected an approval request, got {other:?}"),
+        }
+    }
+
+    fn sink() -> Harness {
         let (event_tx, event_rx) = sync_channel(64);
         let (approval_tx, approval_rx) = sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -295,10 +327,10 @@ mod tests {
     fn approval_blocks_the_worker_and_returns_the_decision() {
         let (mut sink, rx, approvals, _c) = sink();
         let answered = std::thread::spawn(move || {
-            // Mirrors the supervisor: see the request, then answer.
+            // Mirrors the supervisor: see the request, then answer the
+            // call it actually names.
             let request = rx.recv().unwrap();
-            assert!(matches!(request.payload, Payload::ApprovalRequired { .. }));
-            approvals.send(true).unwrap();
+            approvals.send((requested_call(&request), true)).unwrap();
             rx
         });
         assert!(sink.request_approval("run_shell", "cargo test"));
@@ -309,8 +341,8 @@ mod tests {
     fn a_denied_call_is_reported_as_denied() {
         let (mut sink, rx, approvals, _c) = sink();
         let joined = std::thread::spawn(move || {
-            let _request = rx.recv().unwrap();
-            approvals.send(false).unwrap();
+            let request = rx.recv().unwrap();
+            approvals.send((requested_call(&request), false)).unwrap();
             rx
         });
         assert!(!sink.request_approval("write_file", "src/main.rs"));
@@ -323,12 +355,12 @@ mod tests {
     fn cancellation_while_waiting_is_never_read_as_permission() {
         let (mut sink, rx, approvals, cancelled) = sink();
         let joined = std::thread::spawn(move || {
-            let _request = rx.recv().unwrap();
+            let request = rx.recv().unwrap();
             // The supervisor's interrupt path: raise the flag, then
             // unpark the waiter. Even though this says `true`, the
             // cancellation must win.
             cancelled.store(true, Ordering::SeqCst);
-            approvals.send(true).unwrap();
+            approvals.send((requested_call(&request), true)).unwrap();
             rx
         });
         assert!(
@@ -351,9 +383,9 @@ mod tests {
     fn time_spent_waiting_on_a_human_is_recorded_as_such() {
         let (mut sink, rx, approvals, _c) = sink();
         let joined = std::thread::spawn(move || {
-            let _ = rx.recv().unwrap();
+            let request = rx.recv().unwrap();
             std::thread::sleep(std::time::Duration::from_millis(30));
-            approvals.send(true).unwrap();
+            approvals.send((requested_call(&request), true)).unwrap();
             rx
         });
         sink.request_approval("run_shell", "ls");

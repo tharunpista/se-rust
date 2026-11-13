@@ -27,6 +27,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserTurn {
     pub session: SessionId,
+    /// Allocated by the caller, so the identity it was told about and
+    /// the identity the core runs under are the same one. Two separate
+    /// allocations meant an interface could hold an id that no event
+    /// ever referred to.
+    pub task: TaskId,
     pub text: String,
     /// Files the user attached. Paths only: the core decides what is
     /// readable and how much of it to include, because that is a policy
@@ -315,6 +320,7 @@ mod tests {
 
         let op = CoreOp::SubmitUserTurn(UserTurn {
             session: SessionId::from_raw(1),
+            task: TaskId::from_raw(1),
             text: "hi".into(),
             attachments: vec![],
         });

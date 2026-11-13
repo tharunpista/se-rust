@@ -48,8 +48,16 @@ pub struct Service {
     pub display_name: &'static str,
     /// Environment variable holding an API key, overriding the store.
     pub key_var: &'static str,
-    /// The documented OpenAI-compatible base URL. Empty means the user
-    /// must supply one, which `detect` reports as unusable.
+    /// The service's documented OpenAI-compatible API root, including
+    /// whatever version segment it uses.
+    ///
+    /// The version is part of the configured root rather than being
+    /// appended by SE, because vendors do not agree on where it goes:
+    /// NVIDIA and OpenAI use `/v1`, Google uses `/v1beta/openai`, Groq
+    /// uses `/openai/v1`. Appending a fixed `/v1` produced
+    /// `/v1/v1/chat/completions` for Ollama and
+    /// `/v1beta/openai/v1/...` for Gemini. Empty means the user must
+    /// supply one, which `detect` reports as unusable.
     pub default_base_url: &'static str,
     /// Environment variable overriding the base URL. Required for
     /// self-hosted endpoints, and what tests point at a mock server.
@@ -62,14 +70,14 @@ pub const CATALOGUE: &[Service] = &[
         id: "nvidia",
         display_name: "NVIDIA NIM",
         key_var: "NVIDIA_API_KEY",
-        default_base_url: "https://integrate.api.nvidia.com",
+        default_base_url: "https://integrate.api.nvidia.com/v1",
         base_url_var: "NVIDIA_BASE_URL",
     },
     Service {
         id: "openai",
         display_name: "OpenAI",
         key_var: "OPENAI_API_KEY",
-        default_base_url: "https://api.openai.com",
+        default_base_url: "https://api.openai.com/v1",
         base_url_var: "OPENAI_BASE_URL",
     },
     Service {
@@ -83,21 +91,21 @@ pub const CATALOGUE: &[Service] = &[
         id: "openrouter",
         display_name: "OpenRouter",
         key_var: "OPENROUTER_API_KEY",
-        default_base_url: "https://openrouter.ai/api",
+        default_base_url: "https://openrouter.ai/api/v1",
         base_url_var: "OPENROUTER_BASE_URL",
     },
     Service {
         id: "deepseek",
         display_name: "DeepSeek",
         key_var: "DEEPSEEK_API_KEY",
-        default_base_url: "https://api.deepseek.com",
+        default_base_url: "https://api.deepseek.com/v1",
         base_url_var: "DEEPSEEK_BASE_URL",
     },
     Service {
         id: "groq",
         display_name: "Groq",
         key_var: "GROQ_API_KEY",
-        default_base_url: "https://api.groq.com/openai",
+        default_base_url: "https://api.groq.com/openai/v1",
         base_url_var: "GROQ_BASE_URL",
     },
     Service {
@@ -370,7 +378,7 @@ impl ModelProvider for OpenAiCompatible {
         on_event: &mut dyn FnMut(StreamEvent) -> bool,
     ) -> Result<(), ProviderError> {
         let key = self.key_or_error()?;
-        let url = self.endpoint("/v1/chat/completions")?;
+        let url = self.endpoint("/chat/completions")?;
 
         let messages: Vec<serde_json::Value> = request
             .messages
@@ -461,7 +469,7 @@ impl ModelProvider for OpenAiCompatible {
 
     fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         let key = self.key_or_error()?;
-        let url = self.endpoint("/v1/models")?;
+        let url = self.endpoint("/models")?;
         let response = agent()
             .get(&url)
             .set("Authorization", &format!("Bearer {key}"))
@@ -810,6 +818,64 @@ mod tests {
         }
         assert!(ids.contains("nvidia"));
         assert!(ids.contains("custom"));
+    }
+
+    /// Every endpoint must resolve to exactly one `chat/completions`
+    /// with no duplicated version segment.
+    ///
+    /// Regression for a real defect: a fixed `/v1` was appended to every
+    /// base, which gave Ollama `/v1/v1/chat/completions` and Gemini
+    /// `/v1beta/openai/v1/chat/completions`.
+    #[test]
+    fn no_catalogue_endpoint_duplicates_its_version_segment() {
+        for service in CATALOGUE {
+            if service.default_base_url.is_empty() {
+                continue;
+            }
+            let p = OpenAiCompatible::new(*service);
+            let chat = p.endpoint("/chat/completions").unwrap();
+            assert!(
+                !chat.contains("/v1/v1/"),
+                "{}: duplicated version segment in {chat}",
+                service.id
+            );
+            assert_eq!(
+                chat.matches("/chat/completions").count(),
+                1,
+                "{}: {chat}",
+                service.id
+            );
+            // And the root is a plausible absolute URL.
+            assert!(
+                chat.starts_with("http://") || chat.starts_with("https://"),
+                "{}: {chat}",
+                service.id
+            );
+        }
+    }
+
+    #[test]
+    fn the_documented_endpoints_are_what_each_vendor_publishes() {
+        let url = |id: &str| {
+            let s = CATALOGUE.iter().find(|s| s.id == id).unwrap();
+            OpenAiCompatible::new(*s)
+                .endpoint("/chat/completions")
+                .unwrap()
+        };
+        assert_eq!(
+            url("nvidia"),
+            "https://integrate.api.nvidia.com/v1/chat/completions"
+        );
+        assert_eq!(url("openai"), "https://api.openai.com/v1/chat/completions");
+        assert_eq!(
+            url("gemini"),
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        );
+        assert_eq!(
+            url("groq"),
+            "https://api.groq.com/openai/v1/chat/completions"
+        );
+        assert_eq!(url("ollama"), "http://localhost:11434/v1/chat/completions");
     }
 
     #[test]

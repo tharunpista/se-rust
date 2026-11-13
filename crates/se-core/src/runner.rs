@@ -13,6 +13,7 @@
 //! provider-backed runner and must change no interface code at all.
 
 use se_protocol::{Outcome, Usage, UsageSource, UserTurn};
+use se_provider::Message;
 
 use crate::sink::TurnSink;
 
@@ -30,10 +31,15 @@ pub trait Runner: Send + Sync + 'static {
 
     /// Runs the task to completion.
     ///
+    /// `history` is the conversation before this turn, oldest first,
+    /// owned by the core rather than by the runner: a runner holds no
+    /// per-task state (one instance serves every task), and a turn that
+    /// cannot see the previous one is not a conversation.
+    ///
     /// Must return an [`Outcome`] on every path, and should check
     /// [`TurnSink::is_cancelled`] wherever it would otherwise keep the
     /// user waiting.
-    fn run(&self, turn: &UserTurn, sink: &mut TurnSink) -> Outcome;
+    fn run(&self, turn: &UserTurn, history: &[Message], sink: &mut TurnSink) -> Outcome;
 }
 
 /// A runner with no dependencies, used to exercise the pipeline.
@@ -72,7 +78,7 @@ impl Runner for EchoRunner {
         ("echo".to_string(), "echo-1".to_string())
     }
 
-    fn run(&self, turn: &UserTurn, sink: &mut TurnSink) -> Outcome {
+    fn run(&self, turn: &UserTurn, _history: &[Message], sink: &mut TurnSink) -> Outcome {
         let (provider, model) = self.describe();
         if sink.start_turn(&provider, &model).is_err() {
             return Outcome::Failed {
@@ -143,7 +149,7 @@ impl Runner for ApprovalRunner {
         ("echo".to_string(), "echo-approval".to_string())
     }
 
-    fn run(&self, turn: &UserTurn, sink: &mut TurnSink) -> Outcome {
+    fn run(&self, turn: &UserTurn, _history: &[Message], sink: &mut TurnSink) -> Outcome {
         let (provider, model) = self.describe();
         if sink.start_turn(&provider, &model).is_err() {
             return Outcome::Failed {
@@ -172,6 +178,38 @@ impl Runner for ApprovalRunner {
     }
 }
 
+/// Requests approval for two different tools in sequence, so that a
+/// decision meant for one can be shown not to answer the other.
+pub struct TwoApprovalRunner;
+
+impl Runner for TwoApprovalRunner {
+    fn describe(&self) -> (String, String) {
+        ("echo".to_string(), "echo-two-approvals".to_string())
+    }
+
+    fn run(&self, _turn: &UserTurn, _history: &[Message], sink: &mut TurnSink) -> Outcome {
+        let (provider, model) = self.describe();
+        if sink.start_turn(&provider, &model).is_err() {
+            return Outcome::Failed {
+                detail: "the interface disconnected".to_string(),
+            };
+        }
+        let mut ran = Vec::new();
+        for tool in ["first_tool", "second_tool"] {
+            if sink.request_approval(tool, "please decide") {
+                // A real tool takes time to run. The pause matters: it
+                // is the window in which a stray decision can arrive
+                // with nothing waiting to consume it.
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                ran.push(tool);
+            }
+        }
+        Outcome::Completed {
+            final_text: format!("ran: {}", ran.join(",")),
+        }
+    }
+}
+
 /// Panics on purpose, to prove a broken runner still yields a terminal
 /// event rather than a view stuck on "running" (I5).
 #[cfg(test)]
@@ -183,7 +221,7 @@ impl Runner for PanickingRunner {
         ("broken".to_string(), "broken-1".to_string())
     }
 
-    fn run(&self, _turn: &UserTurn, _sink: &mut TurnSink) -> Outcome {
+    fn run(&self, _turn: &UserTurn, _history: &[Message], _sink: &mut TurnSink) -> Outcome {
         panic!("this runner is deliberately broken");
     }
 }

@@ -195,11 +195,23 @@ fn draw_transcript(f: &mut Frame, area: Rect, state: &AppState) {
         }
     }
 
+    // Wrapped here rather than by `Paragraph`, because the scroll
+    // offset is counted in *rendered* lines.
+    //
+    // The defect this fixes: a model's answer is one logical line no
+    // matter how long it is, so counting logical lines made a single
+    // streamed paragraph look like one row. Everything below it was
+    // then pushed off the bottom of the viewport, with no way to scroll
+    // to it. Lines are now pre-wrapped to the available width, so the
+    // count the offset uses is the count the terminal shows.
+    let inner_width = area.width.saturating_sub(1).max(1);
+    let wrapped = wrap_lines(lines, inner_width);
+
     // `scroll` counts lines back from the newest, so the view stays
     // pinned to the bottom while content streams in.
-    let viewport = area.height.saturating_sub(2) as usize;
-    let offset = if lines.len() > viewport {
-        (lines.len() - viewport).saturating_sub(state.scroll as usize)
+    let viewport = area.height.saturating_sub(1) as usize;
+    let offset = if wrapped.len() > viewport {
+        (wrapped.len() - viewport).saturating_sub(state.scroll as usize)
     } else {
         0
     };
@@ -208,12 +220,89 @@ fn draw_transcript(f: &mut Frame, area: Rect, state: &AppState) {
         .borders(Borders::TOP)
         .border_style(theme::muted());
     f.render_widget(
-        Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>())
+        Paragraph::new(wrapped.into_iter().skip(offset).collect::<Vec<_>>())
             .style(theme::base())
-            .wrap(Wrap { trim: false })
             .block(block),
         area,
     );
+}
+
+/// Breaks lines at `width`, preferring word boundaries.
+///
+/// Styling is preserved per span: a wrapped fragment keeps the style of
+/// the span it came from, so a tool row stays coloured when it wraps.
+fn wrap_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    let width = width.max(1) as usize;
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let total: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+        if total <= width {
+            out.push(line);
+            continue;
+        }
+        let mut current: Vec<Span<'static>> = Vec::new();
+        let mut used = 0usize;
+        for span in line.spans {
+            let style = span.style;
+            for word in split_keeping_spaces(&span.content) {
+                let len = word.chars().count();
+                // A word longer than the viewport is broken rather than
+                // dropped: narrow terminals and long paths both happen.
+                if len > width {
+                    for chunk in chunk_chars(&word, width) {
+                        if used > 0 {
+                            out.push(Line::from(std::mem::take(&mut current)));
+                        }
+                        used = chunk.chars().count();
+                        current.push(Span::styled(chunk, style));
+                    }
+                    continue;
+                }
+                if used + len > width {
+                    out.push(Line::from(std::mem::take(&mut current)));
+                    used = 0;
+                    // A wrap point swallows the space that caused it.
+                    if word.trim().is_empty() {
+                        continue;
+                    }
+                }
+                current.push(Span::styled(word, style));
+                used += len;
+            }
+        }
+        if !current.is_empty() {
+            out.push(Line::from(current));
+        }
+    }
+    out
+}
+
+/// Splits into words, keeping each trailing run of spaces attached so
+/// wrapping does not silently reflow deliberate spacing.
+fn split_keeping_spaces(text: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_space = false;
+    for c in text.chars() {
+        let is_space = c == ' ';
+        if !current.is_empty() && is_space != in_space && !is_space {
+            parts.push(std::mem::take(&mut current));
+        }
+        current.push(c);
+        in_space = is_space;
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
+fn chunk_chars(text: &str, width: usize) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    chars
+        .chunks(width.max(1))
+        .map(|c| c.iter().collect())
+        .collect()
 }
 
 fn draw_composer(f: &mut Frame, area: Rect, state: &AppState) {
@@ -419,5 +508,92 @@ mod tests {
         assert!(cut.ends_with('…'));
         // Newlines in a tool summary must not break the single-line row.
         assert_eq!(truncate("a\nb", 10), "a b");
+    }
+}
+
+#[cfg(test)]
+mod wrapping {
+    use super::*;
+    use crate::state::{AppState, Entry};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn render(state: &AppState, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| draw(f, state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// A model's answer is one logical line however long it is. Counting
+    /// logical lines pushed everything after it off the bottom with no
+    /// way to scroll back, so the end of a long answer was unreachable.
+    #[test]
+    fn the_end_of_a_very_long_answer_is_visible() {
+        let mut state = AppState::new();
+        let long: String = (0..200).map(|i| format!("word{i} ")).collect::<String>();
+        state.push(Entry::Assistant(format!("{long}FINALWORD")));
+
+        let out = render(&state, 60, 20);
+        assert!(
+            out.contains("FINALWORD"),
+            "the end of a long answer must be on screen:\n{out}"
+        );
+    }
+
+    #[test]
+    fn scrolling_back_through_a_long_answer_reaches_its_beginning() {
+        let mut state = AppState::new();
+        let long: String = (0..200).map(|i| format!("word{i} ")).collect();
+        state.push(Entry::Assistant(long));
+
+        state.scroll = 400;
+        let out = render(&state, 60, 20);
+        assert!(
+            out.contains("word0"),
+            "scrolling back must reach the start:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_word_longer_than_the_terminal_is_broken_not_dropped() {
+        let mut state = AppState::new();
+        state.push(Entry::Assistant("x".repeat(300)));
+        let out = render(&state, 30, 12);
+        // Every rendered row is within the width, and the content is
+        // present rather than silently truncated to one row.
+        let rows: Vec<&str> = out.lines().filter(|l| l.contains('x')).collect();
+        assert!(rows.len() > 5, "a 300-char word must occupy several rows");
+    }
+
+    #[test]
+    fn wrapping_preserves_text_content_exactly() {
+        let line = Line::from(vec![Span::raw("hello world this is a test of wrapping")]);
+        let wrapped = wrap_lines(vec![line], 10);
+        let joined: String = wrapped
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect::<Vec<_>>()
+            .join("");
+        // Spaces at wrap points are consumed, so compare words.
+        let original: Vec<&str> = "hello world this is a test of wrapping"
+            .split_whitespace()
+            .collect();
+        let after: Vec<&str> = joined.split_whitespace().collect();
+        assert_eq!(original, after, "no word may be lost or duplicated");
+    }
+
+    #[test]
+    fn a_short_line_is_left_untouched() {
+        let line = Line::from(vec![Span::raw("short")]);
+        let wrapped = wrap_lines(vec![line], 40);
+        assert_eq!(wrapped.len(), 1);
     }
 }

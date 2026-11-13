@@ -11,7 +11,9 @@ use std::io::{self, IsTerminal, Stdout, Write};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -192,7 +194,17 @@ fn interactive(cli: &Cli, startup: se_protocol::Running) -> io::Result<()> {
 fn enter() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Bracketed paste matters for correctness, not comfort: without it
+    // a pasted multi-line prompt arrives as individual Enter presses,
+    // so the first newline submits a half-pasted request. The interface
+    // already handles `Event::Paste`; until now that arm was
+    // unreachable because the mode was never enabled.
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     Terminal::new(CrosstermBackend::new(stdout))
 }
 
@@ -200,7 +212,12 @@ fn restore() -> io::Result<()> {
     let mut stdout = io::stdout();
     // Each step is attempted even if an earlier one failed: leaving raw
     // mode enabled is far worse than a redundant escape sequence.
-    let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
+    let _ = execute!(
+        stdout,
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    );
     let _ = disable_raw_mode();
     Ok(())
 }
@@ -454,9 +471,13 @@ fn doctor(startup: se_protocol::Running) -> std::process::ExitCode {
     println!("  What works in this build:");
     println!("    interface        event-driven; never blocks on a turn");
     println!("    turn lifecycle   streaming, cancellation, approval, timings");
-    println!("    providers        OpenAI-compatible streaming (NVIDIA, OpenAI, Gemini,");
-    println!("                     OpenRouter, DeepSeek, Groq, Ollama, custom endpoints)");
+    println!("    providers        one OpenAI-compatible streaming adapter, with endpoints");
+    println!("                     catalogued for NVIDIA, OpenAI, Gemini, OpenRouter,");
+    println!("                     DeepSeek, Groq, Ollama and custom roots. Tested against");
+    println!("                     mock endpoints only — no live vendor API has been called");
+    println!("                     from this build, so `se models <id>` is the real check");
     println!("    credentials      OS-native secure storage");
+    println!("    conversation     history is sent back on later turns (in memory only)");
     println!();
     println!("  Not implemented yet, and not pretended otherwise:");
     println!("    tools / sandbox  Phase 3 — the model cannot read or change files");
