@@ -164,18 +164,26 @@ impl TurnSink {
         self.emit(Payload::UsageUpdated(usage))
     }
 
+    /// Announces that `call` -- an id already minted by
+    /// [`TurnSink::request_approval`] -- is now actually running.
+    ///
+    /// Takes the id rather than minting its own, which is the E7 fix:
+    /// before this, a call was approved under one `ToolCallId` and then
+    /// announced and completed under a second, unrelated one that
+    /// `tool_requested` minted for itself, so nothing connected what
+    /// the user approved to what actually ran. There is now exactly one
+    /// id per call, created once, at the point permission is asked.
     pub fn tool_requested(
         &mut self,
+        call: ToolCallId,
         name: &str,
         summary: &str,
-    ) -> Result<ToolCallId, Disconnected> {
-        let call = ToolCallId::next();
+    ) -> Result<(), Disconnected> {
         self.emit(Payload::ToolRequested {
             call,
             name: name.to_string(),
             summary: summary.to_string(),
-        })?;
-        Ok(call)
+        })
     }
 
     pub fn tool_completed(
@@ -199,10 +207,14 @@ impl TurnSink {
     /// own loop, drawing and reading input, which is the difference from
     /// the previous implementation's nested `event::read()`.
     ///
-    /// Returns `false` if the task was cancelled while waiting or the
-    /// interface disappeared: a withheld decision is never treated as
-    /// permission.
-    pub fn request_approval(&mut self, name: &str, summary: &str) -> bool {
+    /// Returns the call's id on approval -- the same id to pass to
+    /// [`TurnSink::tool_requested`] and [`TurnSink::tool_completed`], so
+    /// the approved call and the executed call are structurally one
+    /// thing, not two ids a caller must remember to keep in sync.
+    /// Returns `None` if denied, if the task was cancelled while
+    /// waiting, or if the interface disappeared: a withheld decision is
+    /// never treated as permission.
+    pub fn request_approval(&mut self, name: &str, summary: &str) -> Option<ToolCallId> {
         let call = ToolCallId::next();
         if self
             .emit(Payload::ApprovalRequired {
@@ -212,7 +224,7 @@ impl TurnSink {
             })
             .is_err()
         {
-            return false;
+            return None;
         }
         let waiting = se_protocol::Running::start(Stage::ApprovalWait);
         // A decision must name the call it answers. Anything else is
@@ -254,8 +266,9 @@ impl TurnSink {
                 call,
                 name: name.to_string(),
             });
+            return None;
         }
-        allowed
+        Some(call)
     }
 
     /// Records a completed measurement against this task.
@@ -357,7 +370,7 @@ mod tests {
             approvals.send((requested_call(&request), true)).unwrap();
             rx
         });
-        assert!(sink.request_approval("run_shell", "cargo test"));
+        assert!(sink.request_approval("run_shell", "cargo test").is_some());
         let _rx = answered.join().unwrap();
     }
 
@@ -369,7 +382,7 @@ mod tests {
             approvals.send((requested_call(&request), false)).unwrap();
             rx
         });
-        assert!(!sink.request_approval("write_file", "src/main.rs"));
+        assert!(sink.request_approval("write_file", "src/main.rs").is_none());
         let rx = joined.join().unwrap();
         let denied = rx.recv().unwrap();
         assert!(matches!(denied.payload, Payload::ToolDenied { .. }));
@@ -388,7 +401,7 @@ mod tests {
             rx
         });
         assert!(
-            !sink.request_approval("run_shell", "rm -rf /"),
+            sink.request_approval("run_shell", "rm -rf /").is_none(),
             "a cancelled task must not act on a stale approval"
         );
         let _rx = joined.join().unwrap();
@@ -419,7 +432,7 @@ mod tests {
         });
         let started = std::time::Instant::now();
         assert!(
-            !sink.request_approval("run_shell", "anything"),
+            sink.request_approval("run_shell", "anything").is_none(),
             "a cancelled task must not hang waiting for an UNPARK that never arrives"
         );
         assert!(
@@ -435,7 +448,7 @@ mod tests {
         let (mut sink, rx, approvals, _c) = sink();
         // The interface goes away without answering.
         drop(approvals);
-        assert!(!sink.request_approval("run_shell", "anything"));
+        assert!(sink.request_approval("run_shell", "anything").is_none());
         drop(rx);
     }
 

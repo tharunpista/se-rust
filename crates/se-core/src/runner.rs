@@ -140,6 +140,13 @@ impl Runner for EchoRunner {
 
 /// Requests approval before echoing, to exercise the approval round
 /// trip end to end.
+///
+/// Exists to drive the sink's approval machinery in tests, not as a
+/// real tool runner -- there is no tool system to run yet, and no
+/// `se` binary code path references this type. `#[cfg(test)]`-gating
+/// was tried and reverted: it broke se-tui's own tests, which exercise
+/// this cross-crate the same way `EchoRunner` already is, and that
+/// existing convention is worth more than the marginal gate.
 pub struct ApprovalRunner {
     pub tool: &'static str,
 }
@@ -156,21 +163,20 @@ impl Runner for ApprovalRunner {
                 detail: "the interface disconnected".to_string(),
             };
         }
-        if !sink.request_approval(self.tool, &turn.text) {
+        let Some(call) = sink.request_approval(self.tool, &turn.text) else {
             // A refusal is a normal outcome, not an error: the user said
             // no and the transcript should say exactly that.
             return Outcome::Completed {
                 final_text: format!("{} was not approved, so nothing ran", self.tool),
             };
-        }
-        let call = match sink.tool_requested(self.tool, &turn.text) {
-            Ok(call) => call,
-            Err(_) => {
-                return Outcome::Failed {
-                    detail: "the interface disconnected".to_string(),
-                }
-            }
         };
+        // The same id approval was granted under, not a new one: this
+        // is the E7 fix in use, not just in the sink's own definition.
+        if sink.tool_requested(call, self.tool, &turn.text).is_err() {
+            return Outcome::Failed {
+                detail: "the interface disconnected".to_string(),
+            };
+        }
         let _ = sink.tool_completed(call, self.tool, true, "approved and ran");
         Outcome::Completed {
             final_text: format!("{} ran", self.tool),
@@ -196,7 +202,7 @@ impl Runner for TwoApprovalRunner {
         }
         let mut ran = Vec::new();
         for tool in ["first_tool", "second_tool"] {
-            if sink.request_approval(tool, "please decide") {
+            if sink.request_approval(tool, "please decide").is_some() {
                 // A real tool takes time to run. The pause matters: it
                 // is the window in which a stray decision can arrive
                 // with nothing waiting to consume it.

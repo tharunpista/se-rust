@@ -810,6 +810,54 @@ mod tests {
     /// approve the *next* request -- an approval bypass reachable by
     /// pressing `y` twice.
     #[test]
+    fn the_approved_call_id_is_the_same_id_the_tool_actually_runs_and_completes_under() {
+        // E7: `request_approval` used to hand back a plain bool, and
+        // `tool_requested` minted its own id for what the sink had
+        // already approved -- so the id a human approved and the id
+        // the tool actually ran under were two different numbers with
+        // nothing connecting them. This drives a real ApprovalRunner
+        // through a real CoreHandle and asserts all three events name
+        // the same call.
+        let handle = start(crate::runner::ApprovalRunner { tool: "run_shell" });
+        handle.submit("please run it", vec![]).unwrap();
+
+        let mut approval_required_call = None;
+        let mut tool_requested_call = None;
+        let mut tool_completed_call = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        'outer: while std::time::Instant::now() < deadline {
+            for event in handle.drain_blocking(Duration::from_millis(20)) {
+                match &event.payload {
+                    Payload::ApprovalRequired { call, .. } => {
+                        approval_required_call = Some(*call);
+                        handle.approve(se_protocol::ApprovalDecision {
+                            call: *call,
+                            allow: true,
+                        });
+                    }
+                    Payload::ToolRequested { call, .. } => tool_requested_call = Some(*call),
+                    Payload::ToolCompleted { call, .. } => tool_completed_call = Some(*call),
+                    Payload::TaskFinished { .. } => break 'outer,
+                    _ => {}
+                }
+            }
+        }
+        handle.shutdown();
+
+        let approved = approval_required_call.expect("must have asked for approval");
+        assert_eq!(
+            tool_requested_call,
+            Some(approved),
+            "the tool must announce itself under the exact id that was approved"
+        );
+        assert_eq!(
+            tool_completed_call,
+            Some(approved),
+            "the tool must complete under the exact id that was approved"
+        );
+    }
+
+    #[test]
     fn a_stray_decision_never_approves_a_later_tool_call() {
         let handle = start(crate::runner::TwoApprovalRunner);
         handle.submit("do two things", vec![]).unwrap();
