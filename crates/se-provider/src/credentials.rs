@@ -64,6 +64,7 @@ fn entry(id: &str) -> Result<keyring::Entry, String> {
 /// Consulted on every call by design -- see the module note.
 pub fn load(id: &str, env_var: &str) -> Option<String> {
     if let Ok(v) = std::env::var(env_var) {
+        let v = sanitise(&v);
         if !v.is_empty() {
             return Some(v);
         }
@@ -72,7 +73,29 @@ pub fn load(id: &str, env_var: &str) -> Option<String> {
         .ok()?
         .get_password()
         .ok()
+        .map(|v| sanitise(&v))
         .filter(|v| !v.is_empty())
+}
+
+/// Trims a credential and drops anything that cannot go in an HTTP
+/// header.
+///
+/// A pasted key routinely carries a trailing newline or stray
+/// whitespace. Left in place it produced an invalid-header error whose
+/// text could contain the header *value* -- the key itself leaking into
+/// a user-visible error, which breaks I8. Control characters go for the
+/// same reason. Non-ASCII is kept here but rejected by `header_safe`,
+/// which reports the problem without quoting the value.
+fn sanitise(raw: &str) -> String {
+    raw.trim().chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Whether a credential can be placed in an HTTP header at all.
+///
+/// Checked before building the header so the failure is a clear message
+/// rather than a transport error that might echo the value.
+pub fn header_safe(secret: &str) -> bool {
+    !secret.is_empty() && secret.is_ascii()
 }
 
 pub fn source(id: &str, env_var: &str) -> Source {
@@ -229,6 +252,36 @@ mod tests {
         assert!(store(&id, "   ").is_err());
         assert!(store(&id, "").is_err());
         assert_eq!(source(&id, "SE_TEST_VAR_UNSET_ON_PURPOSE"), Source::None);
+    }
+
+    /// A pasted key routinely carries a trailing newline. Left in, it
+    /// produced an invalid-header error whose text could echo the
+    /// header value -- the key itself leaking into a visible error.
+    #[test]
+    fn a_pasted_credential_is_trimmed_of_whitespace_and_control_characters() {
+        let _guard = test_lock();
+        let id = scratch_id("sanitise");
+        let var = format!("SE_TEST_SANITISE_{}", std::process::id());
+
+        std::env::set_var(&var, "  sk-with-newline\n");
+        assert_eq!(load(&id, &var).as_deref(), Some("sk-with-newline"));
+
+        std::env::set_var(&var, "sk\u{7}bell");
+        assert_eq!(load(&id, &var).as_deref(), Some("skbell"));
+
+        // Whitespace only is not a credential at all.
+        std::env::set_var(&var, "   \n  ");
+        assert!(load(&id, &var).is_none());
+        std::env::remove_var(&var);
+    }
+
+    #[test]
+    fn a_credential_that_cannot_go_in_a_header_is_rejected_without_quoting_it() {
+        assert!(header_safe("sk-ascii-key"));
+        assert!(!header_safe(""));
+        // Non-ASCII cannot be a header value; the check reports that
+        // without ever including the value in the message.
+        assert!(!header_safe("sk-caf\u{e9}-key"));
     }
 
     #[test]

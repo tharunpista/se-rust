@@ -107,6 +107,7 @@ impl Runner for ProviderRunner {
         });
 
         let mut answer = String::new();
+        let mut finish_reason: Option<String> = None;
         let mut reported_usage: Option<Usage> = None;
         let mut first_token_at: Option<std::time::Instant> = None;
         let request_started = std::time::Instant::now();
@@ -155,6 +156,16 @@ impl Runner for ProviderRunner {
                     });
                     true
                 }
+                // A mid-stream provider error becomes a transport-level
+                // failure via the `Err` the provider returns; nothing is
+                // appended to `answer`, so a failed turn cannot present
+                // a partial reply as the answer.
+                StreamEvent::Error(_) => false,
+                // Recorded for the outcome, not shown as content.
+                StreamEvent::FinishReason(reason) => {
+                    finish_reason = Some(reason);
+                    true
+                }
                 StreamEvent::Done => true,
             },
         );
@@ -185,7 +196,22 @@ impl Runner for ProviderRunner {
             Ok(()) if disconnected => Outcome::Failed {
                 detail: "the interface disconnected mid-answer".to_string(),
             },
-            Ok(()) => Outcome::Completed { final_text: answer },
+            Ok(()) => {
+                // A provider that completed without ever saying why it
+                // stopped is accepted (many send only `[DONE]`), but a
+                // recorded reason other than a normal stop is surfaced
+                // rather than silently dropped.
+                match finish_reason.as_deref() {
+                    None | Some("stop") | Some("end_turn") => {
+                        Outcome::Completed { final_text: answer }
+                    }
+                    Some(other) => Outcome::Failed {
+                        detail: format!(
+                            "the provider stopped early ({other}); the answer may be incomplete"
+                        ),
+                    },
+                }
+            }
             Err(ProviderError::Cancelled) => Outcome::Cancelled,
             Err(e) => Outcome::Failed {
                 detail: e.to_string(),
@@ -263,6 +289,7 @@ mod tests {
         key_var: "SE_TEST_SCRIPTED_KEY",
         default_base_url: "http://127.0.0.1:1",
         base_url_var: "SE_TEST_SCRIPTED_BASE_URL",
+        key_required: true,
     };
 
     fn runner_with(

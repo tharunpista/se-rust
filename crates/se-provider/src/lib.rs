@@ -52,7 +52,21 @@ pub enum StreamEvent {
         output_tokens: Option<u64>,
         cached_input_tokens: Option<u64>,
     },
-    /// The provider signalled the end of the response.
+    /// The provider reported an error *inside* a 200 response stream.
+    ///
+    /// Vendors do this: the HTTP status is 200, the body opens as an
+    /// event stream, and a later frame carries `{"error": …}`. Without
+    /// this variant such a frame parsed as "no content" and was
+    /// silently dropped, so a failed generation finished as a complete,
+    /// usually empty, answer.
+    Error(String),
+    /// Why the provider stopped, verbatim (`stop`, `length`,
+    /// `content_filter`, …).
+    ///
+    /// Carried because `length` means the answer was truncated, which
+    /// must not be reported as a finished reply.
+    FinishReason(String),
+    /// The provider signalled the end of the response (`[DONE]`).
     Done,
 }
 

@@ -62,6 +62,13 @@ pub struct Service {
     /// Environment variable overriding the base URL. Required for
     /// self-hosted endpoints, and what tests point at a mock server.
     pub base_url_var: &'static str,
+    /// Whether this service needs a credential at all.
+    ///
+    /// A local Ollama serves `/v1/chat/completions` with no auth, so
+    /// demanding a key made it unusable without inventing a fake one --
+    /// and an `Authorization: Bearer <nonsense>` header sent to a
+    /// server that does not want one is worse than sending none.
+    pub key_required: bool,
 }
 
 /// The services SE registers.
@@ -72,6 +79,7 @@ pub const CATALOGUE: &[Service] = &[
         key_var: "NVIDIA_API_KEY",
         default_base_url: "https://integrate.api.nvidia.com/v1",
         base_url_var: "NVIDIA_BASE_URL",
+        key_required: true,
     },
     Service {
         id: "openai",
@@ -79,6 +87,7 @@ pub const CATALOGUE: &[Service] = &[
         key_var: "OPENAI_API_KEY",
         default_base_url: "https://api.openai.com/v1",
         base_url_var: "OPENAI_BASE_URL",
+        key_required: true,
     },
     Service {
         id: "gemini",
@@ -86,6 +95,7 @@ pub const CATALOGUE: &[Service] = &[
         key_var: "GEMINI_API_KEY",
         default_base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
         base_url_var: "GEMINI_BASE_URL",
+        key_required: true,
     },
     Service {
         id: "openrouter",
@@ -93,6 +103,7 @@ pub const CATALOGUE: &[Service] = &[
         key_var: "OPENROUTER_API_KEY",
         default_base_url: "https://openrouter.ai/api/v1",
         base_url_var: "OPENROUTER_BASE_URL",
+        key_required: true,
     },
     Service {
         id: "deepseek",
@@ -100,6 +111,7 @@ pub const CATALOGUE: &[Service] = &[
         key_var: "DEEPSEEK_API_KEY",
         default_base_url: "https://api.deepseek.com/v1",
         base_url_var: "DEEPSEEK_BASE_URL",
+        key_required: true,
     },
     Service {
         id: "groq",
@@ -107,6 +119,7 @@ pub const CATALOGUE: &[Service] = &[
         key_var: "GROQ_API_KEY",
         default_base_url: "https://api.groq.com/openai/v1",
         base_url_var: "GROQ_BASE_URL",
+        key_required: true,
     },
     Service {
         id: "ollama",
@@ -114,6 +127,7 @@ pub const CATALOGUE: &[Service] = &[
         key_var: "OLLAMA_API_KEY",
         default_base_url: "http://localhost:11434/v1",
         base_url_var: "OLLAMA_BASE_URL",
+        key_required: false,
     },
     Service {
         id: "custom",
@@ -121,6 +135,7 @@ pub const CATALOGUE: &[Service] = &[
         key_var: "SE_CUSTOM_API_KEY",
         default_base_url: "",
         base_url_var: "SE_CUSTOM_BASE_URL",
+        key_required: true,
     },
 ];
 
@@ -207,13 +222,20 @@ impl OpenAiCompatible {
         Ok(format!("{base}{path}"))
     }
 
-    fn key_or_error(&self) -> Result<String, ProviderError> {
-        self.api_key().ok_or_else(|| {
-            ProviderError::NotConfigured(format!(
+    /// The credential, if this service needs one.
+    ///
+    /// `Ok(None)` is a valid, fully-configured state for a service with
+    /// `key_required: false` (a local Ollama). Callers must then send no
+    /// `Authorization` header at all.
+    fn key_or_error(&self) -> Result<Option<String>, ProviderError> {
+        match self.api_key() {
+            Some(key) => Ok(Some(key)),
+            None if !self.service.key_required => Ok(None),
+            None => Err(ProviderError::NotConfigured(format!(
                 "no credential for {} — run `se connect {}`, or set {}",
                 self.service.id, self.service.id, self.service.key_var
-            ))
-        })
+            ))),
+        }
     }
 }
 
@@ -248,78 +270,106 @@ pub fn parse_model_list(body: &serde_json::Value) -> Vec<ModelInfo> {
         .unwrap_or_default()
 }
 
-/// Interprets one SSE `data:` payload.
+/// Interprets one SSE `data:` payload, returning **every** event it
+/// carries.
 ///
-/// Returns `None` for frames that carry nothing a caller needs, so the
-/// stream loop stays readable.
-pub fn parse_stream_frame(payload: &str) -> Option<StreamEvent> {
+/// Returns a `Vec` rather than an `Option<StreamEvent>` because a single
+/// frame genuinely can carry more than one fact, and the previous
+/// one-event-per-frame signature silently dropped the extras. Two cases
+/// were confirmed by reading the old code against real frame shapes:
+///
+/// * a frame with `usage` **and** a content delta returned only the
+///   text, so the token accounting vanished (the old comment claimed
+///   the delta was "handled below on the next call" -- there is no next
+///   call; this function is invoked once per line);
+/// * a frame with `reasoning_content` **and** `content` returned only
+///   the reasoning, so the actual answer text vanished.
+///
+/// An empty `Vec` means the frame carried nothing a caller needs
+/// (keep-alives, role-only openers, unparseable lines).
+pub fn parse_stream_frame(payload: &str) -> Vec<StreamEvent> {
     let payload = payload.trim();
     if payload.is_empty() {
-        return None;
+        return Vec::new();
     }
     // The documented end-of-stream sentinel.
     if payload == "[DONE]" {
-        return Some(StreamEvent::Done);
+        return vec![StreamEvent::Done];
     }
-    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        // A malformed line is skipped rather than killing the stream,
+        // but it is never mistaken for content.
+        return Vec::new();
+    };
 
-    // Usage arrives in its own frame when requested, often alongside an
-    // empty choices array.
-    if let Some(usage) = value.get("usage").filter(|u| !u.is_null()) {
+    let mut events = Vec::new();
+
+    // An error delivered *inside* a 200 response stream. Checked first:
+    // if a provider reports a failure mid-stream, nothing else in the
+    // frame should be treated as a usable answer.
+    if let Some(error) = value.get("error").filter(|e| !e.is_null()) {
+        let detail = error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| error.to_string());
+        events.push(StreamEvent::Error(detail));
+        return events;
+    }
+
+    // Usage, wherever the vendor put it. Groq nests streaming usage
+    // under `x_groq`; the top level is the OpenAI-documented position.
+    let usage_value = value
+        .get("usage")
+        .filter(|u| !u.is_null())
+        .or_else(|| value.get("x_groq").and_then(|g| g.get("usage")));
+    if let Some(usage) = usage_value {
         let get = |k: &str| usage.get(k).and_then(|v| v.as_u64());
         let cached = usage
             .get("prompt_tokens_details")
             .and_then(|d| d.get("cached_tokens"))
             .and_then(|v| v.as_u64());
-        let event = StreamEvent::Usage {
+        events.push(StreamEvent::Usage {
             input_tokens: get("prompt_tokens"),
             output_tokens: get("completion_tokens"),
             cached_input_tokens: cached,
-        };
-        // A frame can carry both usage and a delta; the delta is handled
-        // below on the next call, so only return usage if there is no
-        // content here.
-        let has_content = value
-            .get("choices")
-            .and_then(|c| c.as_array())
-            .map(|c| {
-                c.iter().any(|choice| {
-                    choice
-                        .get("delta")
-                        .and_then(|d| d.get("content"))
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|s| !s.is_empty())
-                })
-            })
-            .unwrap_or(false);
-        if !has_content {
-            return Some(event);
+        });
+    }
+
+    // Every choice, not just the first: a frame may carry several.
+    let choices = value.get("choices").and_then(|c| c.as_array());
+    for choice in choices.into_iter().flatten() {
+        if let Some(delta) = choice.get("delta") {
+            // Reasoning models expose thinking under a separate key. It
+            // is emitted alongside, never instead of, the answer.
+            if let Some(reasoning) = delta
+                .get("reasoning_content")
+                .or_else(|| delta.get("reasoning"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                events.push(StreamEvent::ReasoningDelta(reasoning.to_string()));
+            }
+            if let Some(text) = delta
+                .get("content")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                events.push(StreamEvent::TextDelta(text.to_string()));
+            }
+        }
+        // Why the provider stopped. `length` means truncated, which the
+        // caller must not report as a finished answer.
+        if let Some(reason) = choice
+            .get("finish_reason")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            events.push(StreamEvent::FinishReason(reason.to_string()));
         }
     }
 
-    let delta = value
-        .get("choices")
-        .and_then(|c| c.as_array())
-        .and_then(|c| c.first())
-        .and_then(|choice| choice.get("delta"))?;
-
-    // Reasoning models expose their thinking under a separate key; it is
-    // kept distinct because it is not the answer.
-    if let Some(reasoning) = delta
-        .get("reasoning_content")
-        .or_else(|| delta.get("reasoning"))
-        .and_then(|v| v.as_str())
-    {
-        if !reasoning.is_empty() {
-            return Some(StreamEvent::ReasoningDelta(reasoning.to_string()));
-        }
-    }
-
-    let text = delta.get("content").and_then(|v| v.as_str())?;
-    if text.is_empty() {
-        return None;
-    }
-    Some(StreamEvent::TextDelta(text.to_string()))
+    events
 }
 
 impl ModelProvider for OpenAiCompatible {
@@ -353,6 +403,15 @@ impl ModelProvider for OpenAiCompatible {
             };
         }
         if !source.is_configured() {
+            if !self.service.key_required {
+                // No credential is the correct, complete configuration
+                // for this service. Still not a reachability claim.
+                return Status {
+                    configured: true,
+                    detail: "no credential needed — not yet validated".to_string(),
+                    source,
+                };
+            }
             return Status {
                 configured: false,
                 detail: format!(
@@ -410,12 +469,14 @@ impl ModelProvider for OpenAiCompatible {
             return Err(ProviderError::Cancelled);
         }
 
-        let response = agent()
+        let mut request = agent()
             .post(&url)
-            .set("Authorization", &format!("Bearer {key}"))
             .set("Content-Type", "application/json")
-            .set("Accept", "text/event-stream")
-            .send_json(body);
+            .set("Accept", "text/event-stream");
+        if let Some(key) = &key {
+            request = request.set("Authorization", &format!("Bearer {key}"));
+        }
+        let response = request.send_json(body);
 
         let response = match response {
             Ok(r) => r,
@@ -432,6 +493,11 @@ impl ModelProvider for OpenAiCompatible {
 
         let mut reader = BufReader::new(response.into_reader());
         let mut line = String::new();
+        // Whether the provider ever said why it stopped. A stream that
+        // just ends is not the same as one that finished, and treating
+        // the two alike meant a connection dropped mid-answer was
+        // reported as a complete reply.
+        let mut saw_terminal_signal = false;
         loop {
             if cancelled() {
                 // Dropping the reader closes the connection, so the
@@ -441,9 +507,19 @@ impl ModelProvider for OpenAiCompatible {
             }
             line.clear();
             match reader.read_line(&mut line) {
-                // End of body without an explicit sentinel: the stream
-                // is over either way.
-                Ok(0) => return Ok(()),
+                Ok(0) => {
+                    // End of body. Only a success if the provider
+                    // actually signalled completion; otherwise the
+                    // answer we have is a fragment and must say so.
+                    return if saw_terminal_signal {
+                        Ok(())
+                    } else {
+                        Err(ProviderError::Protocol(format!(
+                            "{} closed the stream without completing it; the answer may be incomplete",
+                            self.service.id
+                        )))
+                    };
+                }
                 Ok(_) => {}
                 Err(e) => return Err(ProviderError::Transport(e.to_string())),
             }
@@ -452,17 +528,43 @@ impl ModelProvider for OpenAiCompatible {
                 // Comments, event names and blank separators.
                 continue;
             };
-            match parse_stream_frame(payload) {
-                Some(StreamEvent::Done) => {
-                    on_event(StreamEvent::Done);
-                    return Ok(());
-                }
-                Some(event) => {
-                    if !on_event(event) {
-                        return Err(ProviderError::Cancelled);
+            for event in parse_stream_frame(payload) {
+                match event {
+                    StreamEvent::Done => {
+                        on_event(StreamEvent::Done);
+                        return Ok(());
+                    }
+                    // A provider error inside a 200 stream is a failed
+                    // turn, not a finished one.
+                    StreamEvent::Error(detail) => {
+                        return Err(ProviderError::Protocol(format!(
+                            "{} reported an error mid-stream: {}",
+                            self.service.id,
+                            first_line(&detail, 300)
+                        )));
+                    }
+                    StreamEvent::FinishReason(reason) => {
+                        saw_terminal_signal = true;
+                        // Truncation is not completion. Reported as an
+                        // error so the caller cannot present a cut-off
+                        // answer as the whole one.
+                        if reason == "length" {
+                            on_event(StreamEvent::FinishReason(reason));
+                            return Err(ProviderError::Protocol(format!(
+                                "{} stopped because the output limit was reached; the answer is truncated",
+                                self.service.id
+                            )));
+                        }
+                        if !on_event(StreamEvent::FinishReason(reason)) {
+                            return Err(ProviderError::Cancelled);
+                        }
+                    }
+                    event => {
+                        if !on_event(event) {
+                            return Err(ProviderError::Cancelled);
+                        }
                     }
                 }
-                None => {}
             }
         }
     }
@@ -470,11 +572,11 @@ impl ModelProvider for OpenAiCompatible {
     fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         let key = self.key_or_error()?;
         let url = self.endpoint("/models")?;
-        let response = agent()
-            .get(&url)
-            .set("Authorization", &format!("Bearer {key}"))
-            .timeout(METADATA_TIMEOUT)
-            .call();
+        let mut request = agent().get(&url).timeout(METADATA_TIMEOUT);
+        if let Some(key) = &key {
+            request = request.set("Authorization", &format!("Bearer {key}"));
+        }
+        let response = request.call();
 
         let body: serde_json::Value = match response {
             Ok(r) => r.into_json().map_err(|e| {
@@ -520,6 +622,7 @@ mod tests {
         key_var: "SE_TEST_MOCK_KEY_UNSET",
         default_base_url: "",
         base_url_var: "SE_TEST_MOCK_BASE_URL",
+        key_required: true,
     };
 
     /// Serves one HTTP response and records the request body it read.
@@ -789,22 +892,16 @@ mod tests {
 
     #[test]
     fn frame_parsing_handles_the_shapes_providers_actually_send() {
-        assert_eq!(parse_stream_frame(" [DONE]"), Some(StreamEvent::Done));
+        assert_eq!(parse_stream_frame(" [DONE]"), vec![StreamEvent::Done]);
         // Keep-alive and empty frames carry nothing.
-        assert_eq!(parse_stream_frame(""), None);
-        assert_eq!(parse_stream_frame("{}"), None);
+        assert!(parse_stream_frame("").is_empty());
+        assert!(parse_stream_frame("{}").is_empty());
         // An empty content delta is not a delta.
-        assert_eq!(
-            parse_stream_frame(r#"{"choices":[{"delta":{"content":""}}]}"#),
-            None
-        );
+        assert!(parse_stream_frame(r#"{"choices":[{"delta":{"content":""}}]}"#).is_empty());
         // A role-only opening frame.
-        assert_eq!(
-            parse_stream_frame(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#),
-            None
-        );
+        assert!(parse_stream_frame(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#).is_empty());
         // Malformed JSON is skipped rather than killing the stream.
-        assert_eq!(parse_stream_frame("{not json"), None);
+        assert!(parse_stream_frame("{not json").is_empty());
     }
 
     #[test]
@@ -876,6 +973,155 @@ mod tests {
             "https://api.groq.com/openai/v1/chat/completions"
         );
         assert_eq!(url("ollama"), "http://localhost:11434/v1/chat/completions");
+    }
+
+    /// Regression for a confirmed honesty defect: a single frame can
+    /// carry usage *and* content, and the old one-event-per-frame
+    /// signature returned only the text, so the token accounting was
+    /// silently discarded.
+    #[test]
+    fn a_frame_carrying_usage_and_content_yields_both() {
+        let events = parse_stream_frame(
+            r#"{"choices":[{"delta":{"content":"hi"}}],"usage":{"prompt_tokens":7,"completion_tokens":2}}"#,
+        );
+        assert!(
+            events.contains(&StreamEvent::TextDelta("hi".into())),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::Usage {
+                    input_tokens: Some(7),
+                    ..
+                }
+            )),
+            "usage must not be dropped: {events:?}"
+        );
+    }
+
+    /// The same defect in its other form: reasoning and answer text in
+    /// one frame returned only the reasoning, losing the answer.
+    #[test]
+    fn a_frame_carrying_reasoning_and_content_yields_both() {
+        let events = parse_stream_frame(
+            r#"{"choices":[{"delta":{"reasoning_content":"thinking","content":"answer"}}]}"#,
+        );
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ReasoningDelta("thinking".into()),
+                StreamEvent::TextDelta("answer".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn groq_style_nested_usage_is_found() {
+        let events = parse_stream_frame(
+            r#"{"choices":[],"x_groq":{"usage":{"prompt_tokens":3,"completion_tokens":4}}}"#,
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::Usage {
+                    output_tokens: Some(4),
+                    ..
+                }
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn an_error_frame_inside_a_200_stream_is_reported_not_dropped() {
+        let events = parse_stream_frame(r#"{"error":{"message":"rate limited"}}"#);
+        assert_eq!(events, vec![StreamEvent::Error("rate limited".into())]);
+    }
+
+    #[test]
+    fn a_finish_reason_is_carried_so_truncation_can_be_detected() {
+        let events = parse_stream_frame(r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#);
+        assert_eq!(events, vec![StreamEvent::FinishReason("length".into())]);
+    }
+
+    /// A stream that just stops, with no `[DONE]` and no finish reason,
+    /// must not be reported as a finished answer.
+    #[test]
+    fn a_stream_that_ends_without_completing_is_an_error_not_a_success() {
+        const BODY: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}
+
+";
+        let (base, _r) = serve("HTTP/1.1 200 OK", "text/event-stream", BODY);
+        let p = provider(&base);
+        let mut seen = String::new();
+        let result = p.stream(&request(), &|| false, &mut |e| {
+            if let StreamEvent::TextDelta(t) = e {
+                seen.push_str(&t);
+            }
+            true
+        });
+        assert_eq!(seen, "partial", "the fragment is still delivered");
+        match result {
+            Err(ProviderError::Protocol(d)) => {
+                assert!(d.contains("without completing"), "{d}")
+            }
+            other => panic!("a truncated stream must not succeed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_service_needing_no_credential_is_configured_and_sends_no_auth_header() {
+        // Ollama serves /v1 with no auth. Demanding a key made it
+        // unusable, and sending a fake bearer token is worse than none.
+        const KEYLESS: Service = Service {
+            id: "keyless",
+            display_name: "Keyless",
+            key_var: "SE_TEST_KEYLESS_KEY_UNSET",
+            default_base_url: "",
+            base_url_var: "SE_TEST_KEYLESS_BASE",
+            key_required: false,
+        };
+        const BODY: &str = "data: [DONE]
+
+";
+        let (base, requests) = serve("HTTP/1.1 200 OK", "text/event-stream", BODY);
+        let p = OpenAiCompatible {
+            service: KEYLESS,
+            fixed_key: None,
+            fixed_base_url: Some(base),
+        };
+
+        let status = p.detect();
+        assert!(status.configured, "{}", status.detail);
+        assert!(
+            status.detail.contains("no credential needed"),
+            "{}",
+            status.detail
+        );
+
+        p.stream(&request(), &|| false, &mut |_| true).unwrap();
+        let seen = requests.lock().unwrap().join(
+            "
+",
+        );
+        assert!(
+            !seen.to_lowercase().contains("authorization"),
+            "a keyless service must receive no Authorization header: {seen}"
+        );
+    }
+
+    /// Ollama in the real catalogue must be keyless; everything else
+    /// must still require a credential.
+    #[test]
+    fn only_ollama_is_keyless_in_the_catalogue() {
+        for s in CATALOGUE {
+            if s.id == "ollama" {
+                assert!(!s.key_required, "ollama needs no key");
+            } else {
+                assert!(s.key_required, "{} must require a credential", s.id);
+            }
+        }
     }
 
     #[test]
