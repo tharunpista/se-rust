@@ -88,20 +88,115 @@ pub struct ModelInfo {
 pub enum ProviderError {
     /// No credential, or no endpoint. Never reached the network.
     NotConfigured(String),
-    /// The provider answered, with a refusal or an error status.
+    /// The credential was rejected (HTTP 401/403). Never retry-eligible:
+    /// hammering an invalid key wastes attempts and can trip the
+    /// provider's own abuse detection. The user must fix the credential.
+    Auth(String),
+    /// The provider refused on policy grounds (a content filter, a
+    /// safety block). Never retry-eligible, and specifically never
+    /// eligible for failover to a different provider/model -- routing
+    /// around a refusal is policy evasion, not error recovery.
+    Policy(String),
+    /// The request itself was malformed (HTTP 400 with no policy
+    /// marker): a bad parameter, an unsupported combination. Retrying
+    /// the same request changes nothing; the request must be fixed
+    /// first.
+    BadRequest(String),
+    /// The provider is throttling. `retry_after` is the provider's own
+    /// stated wait, when it gave one -- never invented. Eligible for a
+    /// bounded, backed-off retry.
+    RateLimited {
+        retry_after: Option<std::time::Duration>,
+        detail: String,
+    },
+    /// The provider's own infrastructure failed (HTTP 5xx). Eligible
+    /// for a bounded retry.
+    Server { status: u16, detail: String },
+    /// A real answer started but could not finish for a reason that is
+    /// not a transient failure: an output-length truncation, or the
+    /// connection ending with no terminal signal. Never retry-eligible
+    /// with the same parameters -- retrying a truncation at the same
+    /// token budget produces the same truncation.
+    Truncated(String),
+    /// The provider answered in a shape this adapter could not parse,
+    /// or reported an error whose nature does not fit the variants
+    /// above. Not retry-eligible: the shape will not change on retry.
     Protocol(String),
-    /// The request never completed: DNS, TLS, timeout, connection.
+    /// The request never completed: DNS, TLS, connection reset.
+    /// Eligible for a bounded retry.
     Transport(String),
-    /// The caller asked to stop. Not a failure.
+    /// A bound SE itself enforces -- not something the provider
+    /// reported -- was exceeded. Eligible for a bounded retry (a
+    /// different attempt may simply be faster).
+    Timeout(TimeoutKind),
+    /// The caller asked to stop. Not a failure, and never retried.
     Cancelled,
+}
+
+/// Which SE-enforced bound a [`ProviderError::Timeout`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutKind {
+    /// No byte arrived for longer than the configured inactivity bound.
+    Idle,
+    /// The whole turn ran longer than its absolute deadline, regardless
+    /// of whether bytes kept arriving.
+    WholeTurn,
+}
+
+impl ProviderError {
+    /// Whether this failure is ever eligible for a retry or a
+    /// capability-aware failover, independent of what produced the
+    /// error message.
+    ///
+    /// Deliberately a match on the *type*, not a scan of `to_string()`:
+    /// a retry loop built on string-matching a provider's error body is
+    /// exactly what the charter forbids, because wording varies by
+    /// provider and by locale and a match that works today silently
+    /// stops matching tomorrow. This function is the one place that
+    /// decision is made, so it can be the one place it is tested.
+    pub fn is_retriable(&self) -> bool {
+        match self {
+            ProviderError::RateLimited { .. }
+            | ProviderError::Server { .. }
+            | ProviderError::Transport(_)
+            | ProviderError::Timeout(_) => true,
+            ProviderError::NotConfigured(_)
+            | ProviderError::Auth(_)
+            | ProviderError::Policy(_)
+            | ProviderError::BadRequest(_)
+            | ProviderError::Truncated(_)
+            | ProviderError::Protocol(_)
+            | ProviderError::Cancelled => false,
+        }
+    }
 }
 
 impl std::fmt::Display for ProviderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProviderError::NotConfigured(d) => write!(f, "not configured: {d}"),
+            ProviderError::Auth(d) => write!(f, "authentication failed: {d}"),
+            ProviderError::Policy(d) => write!(f, "refused on policy grounds: {d}"),
+            ProviderError::BadRequest(d) => write!(f, "the request was rejected: {d}"),
+            ProviderError::RateLimited {
+                retry_after,
+                detail,
+            } => match retry_after {
+                Some(d) => write!(f, "rate limited (retry after {}s): {detail}", d.as_secs()),
+                None => write!(f, "rate limited: {detail}"),
+            },
+            ProviderError::Server { status, detail } => {
+                write!(f, "provider error (HTTP {status}): {detail}")
+            }
+            ProviderError::Truncated(d) => write!(f, "{d}"),
             ProviderError::Protocol(d) => write!(f, "{d}"),
             ProviderError::Transport(d) => write!(f, "could not reach the provider: {d}"),
+            ProviderError::Timeout(TimeoutKind::Idle) => {
+                write!(f, "the provider stopped sending data")
+            }
+            ProviderError::Timeout(TimeoutKind::WholeTurn) => {
+                write!(f, "the turn exceeded its time limit")
+            }
             ProviderError::Cancelled => write!(f, "cancelled"),
         }
     }
@@ -268,5 +363,57 @@ mod tests {
         let e = ProviderError::NotConfigured("no credential for nvidia".into());
         assert_eq!(e.to_string(), "not configured: no credential for nvidia");
         assert_eq!(ProviderError::Cancelled.to_string(), "cancelled");
+    }
+
+    /// The negative cases the charter is explicit about: these must
+    /// never be retried or failed over, no matter how the retry logic
+    /// is later written. A match on the type, never on wording.
+    #[test]
+    fn auth_policy_and_bad_request_are_never_retriable() {
+        assert!(!ProviderError::Auth("bad key".into()).is_retriable());
+        assert!(!ProviderError::Policy("content filtered".into()).is_retriable());
+        assert!(!ProviderError::BadRequest("unknown parameter".into()).is_retriable());
+        assert!(!ProviderError::NotConfigured("no credential".into()).is_retriable());
+        assert!(!ProviderError::Cancelled.is_retriable());
+    }
+
+    #[test]
+    fn transient_failures_are_retriable() {
+        assert!(ProviderError::RateLimited {
+            retry_after: None,
+            detail: "slow down".into()
+        }
+        .is_retriable());
+        assert!(ProviderError::Server {
+            status: 503,
+            detail: "overloaded".into()
+        }
+        .is_retriable());
+        assert!(ProviderError::Transport("connection reset".into()).is_retriable());
+        assert!(ProviderError::Timeout(TimeoutKind::Idle).is_retriable());
+        assert!(ProviderError::Timeout(TimeoutKind::WholeTurn).is_retriable());
+    }
+
+    /// Truncation and an unparseable response shape are not transient:
+    /// retrying with the same parameters reproduces the same problem.
+    #[test]
+    fn truncation_and_protocol_shape_errors_are_not_retriable() {
+        assert!(!ProviderError::Truncated("output limit reached".into()).is_retriable());
+        assert!(!ProviderError::Protocol("unexpected shape".into()).is_retriable());
+    }
+
+    #[test]
+    fn a_retry_after_duration_is_shown_when_the_provider_gave_one() {
+        let with = ProviderError::RateLimited {
+            retry_after: Some(std::time::Duration::from_secs(12)),
+            detail: "too many requests".into(),
+        };
+        assert!(with.to_string().contains("12s"), "{with}");
+
+        let without = ProviderError::RateLimited {
+            retry_after: None,
+            detail: "too many requests".into(),
+        };
+        assert!(!without.to_string().contains("retry after"), "{without}");
     }
 }

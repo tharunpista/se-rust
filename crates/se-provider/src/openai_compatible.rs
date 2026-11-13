@@ -15,28 +15,50 @@ use std::io::{BufRead, BufReader};
 use std::time::Duration;
 
 use crate::credentials;
-use crate::{ChatRequest, ModelInfo, ModelProvider, ProviderError, Role, Status, StreamEvent};
+use crate::{
+    ChatRequest, ModelInfo, ModelProvider, ProviderError, Role, Status, StreamEvent, TimeoutKind,
+};
 
 /// Time allowed to establish a connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-/// Time allowed between reads once a stream is open.
+/// Default time allowed between reads once a stream is open.
 ///
 /// Deliberately an *idle* bound, not a total one: a long answer is not a
 /// hung connection, so capping total generation would cancel healthy
 /// work. Silence this long means the connection is dead.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+///
+/// Configurable via `SE_PROVIDER_IDLE_TIMEOUT_SECS`, read once when the
+/// shared agent is first built. A fixed 120s was too coarse a single
+/// answer for every deployment -- a developer debugging a slow local
+/// model and a user on a flaky connection both legitimately want a
+/// different bound, and recompiling to change a constant is not a real
+/// option.
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Time allowed for the metadata call, which should be quick.
 const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn idle_timeout() -> Duration {
+    std::env::var("SE_PROVIDER_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_IDLE_TIMEOUT)
+}
 
 /// One shared agent, so DNS, TLS and connections are reused across
 /// requests instead of being rebuilt per turn (a startup cost the
 /// latency budget in docs/ARCHITECTURE.md explicitly calls out).
+///
+/// Read once, at first use -- not a hot-reload setting. A test that
+/// needs a different idle bound must set the environment variable
+/// before anything in the process has touched this function.
 fn agent() -> &'static ureq::Agent {
     static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
     AGENT.get_or_init(|| {
         ureq::AgentBuilder::new()
             .timeout_connect(CONNECT_TIMEOUT)
-            .timeout_read(IDLE_TIMEOUT)
+            .timeout_read(idle_timeout())
             // A 302 from a provider can carry Authorization to another
             // host. Never follow a redirect on an authenticated request.
             // The provider's own canonical endpoint is the only URL that
@@ -544,12 +566,10 @@ impl ModelProvider for OpenAiCompatible {
         let response = match response {
             Ok(r) => r,
             Err(ureq::Error::Status(code, r)) => {
-                let detail = r.into_string().unwrap_or_default();
-                return Err(ProviderError::Protocol(format!(
-                    "{} returned HTTP {code}: {}",
-                    self.service.id,
-                    first_line(&detail, 300)
-                )));
+                return Err(classify_http_error(self.service.id, code, r, ""));
+            }
+            Err(ureq::Error::Transport(t)) if is_timeout(&t) => {
+                return Err(ProviderError::Timeout(TimeoutKind::Idle));
             }
             Err(ureq::Error::Transport(t)) => return Err(ProviderError::Transport(t.to_string())),
         };
@@ -577,13 +597,20 @@ impl ModelProvider for OpenAiCompatible {
                     return if saw_terminal_signal {
                         Ok(())
                     } else {
-                        Err(ProviderError::Protocol(format!(
+                        // A real answer may already have streamed; this
+                        // is a Truncated error (not Protocol) precisely
+                        // so the caller can preserve the partial text as
+                        // Outcome::Incomplete rather than discarding it.
+                        Err(ProviderError::Truncated(format!(
                             "{} closed the stream without completing it; the answer may be incomplete",
                             self.service.id
                         )))
                     };
                 }
                 Ok(_) => {}
+                Err(e) if is_timeout_io(&e) => {
+                    return Err(ProviderError::Timeout(TimeoutKind::Idle))
+                }
                 Err(e) => return Err(ProviderError::Transport(e.to_string())),
             }
 
@@ -598,22 +625,38 @@ impl ModelProvider for OpenAiCompatible {
                         return Ok(());
                     }
                     // A provider error inside a 200 stream is a failed
-                    // turn, not a finished one.
+                    // turn, not a finished one. Classified the same way
+                    // an HTTP-level error body would be, within the
+                    // limits of `looks_like_a_policy_refusal`.
                     StreamEvent::Error(detail) => {
-                        return Err(ProviderError::Protocol(format!(
+                        let detail = format!(
                             "{} reported an error mid-stream: {}",
                             self.service.id,
                             first_line(&detail, 300)
-                        )));
+                        );
+                        return Err(if looks_like_a_policy_refusal(&detail) {
+                            ProviderError::Policy(detail)
+                        } else {
+                            ProviderError::Protocol(detail)
+                        });
                     }
                     StreamEvent::FinishReason(reason) => {
                         saw_terminal_signal = true;
-                        // Truncation is not completion. Reported as an
-                        // error so the caller cannot present a cut-off
-                        // answer as the whole one.
+                        if reason == "content_filter" {
+                            on_event(StreamEvent::FinishReason(reason.clone()));
+                            return Err(ProviderError::Policy(format!(
+                                "{} refused to continue on content-policy grounds",
+                                self.service.id
+                            )));
+                        }
+                        // Truncation is not completion. A Truncated
+                        // error (not Protocol) so the caller preserves
+                        // what streamed as Outcome::Incomplete rather
+                        // than presenting a cut-off answer as the whole
+                        // one, or discarding it as a bare failure.
                         if reason == "length" {
                             on_event(StreamEvent::FinishReason(reason));
-                            return Err(ProviderError::Protocol(format!(
+                            return Err(ProviderError::Truncated(format!(
                                 "{} stopped because the output limit was reached; the answer is truncated",
                                 self.service.id
                             )));
@@ -647,12 +690,15 @@ impl ModelProvider for OpenAiCompatible {
                 ProviderError::Protocol(format!("the model list was not JSON: {e}"))
             })?,
             Err(ureq::Error::Status(code, r)) => {
-                let detail = r.into_string().unwrap_or_default();
-                return Err(ProviderError::Protocol(format!(
-                    "{} returned HTTP {code} for the model list: {}",
+                return Err(classify_http_error(
                     self.service.id,
-                    first_line(&detail, 300)
-                )));
+                    code,
+                    r,
+                    "for the model list",
+                ));
+            }
+            Err(ureq::Error::Transport(t)) if is_timeout(&t) => {
+                return Err(ProviderError::Timeout(TimeoutKind::Idle));
             }
             Err(ureq::Error::Transport(t)) => return Err(ProviderError::Transport(t.to_string())),
         };
@@ -687,21 +733,151 @@ fn is_safe_origin(url: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
+/// Whether an error body carries one of the markers vendors use for a
+/// policy/safety refusal.
+///
+/// Honestly limited: there is no shared vendor standard for this, so
+/// the match is on the handful of strings observed in practice
+/// (OpenAI/Groq's `content_filter`, Gemini's `SAFETY`). A vendor using
+/// different wording is classified as `BadRequest`/`Protocol` instead of
+/// `Policy` -- wrong severity, but never the dangerous direction: it is
+/// never silently retried or failed over either way, since both
+/// variants are equally non-retriable. Extending this table is a
+/// one-line, reviewable change; it is not a security boundary.
+fn looks_like_a_policy_refusal(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("content_filter") || lower.contains("safety") || lower.contains("content_policy")
+}
+
+/// Classifies an HTTP error status into a typed [`ProviderError`],
+/// reading `Retry-After` before the body is consumed.
+///
+/// A match on the status code and a declared policy marker -- never on
+/// free-text wording beyond that one documented exception -- so a
+/// future retry/failover decision can be written against the type
+/// rather than re-parsing vendor prose.
+fn classify_http_error(
+    service_id: &str,
+    code: u16,
+    response: ureq::Response,
+    context: &str,
+) -> ProviderError {
+    let retry_after = response.header("Retry-After").and_then(parse_retry_after);
+    let body = response.into_string().unwrap_or_default();
+    let detail = format!(
+        "{service_id} returned HTTP {code} {context}: {}",
+        first_line(&body, 300)
+    );
+    match code {
+        401 | 403 => ProviderError::Auth(detail),
+        429 => ProviderError::RateLimited {
+            retry_after,
+            detail,
+        },
+        400 if looks_like_a_policy_refusal(&body) => ProviderError::Policy(detail),
+        400 | 404 | 422 => ProviderError::BadRequest(detail),
+        500..=599 => ProviderError::Server {
+            status: code,
+            detail,
+        },
+        _ => ProviderError::Protocol(detail),
+    }
+}
+
+/// Parses `Retry-After` as a number of seconds.
+///
+/// Deliberately does not handle the HTTP-date form (`Retry-After: Wed,
+/// 13 Nov 2026 12:00:00 GMT`). Adding a date-parsing dependency for one
+/// header was not worth it at this scope; a provider using the date
+/// form is treated as not having given a retry hint (`None`), which is
+/// the honest fallback already used for a missing header, not a wrong
+/// answer -- just a less specific one.
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
+/// Whether a `ureq::Transport` represents a timeout SE itself bounded
+/// (connect or idle-read), as opposed to DNS failure, TLS failure or a
+/// reset connection -- which stay `ProviderError::Transport`.
+fn is_timeout(t: &ureq::Transport) -> bool {
+    matches!(t.kind(), ureq::ErrorKind::Io) && t.to_string().to_ascii_lowercase().contains("time")
+}
+
+/// Same distinction for the `std::io::Error` surfaced by `read_line`
+/// once a stream is already open (ureq maps a read timeout to
+/// `io::ErrorKind::WouldBlock` or `TimedOut` depending on platform).
+fn is_timeout_io(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// Credential shapes several providers echo back inside their own error
+/// payloads. Prefix matching only -- a generic "long random-looking
+/// word" rule would redact model ids and request ids as well.
+const CREDENTIAL_PREFIXES: [&str; 5] = ["sk-", "sk_", "gsk_", "nvapi-", "AIza"];
+
+/// A provider's error body is text this process does not control, and it
+/// reaches both the interface and any log: control characters (ANSI
+/// escapes among them) are flattened, and anything shaped like a
+/// credential is replaced before the body is carried anywhere.
 fn first_line(text: &str, max: usize) -> String {
     let flat: String = text
         .chars()
-        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    let trimmed = flat.trim();
-    if trimmed.chars().count() <= max {
-        return trimmed.to_string();
+    let mut words: Vec<String> = Vec::new();
+    let mut after_bearer = false;
+    for word in flat.split_whitespace() {
+        let looks_like_a_key = after_bearer
+            || CREDENTIAL_PREFIXES
+                .iter()
+                .any(|p| word.trim_start_matches(['"', '\'']).starts_with(p));
+        after_bearer = word.eq_ignore_ascii_case("bearer");
+        words.push(if looks_like_a_key {
+            "[redacted]".to_string()
+        } else {
+            word.to_string()
+        });
     }
-    trimmed.chars().take(max).collect::<String>() + "…"
+    let joined = words.join(" ");
+    if joined.chars().count() <= max {
+        return joined;
+    }
+    joined.chars().take(max).collect::<String>() + "…"
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_credential_echoed_back_by_a_provider_is_redacted_before_it_is_displayed() {
+        let body =
+            r#"{"error":"invalid key sk-abc123secret for Authorization: Bearer gsk_realsecret"}"#;
+        let shown = first_line(body, 300);
+        assert!(!shown.contains("abc123secret"), "{shown}");
+        assert!(!shown.contains("realsecret"), "{shown}");
+        assert!(shown.contains("[redacted]"), "{shown}");
+        assert!(
+            shown.contains("invalid key"),
+            "the reason must survive: {shown}"
+        );
+    }
+
+    #[test]
+    fn escape_sequences_in_a_provider_error_cannot_reach_the_terminal() {
+        let shown = first_line("bad \u{1b}[31mrequest\u{1b}[0m", 300);
+        assert!(!shown.contains('\u{1b}'), "{shown:?}");
+        assert!(shown.contains("request"), "{shown:?}");
+    }
+
+    #[test]
+    fn an_ordinary_model_id_is_not_mistaken_for_a_credential() {
+        let shown = first_line("model gpt-4o-mini-2024-07-18 is unavailable", 300);
+        assert_eq!(shown, "model gpt-4o-mini-2024-07-18 is unavailable");
+    }
+
     use crate::Message;
     use std::io::Write;
     use std::net::TcpListener;
@@ -894,18 +1070,94 @@ mod tests {
         assert_eq!(result, Err(ProviderError::Cancelled));
     }
 
+    /// A 401 is classified as `Auth`, not the generic `Protocol`, so a
+    /// future retry/failover decision can match on the type rather than
+    /// re-parsing this message -- and specifically so it is never
+    /// retried (see `is_retriable`).
     #[test]
-    fn an_http_error_is_reported_with_the_providers_own_explanation() {
+    fn an_http_401_is_reported_as_auth_with_the_providers_own_explanation() {
         const BODY: &str = r#"{"error":{"message":"invalid api key"}}"#;
         let (base, _r) = serve("HTTP/1.1 401 Unauthorized", "application/json", BODY);
         let p = provider(&base);
         let err = p.stream(&request(), &|| false, &mut |_| true).unwrap_err();
+        assert!(!err.is_retriable());
         match err {
-            ProviderError::Protocol(detail) => {
+            ProviderError::Auth(detail) => {
                 assert!(detail.contains("401"), "{detail}");
                 assert!(detail.contains("invalid api key"), "{detail}");
             }
-            other => panic!("expected a protocol error, got {other:?}"),
+            other => panic!("expected Auth, got {other:?}"),
+        }
+    }
+
+    /// 403, 429 (with and without Retry-After), and 5xx each classify
+    /// distinctly -- the test matrix the next phase's review asked for.
+    #[test]
+    fn http_error_statuses_classify_into_distinct_typed_variants() {
+        let (base, _r) = serve("HTTP/1.1 403 Forbidden", "application/json", "{}");
+        let err = provider(&base)
+            .stream(&request(), &|| false, &mut |_| true)
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Auth(_)), "403: {err:?}");
+
+        let (base, _r) = serve("HTTP/1.1 429 Too Many Requests", "application/json", "{}");
+        let err = provider(&base)
+            .stream(&request(), &|| false, &mut |_| true)
+            .unwrap_err();
+        match err {
+            ProviderError::RateLimited { retry_after, .. } => assert_eq!(retry_after, None),
+            other => panic!("429 with no header: expected RateLimited, got {other:?}"),
+        }
+
+        for status in [
+            "HTTP/1.1 500 Internal Server Error",
+            "HTTP/1.1 503 Service Unavailable",
+        ] {
+            let (base, _r) = serve(status, "application/json", "{}");
+            let err = provider(&base)
+                .stream(&request(), &|| false, &mut |_| true)
+                .unwrap_err();
+            assert!(
+                matches!(err, ProviderError::Server { .. }),
+                "{status}: {err:?}"
+            );
+        }
+    }
+
+    /// A `Retry-After` header is read before the body is consumed and
+    /// surfaces as the provider's own stated wait -- never invented.
+    #[test]
+    fn a_retry_after_header_is_parsed_into_the_rate_limited_variant() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{BufRead, BufReader, Write};
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut l = String::new();
+                if reader.read_line(&mut l).unwrap_or(0) == 0 || l.trim().is_empty() {
+                    break;
+                }
+            }
+            let resp = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+            // Windows discards unread queued data on an abrupt close,
+            // which reached the client as a reset instead of the 429;
+            // waiting for the client to hang up first avoids that.
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            let mut drain = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut reader, &mut drain);
+        });
+        let p = provider(&format!("http://{addr}"));
+        let err = p.stream(&request(), &|| false, &mut |_| true).unwrap_err();
+        match err {
+            ProviderError::RateLimited {
+                retry_after: Some(d),
+                ..
+            } => assert_eq!(d, Duration::from_secs(7)),
+            other => panic!("expected RateLimited with retry_after, got {other:?}"),
         }
     }
 
@@ -1153,8 +1405,11 @@ mod tests {
         });
         assert_eq!(seen, "partial", "the fragment is still delivered");
         match result {
-            Err(ProviderError::Protocol(d)) => {
-                assert!(d.contains("without completing"), "{d}")
+            // Truncated, not Protocol: the whole point of the distinct
+            // variant is that the caller (ProviderRunner) can preserve
+            // `seen` as Outcome::Incomplete rather than discarding it.
+            Err(ProviderError::Truncated(d)) => {
+                assert!(d.contains("without completing"), "{d}");
             }
             other => panic!("a truncated stream must not succeed, got {other:?}"),
         }

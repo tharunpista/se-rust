@@ -300,6 +300,24 @@ impl AppState {
                         self.push(Entry::Notice("interrupted".to_string()));
                         self.status = "interrupted".to_string();
                     }
+                    Outcome::Incomplete {
+                        partial_text,
+                        reason,
+                    } => {
+                        // The partial answer is shown as what it is --
+                        // not silently completed, not thrown away.
+                        if !self
+                            .transcript
+                            .iter()
+                            .rev()
+                            .any(|e| matches!(e, Entry::Assistant(_)))
+                            && !partial_text.is_empty()
+                        {
+                            self.push(Entry::Assistant(partial_text.clone()));
+                        }
+                        self.push(Entry::Notice(format!("incomplete: {reason}")));
+                        self.status = "incomplete".to_string();
+                    }
                     Outcome::ExhaustedTurns { turns } => {
                         self.push(Entry::Notice(format!(
                             "stopped after {turns} turn(s) without a final answer"

@@ -18,14 +18,28 @@
 //!   `UsageSource::Unavailable`, which an interface shows as "not
 //!   reported".
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use se_protocol::{Outcome, Stage, Usage, UsageSource, UserTurn};
-use se_provider::{ChatRequest, Message, ProviderError, Registry, Role, StreamEvent};
+use se_provider::{ChatRequest, Message, ProviderError, Registry, Role, StreamEvent, TimeoutKind};
 
 use crate::sink::TurnSink;
 use crate::Runner;
 
 /// How many tokens to allow in a reply, until this is configurable.
 const MAX_TOKENS: u32 = 4096;
+
+/// Default absolute bound on one turn, independent of the provider's
+/// own idle-read timeout.
+///
+/// The two bounds answer different questions: the provider's idle
+/// timeout detects a dead connection; this detects a connection that
+/// stays alive and keeps sending *something* far longer than a turn
+/// should reasonably take. Without it, a provider that trickles one
+/// byte every few seconds forever would never time out at all.
+const DEFAULT_TURN_DEADLINE: Duration = Duration::from_secs(600);
 
 /// Instructions sent with every request.
 ///
@@ -40,6 +54,7 @@ pub struct ProviderRunner {
     registry: Registry,
     provider_id: String,
     model: String,
+    turn_deadline: Duration,
 }
 
 impl ProviderRunner {
@@ -61,7 +76,21 @@ impl ProviderRunner {
             registry,
             provider_id: provider_id.to_string(),
             model: model.to_string(),
+            turn_deadline: DEFAULT_TURN_DEADLINE,
         })
+    }
+
+    /// Overrides the whole-turn deadline. Rejects a non-positive value
+    /// at construction time rather than racing against an already-
+    /// expired deadline on the first poll.
+    pub fn with_turn_deadline(mut self, deadline: Duration) -> Result<Self, ProviderError> {
+        if deadline.is_zero() {
+            return Err(ProviderError::NotConfigured(
+                "a turn deadline must be greater than zero".to_string(),
+            ));
+        }
+        self.turn_deadline = deadline;
+        Ok(self)
     }
 }
 
@@ -118,57 +147,72 @@ impl Runner for ProviderRunner {
         // Cloned rather than borrowed from `sink`, which is held
         // mutably below to report deltas.
         let cancelled = sink.cancel_flag();
-        let result = provider.stream(
-            &request,
-            &|| cancelled.load(std::sync::atomic::Ordering::SeqCst),
-            &mut |event| match event {
-                StreamEvent::TextDelta(text) => {
-                    if first_token_at.is_none() {
-                        first_token_at = Some(std::time::Instant::now());
-                    }
-                    answer.push_str(&text);
-                    if sink.text_delta(&text).is_err() {
-                        disconnected = true;
-                        return false;
-                    }
-                    true
+        let turn_started = Instant::now();
+        let turn_deadline = self.turn_deadline;
+        // Distinguishes "the deadline fired" from "the user cancelled"
+        // after the fact: both reach the provider through the same
+        // closure returning `true` (a provider has one cancellation
+        // mechanism, not two), so this flag is the only way to tell
+        // them apart once `stream` has returned.
+        let deadline_fired = Arc::new(AtomicBool::new(false));
+        let deadline_fired_writer = deadline_fired.clone();
+        let should_stop = move || {
+            if cancelled.load(Ordering::SeqCst) {
+                return true;
+            }
+            if turn_started.elapsed() >= turn_deadline {
+                deadline_fired_writer.store(true, Ordering::SeqCst);
+                return true;
+            }
+            false
+        };
+        let result = provider.stream(&request, &should_stop, &mut |event| match event {
+            StreamEvent::TextDelta(text) => {
+                if first_token_at.is_none() {
+                    first_token_at = Some(std::time::Instant::now());
                 }
-                StreamEvent::ReasoningDelta(text) => {
-                    if first_token_at.is_none() {
-                        first_token_at = Some(std::time::Instant::now());
-                    }
-                    if sink.reasoning_delta(&text).is_err() {
-                        disconnected = true;
-                        return false;
-                    }
-                    true
+                answer.push_str(&text);
+                if sink.text_delta(&text).is_err() {
+                    disconnected = true;
+                    return false;
                 }
-                StreamEvent::Usage {
+                true
+            }
+            StreamEvent::ReasoningDelta(text) => {
+                if first_token_at.is_none() {
+                    first_token_at = Some(std::time::Instant::now());
+                }
+                if sink.reasoning_delta(&text).is_err() {
+                    disconnected = true;
+                    return false;
+                }
+                true
+            }
+            StreamEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+            } => {
+                reported_usage = Some(Usage {
                     input_tokens,
                     output_tokens,
                     cached_input_tokens,
-                } => {
-                    reported_usage = Some(Usage {
-                        input_tokens,
-                        output_tokens,
-                        cached_input_tokens,
-                        source: UsageSource::ProviderReported,
-                    });
-                    true
-                }
-                // A mid-stream provider error becomes a transport-level
-                // failure via the `Err` the provider returns; nothing is
-                // appended to `answer`, so a failed turn cannot present
-                // a partial reply as the answer.
-                StreamEvent::Error(_) => false,
-                // Recorded for the outcome, not shown as content.
-                StreamEvent::FinishReason(reason) => {
-                    finish_reason = Some(reason);
-                    true
-                }
-                StreamEvent::Done => true,
-            },
-        );
+                    source: UsageSource::ProviderReported,
+                });
+                true
+            }
+            // A mid-stream provider error becomes a transport-level
+            // failure via the `Err` the provider returns; nothing is
+            // appended to `answer`, so a failed turn cannot present
+            // a partial reply as the answer.
+            StreamEvent::Error(_) => false,
+            // Recorded for the outcome, not shown as content.
+            StreamEvent::FinishReason(reason) => {
+                finish_reason = Some(reason);
+                true
+            }
+            StreamEvent::Done => true,
+        });
 
         // Recorded before the outcome is decided, so even a failed turn
         // reports how long it waited.
@@ -192,27 +236,67 @@ impl Runner for ProviderRunner {
             let _ = sink.usage(usage);
         }
 
+        // Checked before the error-type match below: a fired deadline
+        // and a real user cancellation are indistinguishable to
+        // `stream()` (both reach it as the same closure returning
+        // `true`), and user cancellation must always win. `is_cancelled`
+        // is therefore the tie-breaker; a deadline is only reported as
+        // such when the user did not also ask to stop.
+        if deadline_fired.load(Ordering::SeqCst) && !sink.is_cancelled() {
+            return if answer.is_empty() {
+                Outcome::Failed {
+                    detail: ProviderError::Timeout(TimeoutKind::WholeTurn).to_string(),
+                }
+            } else {
+                Outcome::Incomplete {
+                    partial_text: answer,
+                    reason: ProviderError::Timeout(TimeoutKind::WholeTurn).to_string(),
+                }
+            };
+        }
+
         match result {
-            Ok(()) if disconnected => Outcome::Failed {
-                detail: "the interface disconnected mid-answer".to_string(),
-            },
+            Ok(()) if disconnected => {
+                // A real answer may already have streamed before the
+                // interface disappeared; preserve it as Incomplete
+                // rather than discarding it as a bare failure.
+                if answer.is_empty() {
+                    Outcome::Failed {
+                        detail: "the interface disconnected mid-answer".to_string(),
+                    }
+                } else {
+                    Outcome::Incomplete {
+                        partial_text: answer,
+                        reason: "the interface disconnected mid-answer".to_string(),
+                    }
+                }
+            }
             Ok(()) => {
                 // A provider that completed without ever saying why it
-                // stopped is accepted (many send only `[DONE]`), but a
-                // recorded reason other than a normal stop is surfaced
-                // rather than silently dropped.
+                // stopped is accepted (many send only `[DONE]`); `length`
+                // and `content_filter` never reach here -- the provider
+                // reports those as a Truncated/Policy `Err` so they are
+                // handled below, with the partial text preserved.
                 match finish_reason.as_deref() {
                     None | Some("stop") | Some("end_turn") => {
                         Outcome::Completed { final_text: answer }
                     }
-                    Some(other) => Outcome::Failed {
-                        detail: format!(
-                            "the provider stopped early ({other}); the answer may be incomplete"
-                        ),
+                    Some(other) => Outcome::Incomplete {
+                        partial_text: answer,
+                        reason: format!("the provider stopped early ({other})"),
                     },
                 }
             }
             Err(ProviderError::Cancelled) => Outcome::Cancelled,
+            // Truncation and any other mid-stream failure both preserve
+            // whatever already streamed, as Incomplete rather than
+            // Failed -- the distinction the outcome type exists to
+            // make. Only a failure with nothing to preserve (e.g. Auth
+            // rejected before the first byte) is a bare Failed.
+            Err(e) if !answer.is_empty() => Outcome::Incomplete {
+                partial_text: answer,
+                reason: e.to_string(),
+            },
             Err(e) => Outcome::Failed {
                 detail: e.to_string(),
             },
@@ -235,7 +319,16 @@ mod tests {
         frames: Vec<StreamEvent>,
         per_frame_delay: Duration,
         requests: Arc<AtomicUsize>,
+        /// Fails before streaming anything -- for "nothing happened"
+        /// cases (e.g. Auth rejected up front).
         fail_with: Option<ProviderError>,
+        /// Streams every frame in `frames`, *then* fails -- for "a real
+        /// answer started but did not finish" cases.
+        fail_after: Option<ProviderError>,
+        /// Ignores `frames` and streams forever (one delta every
+        /// `per_frame_delay`) until cancelled -- for deadline tests,
+        /// where the point is that nothing *else* ever stops it.
+        never_stops: bool,
     }
 
     impl ModelProvider for ScriptedProvider {
@@ -265,6 +358,26 @@ mod tests {
             if let Some(e) = &self.fail_with {
                 return Err(e.clone());
             }
+            if self.never_stops {
+                let mut i = 0usize;
+                loop {
+                    if cancelled() {
+                        return Err(ProviderError::Cancelled);
+                    }
+                    if !self.per_frame_delay.is_zero() {
+                        std::thread::sleep(self.per_frame_delay);
+                    }
+                    // Rechecked after the wait, as a real provider does
+                    // before putting more bytes on the wire.
+                    if cancelled() {
+                        return Err(ProviderError::Cancelled);
+                    }
+                    if !on_event(StreamEvent::TextDelta(format!("{i} "))) {
+                        return Err(ProviderError::Cancelled);
+                    }
+                    i += 1;
+                }
+            }
             for frame in &self.frames {
                 if cancelled() {
                     return Err(ProviderError::Cancelled);
@@ -276,7 +389,10 @@ mod tests {
                     return Err(ProviderError::Cancelled);
                 }
             }
-            Ok(())
+            match &self.fail_after {
+                Some(e) => Err(e.clone()),
+                None => Ok(()),
+            }
         }
         fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
             Ok(Vec::new())
@@ -297,6 +413,31 @@ mod tests {
         delay: Duration,
         fail_with: Option<ProviderError>,
     ) -> (ProviderRunner, Arc<AtomicUsize>) {
+        scripted_runner(frames, delay, fail_with, None, false)
+    }
+
+    /// Streams `frames` and then fails -- "a real answer started but did
+    /// not finish", which is what distinguishes Incomplete from Failed.
+    fn runner_failing_after(
+        frames: Vec<StreamEvent>,
+        fail_after: ProviderError,
+    ) -> (ProviderRunner, Arc<AtomicUsize>) {
+        scripted_runner(frames, Duration::ZERO, None, Some(fail_after), false)
+    }
+
+    /// Streams forever until something stops it -- so a deadline test is
+    /// measuring the deadline, not the end of a script.
+    fn runner_that_never_stops(delay: Duration) -> (ProviderRunner, Arc<AtomicUsize>) {
+        scripted_runner(Vec::new(), delay, None, None, true)
+    }
+
+    fn scripted_runner(
+        frames: Vec<StreamEvent>,
+        delay: Duration,
+        fail_with: Option<ProviderError>,
+        fail_after: Option<ProviderError>,
+        never_stops: bool,
+    ) -> (ProviderRunner, Arc<AtomicUsize>) {
         let requests = Arc::new(AtomicUsize::new(0));
         let mut registry = Registry::empty();
         registry.register(Box::new(ScriptedProvider {
@@ -304,6 +445,8 @@ mod tests {
             per_frame_delay: delay,
             requests: requests.clone(),
             fail_with,
+            fail_after,
+            never_stops,
         }));
         let _ = SCRIPTED;
         (
@@ -311,6 +454,7 @@ mod tests {
                 registry,
                 provider_id: "scripted".into(),
                 model: "scripted-model".into(),
+                turn_deadline: DEFAULT_TURN_DEADLINE,
             },
             requests,
         )
@@ -633,6 +777,7 @@ mod tests {
             registry,
             provider_id: "recorder".into(),
             model: "m".into(),
+            turn_deadline: DEFAULT_TURN_DEADLINE,
         };
 
         let core = crate::start(runner);
@@ -694,5 +839,82 @@ mod tests {
             started,
             ("scripted".to_string(), "scripted-model".to_string())
         );
+    }
+
+    #[test]
+    fn a_turn_that_outruns_its_deadline_is_incomplete_not_completed() {
+        let (runner, _r) = runner_that_never_stops(Duration::from_millis(5));
+        let runner = runner
+            .with_turn_deadline(Duration::from_millis(80))
+            .expect("a positive deadline is accepted");
+        let (outcome, _p) = run(runner, "stream forever");
+        match outcome {
+            Outcome::Incomplete {
+                partial_text,
+                reason,
+            } => {
+                assert!(
+                    !partial_text.is_empty(),
+                    "the text that did arrive must be preserved"
+                );
+                assert!(reason.contains("turn"), "reason was {reason:?}");
+            }
+            other => panic!("a deadline must not report success: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_deadline_that_fires_before_any_token_is_a_failure_not_a_partial_answer() {
+        // One frame per 50ms against a 20ms deadline: the deadline is
+        // seen on the first poll, before anything is streamed.
+        let (runner, _r) = runner_that_never_stops(Duration::from_millis(50));
+        let runner = runner
+            .with_turn_deadline(Duration::from_millis(1))
+            .expect("a positive deadline is accepted");
+        let (outcome, _p) = run(runner, "stream forever");
+        match outcome {
+            Outcome::Failed { detail } => assert!(detail.contains("turn"), "detail was {detail:?}"),
+            other => panic!("an empty timed-out turn is a failure: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_zero_deadline_is_refused_at_construction() {
+        let (runner, _r) = runner_with(vec![StreamEvent::Done], Duration::ZERO, None);
+        assert!(runner.with_turn_deadline(Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn an_answer_that_started_and_then_failed_is_incomplete_not_failed() {
+        let (runner, _r) = runner_failing_after(
+            vec![StreamEvent::TextDelta("half an ans".into())],
+            ProviderError::Transport("the connection dropped".into()),
+        );
+        let (outcome, _p) = run(runner, "hi");
+        match outcome {
+            Outcome::Incomplete {
+                partial_text,
+                reason,
+            } => {
+                assert_eq!(partial_text, "half an ans");
+                assert!(reason.contains("connection dropped"), "reason {reason:?}");
+            }
+            other => panic!("a partial answer must survive the failure: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failure_before_any_token_stays_a_failure() {
+        let (runner, _r) = runner_failing_after(
+            Vec::new(),
+            ProviderError::Transport("the connection dropped".into()),
+        );
+        let (outcome, _p) = run(runner, "hi");
+        match outcome {
+            Outcome::Failed { detail } => {
+                assert!(detail.contains("connection dropped"), "detail {detail:?}")
+            }
+            other => panic!("nothing arrived, so this is a failure: {other:?}"),
+        }
     }
 }

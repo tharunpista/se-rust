@@ -289,6 +289,11 @@ fn exec(cli: &Cli, request: &str) -> std::process::ExitCode {
                         // A turn that ran out of steps did not succeed,
                         // and must not exit zero as though it had.
                         Outcome::ExhaustedTurns { .. } => std::process::ExitCode::from(3),
+                        // A partial answer is not success, and is given
+                        // its own code rather than being folded into
+                        // Failed's: the caller can tell "something
+                        // streamed" from "nothing did".
+                        Outcome::Incomplete { .. } => std::process::ExitCode::from(4),
                         Outcome::Failed { .. } => std::process::ExitCode::FAILURE,
                     };
                 }

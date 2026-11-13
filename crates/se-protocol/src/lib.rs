@@ -123,13 +123,28 @@ pub enum Outcome {
     /// The model produced a final answer.
     Completed { final_text: String },
     /// The user interrupted it. Distinct from failure: nothing is wrong.
+    /// Takes precedence over every other outcome -- a user-requested
+    /// stop is never relabelled as a truncation or a failure, even if
+    /// partial text exists.
     Cancelled,
     /// The turn limit was reached without a final answer. Reported
     /// honestly rather than presenting the last partial output as an
     /// answer.
     ExhaustedTurns { turns: u32 },
-    /// Something failed. `detail` is safe to display: it never carries a
-    /// credential (I8).
+    /// A real answer started but did not finish: the provider was
+    /// interrupted by something other than the user (truncation at an
+    /// output limit, a mid-stream error, a dropped connection, a
+    /// whole-turn deadline). `partial_text` is exactly what streamed
+    /// before the interruption -- never padded, never silently
+    /// discarded. Distinct from `Failed` specifically so a view can
+    /// show "here is what we got, and why it stopped" rather than
+    /// losing the partial answer or, worse, presenting it as complete.
+    Incomplete {
+        partial_text: String,
+        reason: String,
+    },
+    /// Something failed with no usable partial answer. `detail` is safe
+    /// to display: it never carries a credential (I8).
     Failed { detail: String },
 }
 
@@ -143,6 +158,7 @@ impl Outcome {
             Outcome::Completed { .. } => "completed",
             Outcome::Cancelled => "cancelled",
             Outcome::ExhaustedTurns { .. } => "exhausted",
+            Outcome::Incomplete { .. } => "incomplete",
             Outcome::Failed { .. } => "failed",
         }
     }
