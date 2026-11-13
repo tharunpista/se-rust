@@ -34,35 +34,61 @@ mod theme {
     }
 }
 
-pub fn draw(f: &mut Frame, state: &AppState) {
+/// Draws one frame and records what it actually measured.
+///
+/// Takes `&mut AppState` specifically to write back `last_total_rows`
+/// and `last_viewport_rows`: the scroll clamp and indicator need the
+/// real wrapped-row count the terminal just displayed, not a logical
+/// line count computed separately and liable to disagree with it.
+pub fn draw(f: &mut Frame, state: &mut AppState) {
     let area = f.area();
     f.render_widget(
         Block::default().style(Style::default().bg(theme::CHARCOAL)),
         area,
     );
 
-    let composer_height = composer_height(state, area.width);
+    let banner_height = if state.banner.is_some() { 1 } else { 0 };
+    let composer_height = composer_height(state, area.width.saturating_sub(2));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),               // header
+            Constraint::Length(banner_height),   // optional warning banner
             Constraint::Min(3),                  // transcript
             Constraint::Length(composer_height), // composer
-            Constraint::Length(1),               // status
+            Constraint::Length(1),               // help bar
         ])
         .split(area);
 
     draw_header(f, chunks[0], state);
-    draw_transcript(f, chunks[1], state);
-    draw_composer(f, chunks[2], state);
-    draw_status(f, chunks[3], state);
+    if let Some(banner) = &state.banner {
+        draw_banner(f, chunks[1], banner);
+    }
+    draw_transcript(f, chunks[2], state);
+    draw_composer(f, chunks[3], state);
+    draw_help_bar(f, chunks[4], state);
 }
 
-fn composer_height(state: &AppState, _width: u16) -> u16 {
+fn composer_height(state: &AppState, width: u16) -> u16 {
     // Grows with the draft, capped so a long paste cannot swallow the
-    // transcript.
-    let lines = state.composer.lines().count().max(1) as u16;
-    lines.clamp(1, 6) + 2
+    // transcript. Uses the composer's own wrapped row count, the same
+    // measurement the cursor placement uses, so the box is always tall
+    // enough for the text it is about to show.
+    state.composer.rows(width).clamp(1, 6) + 2
+}
+
+fn draw_banner(f: &mut Frame, area: Rect, text: &str) {
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {text}"),
+            Style::default()
+                .fg(theme::WARN)
+                .bg(theme::CHARCOAL)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .style(theme::base()),
+        area,
+    );
 }
 
 fn draw_header(f: &mut Frame, area: Rect, state: &AppState) {
@@ -89,7 +115,7 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_widget(Paragraph::new(Line::from(spans)).style(theme::base()), area);
 }
 
-fn draw_transcript(f: &mut Frame, area: Rect, state: &AppState) {
+fn draw_transcript(f: &mut Frame, area: Rect, state: &mut AppState) {
     let mut lines: Vec<Line> = Vec::new();
     for entry in &state.transcript {
         match entry {
@@ -208,17 +234,37 @@ fn draw_transcript(f: &mut Frame, area: Rect, state: &AppState) {
     let wrapped = wrap_lines(lines, inner_width);
 
     // `scroll` counts lines back from the newest, so the view stays
-    // pinned to the bottom while content streams in.
+    // pinned to the bottom while content streams in. Recorded on `state`
+    // so input handling (PageUp/PageDown/wheel) can clamp against the
+    // same real measurement used to draw this frame, rather than a
+    // logical-line count computed separately that could disagree.
     let viewport = area.height.saturating_sub(1) as usize;
+    state.last_total_rows = wrapped.len();
+    state.last_viewport_rows = viewport;
+    state.clamp_scroll();
+
     let offset = if wrapped.len() > viewport {
         (wrapped.len() - viewport).saturating_sub(state.scroll as usize)
     } else {
         0
     };
 
+    // A compact position indicator in the border title, rather than a
+    // separate scrollbar widget: "N above" when scrolled back from the
+    // newest content, nothing when already at the bottom (the common
+    // case, which should not be cluttered).
+    let title = if state.scroll > 0 && wrapped.len() > viewport {
+        let above = wrapped
+            .len()
+            .saturating_sub(viewport + state.scroll as usize);
+        format!(" ↑ {above} line(s) above · PgDn to catch up ")
+    } else {
+        String::new()
+    };
     let block = Block::default()
         .borders(Borders::TOP)
-        .border_style(theme::muted());
+        .border_style(theme::muted())
+        .title(Span::styled(title, theme::accent()));
     f.render_widget(
         Paragraph::new(wrapped.into_iter().skip(offset).collect::<Vec<_>>())
             .style(theme::base())
@@ -305,21 +351,32 @@ fn chunk_chars(text: &str, width: usize) -> Vec<String> {
         .collect()
 }
 
+/// Draws the composer, including placing the real terminal cursor.
+///
+/// Placing the cursor (rather than only showing text) is what makes this
+/// feel like an editor instead of a text box that happens to update: the
+/// blinking terminal cursor is the thing a user's eye actually tracks
+/// while typing, and before this it was not drawn at all -- the
+/// underlying text changed, but the cursor never left the top-left
+/// corner of the pane.
 fn draw_composer(f: &mut Frame, area: Rect, state: &AppState) {
-    let (text, style) = if state.awaiting_approval().is_some() {
-        (
-            "a decision is waiting above — press y to allow, n to deny".to_string(),
-            theme::accent_bold(),
-        )
-    } else if state.composer.is_empty() {
-        (
-            "describe the work, or press Enter on an empty line to do nothing".to_string(),
-            theme::muted(),
-        )
-    } else {
-        (state.composer.clone(), theme::base())
-    };
+    let inner_width = area.width.saturating_sub(2).max(1);
 
+    if state.awaiting_approval().is_some() {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(theme::accent_bold());
+        f.render_widget(
+            Paragraph::new("a decision is waiting above — press y to allow, n to deny")
+                .style(theme::accent_bold())
+                .wrap(Wrap { trim: false })
+                .block(block),
+            area,
+        );
+        return;
+    }
+
+    let placeholder = state.composer.is_empty();
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(if state.is_busy() {
@@ -327,27 +384,62 @@ fn draw_composer(f: &mut Frame, area: Rect, state: &AppState) {
         } else {
             theme::accent()
         });
+
+    if placeholder {
+        f.render_widget(
+            Paragraph::new("describe the work  (Enter to send, Shift+Enter for a new line)")
+                .style(theme::muted())
+                .wrap(Wrap { trim: false })
+                .block(block),
+            area,
+        );
+        // The cursor still belongs at the start of an empty composer,
+        // not wherever the previous frame happened to leave it.
+        f.set_cursor_position(ratatui::layout::Position::new(area.x + 1, area.y + 1));
+        return;
+    }
+
     f.render_widget(
-        Paragraph::new(text)
-            .style(style)
+        Paragraph::new(state.composer.text().to_string())
+            .style(theme::base())
             .wrap(Wrap { trim: false })
             .block(block),
         area,
     );
+
+    let (row, col) = state.composer.cursor_rowcol(inner_width);
+    // Clamped to the box: a cursor computed past the rendered area
+    // (possible only if `composer_height`'s cap and this wrap ever
+    // disagree) must never be handed to the terminal as an out-of-frame
+    // position.
+    let max_row = area.height.saturating_sub(3);
+    f.set_cursor_position(ratatui::layout::Position::new(
+        area.x + 1 + col.min(inner_width.saturating_sub(1)),
+        area.y + 1 + row.min(max_row),
+    ));
 }
 
-fn draw_status(f: &mut Frame, area: Rect, state: &AppState) {
-    let hint = match state.activity {
-        Activity::Idle => "Enter send · Shift+Enter newline · Ctrl+D diagnostics · Esc quit",
-        Activity::Working { .. } => "Esc or Ctrl+C interrupt · PgUp/PgDn scroll",
-        Activity::AwaitingApproval { .. } => "y allow · n deny · Ctrl+C interrupt",
+/// A compact, state-sensitive shortcut bar in place of a paragraph of
+/// instructions: only the keys that do something *right now*, plus a
+/// short status when a task is running, in one line.
+fn draw_help_bar(f: &mut Frame, area: Rect, state: &AppState) {
+    let hint = if state.awaiting_approval().is_some() {
+        "y Allow   n Deny   Ctrl+C Exit"
+    } else {
+        match state.activity {
+            Activity::Idle => "Enter Send   Shift+Enter Newline   Ctrl+D Diag   Ctrl+C Exit",
+            Activity::Working { .. } => "Esc Interrupt   Ctrl+C Exit   PgUp/PgDn Scroll",
+            Activity::AwaitingApproval { .. } => unreachable!("handled above"),
+        }
     };
-    let line = Line::from(vec![
-        Span::styled(hint, theme::muted()),
-        Span::styled("   ", theme::muted()),
-        Span::styled(state.usage_line(), theme::muted()),
-    ]);
-    f.render_widget(Paragraph::new(line).style(theme::base()), area);
+    let mut spans = vec![Span::styled(hint, theme::muted())];
+    if !state.status.is_empty() {
+        spans.push(Span::styled("   ", theme::muted()));
+        spans.push(Span::styled(state.status.clone(), theme::accent()));
+    }
+    spans.push(Span::styled("   ", theme::muted()));
+    spans.push(Span::styled(state.usage_line(), theme::muted()));
+    f.render_widget(Paragraph::new(Line::from(spans)).style(theme::base()), area);
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -369,7 +461,7 @@ mod tests {
     use ratatui::Terminal;
     use se_protocol::{Stage, Timings};
 
-    fn render(state: &AppState, w: u16, h: u16) -> String {
+    fn render(state: &mut AppState, w: u16, h: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal.draw(|f| draw(f, state)).unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -383,16 +475,36 @@ mod tests {
         out
     }
 
+    /// The honesty requirement, rendered: when there is no real model
+    /// connected, the fact that replies are a local echo must be on
+    /// screen, not only in a line printed to a terminal the alternate
+    /// screen has already covered.
+    #[test]
+    fn a_banner_is_shown_when_there_is_no_real_model_connected() {
+        let mut state = AppState::new();
+        state.banner = Some("no model connected — replies below are a local echo".into());
+        let out = render(&mut state, 80, 16);
+        assert!(out.contains("local echo"), "{out}");
+    }
+
+    #[test]
+    fn no_banner_means_no_banner_line_is_drawn() {
+        let mut state = AppState::new();
+        assert!(state.banner.is_none());
+        let out = render(&mut state, 80, 16);
+        assert!(!out.contains("echo"), "{out}");
+    }
+
     #[test]
     fn the_frame_shows_a_header_transcript_composer_and_status() {
         let mut state = AppState::new();
         state.push(Entry::User("build the thing".into()));
         state.push(Entry::Assistant("working on it".into()));
-        let out = render(&state, 80, 16);
+        let out = render(&mut state, 80, 16);
         assert!(out.contains("SE"), "{out}");
         assert!(out.contains("build the thing"), "{out}");
         assert!(out.contains("working on it"), "{out}");
-        assert!(out.contains("Enter send"), "{out}");
+        assert!(out.contains("Enter Send"), "{out}");
     }
 
     #[test]
@@ -407,9 +519,9 @@ mod tests {
             summary: "cargo test".into(),
             decision: None,
         });
-        let out = render(&state, 80, 16);
+        let out = render(&mut state, 80, 16);
         assert!(out.contains("run_shell"), "{out}");
-        assert!(out.contains("y allow"), "{out}");
+        assert!(out.contains("y Allow"), "{out}");
         // The composer must say why it is not accepting text.
         assert!(out.contains("decision is waiting"), "{out}");
     }
@@ -420,7 +532,7 @@ mod tests {
         for i in 0..200 {
             state.push(Entry::Assistant(format!("line {i}")));
         }
-        let out = render(&state, 60, 12);
+        let out = render(&mut state, 60, 12);
         assert!(out.contains("line 199"), "newest must be visible");
         assert!(!out.contains("line 0\n"), "oldest must be scrolled off");
     }
@@ -432,7 +544,7 @@ mod tests {
             state.push(Entry::Assistant(format!("line {i}")));
         }
         state.scroll = 50;
-        let out = render(&state, 60, 12);
+        let out = render(&mut state, 60, 12);
         assert!(!out.contains("line 199"), "scrolled away from newest");
         assert!(out.contains("line 14") || out.contains("line 15"), "{out}");
     }
@@ -441,7 +553,7 @@ mod tests {
     fn a_gap_in_events_is_rendered_as_a_warning_not_hidden() {
         let mut state = AppState::new();
         state.dropped_events = 3;
-        let out = render(&state, 80, 10);
+        let out = render(&mut state, 80, 10);
         assert!(out.contains("not received"), "{out}");
     }
 
@@ -455,11 +567,11 @@ mod tests {
         });
         state.last_timings = Some(timings);
 
-        let hidden = render(&state, 80, 12);
+        let hidden = render(&mut state, 80, 12);
         assert!(!hidden.contains("ttft"), "off by default");
 
         state.show_diagnostics = true;
-        let shown = render(&state, 80, 12);
+        let shown = render(&mut state, 80, 12);
         assert!(shown.contains("ttft"), "{shown}");
         assert!(shown.contains("120ms"), "{shown}");
     }
@@ -469,9 +581,9 @@ mod tests {
         // Terminals get resized to silly sizes; drawing must survive it.
         let mut state = AppState::new();
         state.push(Entry::User("a fairly long line of text here".into()));
-        state.composer = "typing something".into();
+        state.composer.set("typing something".into());
         for (w, h) in [(20, 6), (10, 5), (120, 40), (40, 4)] {
-            let _ = render(&state, w, h);
+            let _ = render(&mut state, w, h);
         }
     }
 
@@ -493,7 +605,7 @@ mod tests {
             summary: "not run".into(),
             state: ToolState::Denied,
         });
-        let out = render(&state, 80, 14);
+        let out = render(&mut state, 80, 14);
         assert!(out.contains("✓"), "{out}");
         assert!(out.contains("✗"), "{out}");
         assert!(out.contains("⊘"), "{out}");
@@ -518,7 +630,7 @@ mod wrapping {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    fn render(state: &AppState, w: u16, h: u16) -> String {
+    fn render(state: &mut AppState, w: u16, h: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal.draw(|f| draw(f, state)).unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -541,7 +653,7 @@ mod wrapping {
         let long: String = (0..200).map(|i| format!("word{i} ")).collect::<String>();
         state.push(Entry::Assistant(format!("{long}FINALWORD")));
 
-        let out = render(&state, 60, 20);
+        let out = render(&mut state, 60, 20);
         assert!(
             out.contains("FINALWORD"),
             "the end of a long answer must be on screen:\n{out}"
@@ -555,7 +667,7 @@ mod wrapping {
         state.push(Entry::Assistant(long));
 
         state.scroll = 400;
-        let out = render(&state, 60, 20);
+        let out = render(&mut state, 60, 20);
         assert!(
             out.contains("word0"),
             "scrolling back must reach the start:\n{out}"
@@ -566,7 +678,7 @@ mod wrapping {
     fn a_word_longer_than_the_terminal_is_broken_not_dropped() {
         let mut state = AppState::new();
         state.push(Entry::Assistant("x".repeat(300)));
-        let out = render(&state, 30, 12);
+        let out = render(&mut state, 30, 12);
         // Every rendered row is within the width, and the content is
         // present rather than silently truncated to one row.
         let rows: Vec<&str> = out.lines().filter(|l| l.contains('x')).collect();

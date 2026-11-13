@@ -19,12 +19,14 @@
 //!
 //! Every step is bounded. Nothing in it can wait on a model.
 
+pub mod composer;
 pub mod input;
 pub mod render;
 pub mod state;
 
+pub use composer::Composer;
 pub use input::{action_for_key, action_for_mouse, apply_local, Action};
-pub use state::{Activity, AppState, Entry, ToolState};
+pub use state::{Activity, AppState, CtrlC, Entry, ToolState};
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -44,8 +46,19 @@ use se_protocol::ApprovalDecision;
 const TICK: Duration = Duration::from_millis(16);
 
 /// Runs the interface until the user quits.
-pub fn run<B: Backend>(terminal: &mut Terminal<B>, core: &CoreHandle) -> io::Result<()> {
+///
+/// `banner`, if given, is shown above the transcript for the whole
+/// session -- the caller's way to say "this is not a real model" when it
+/// had to fall back to a local runner, so the honesty requirement is
+/// enforced where the user is actually looking rather than only in a
+/// line printed after the alternate screen has already closed.
+pub fn run<B: Backend>(
+    terminal: &mut Terminal<B>,
+    core: &CoreHandle,
+    banner: Option<String>,
+) -> io::Result<()> {
     let mut state = AppState::new();
+    state.banner = banner;
     let mut dirty = true;
 
     while !state.should_quit {
@@ -69,7 +82,13 @@ pub fn run<B: Backend>(terminal: &mut Terminal<B>, core: &CoreHandle) -> io::Res
                     dirty |= dispatch(&mut state, core, action);
                 }
                 Event::Paste(text) => {
-                    state.composer.push_str(&text);
+                    // Bracketed paste must be enabled by the binary for
+                    // this arm to ever fire; see `se`'s `enter()`.
+                    // Pasted text, including embedded newlines, is
+                    // inserted verbatim rather than key-by-key, so a
+                    // multi-line paste cannot submit on its first
+                    // newline the way un-bracketed paste would.
+                    state.composer.insert_str(&text);
                     dirty = true;
                 }
                 Event::Resize(_, _) => dirty = true,
@@ -78,7 +97,7 @@ pub fn run<B: Backend>(terminal: &mut Terminal<B>, core: &CoreHandle) -> io::Res
         }
 
         if dirty {
-            terminal.draw(|f| render::draw(f, &state))?;
+            terminal.draw(|f| render::draw(f, &mut state))?;
             dirty = false;
         }
     }
@@ -99,7 +118,7 @@ fn dispatch(state: &mut AppState, core: &CoreHandle, action: Action) -> bool {
                     // text has already left the composer, so silence
                     // here would look like the message vanished.
                     state.push(Entry::Notice(e.to_string()));
-                    state.composer = text.clone();
+                    state.composer.set(text.clone());
                 }
             }
             true
@@ -108,6 +127,16 @@ fn dispatch(state: &mut AppState, core: &CoreHandle, action: Action) -> bool {
             if let Some(task) = state.running_task() {
                 core.interrupt(task);
                 state.status = "interrupting…".to_string();
+            }
+            true
+        }
+        Action::CtrlC => {
+            // The explicit two-press machine: `AppState::ctrl_c` decides
+            // based on current activity and timing since the last press.
+            match state.ctrl_c(Instant::now()) {
+                state::CtrlC::Interrupt(task) => core.interrupt(task),
+                state::CtrlC::Quit => state.should_quit = true,
+                state::CtrlC::Armed => {}
             }
             true
         }
@@ -180,7 +209,7 @@ mod tests {
         for _ in 0..40 {
             let started = Instant::now();
             pump(&mut state, &core);
-            terminal.draw(|f| render::draw(f, &state)).unwrap();
+            terminal.draw(|f| render::draw(f, &mut state)).unwrap();
             // Typing must also still be processed promptly.
             let action = action_for_key(&state, key('x'));
             apply_local(&mut state, &action);
@@ -212,7 +241,7 @@ mod tests {
         let mut saw_partial = false;
         while Instant::now() < deadline {
             pump(&mut state, &core);
-            terminal.draw(|f| render::draw(f, &state)).unwrap();
+            terminal.draw(|f| render::draw(f, &mut state)).unwrap();
             if state.is_busy() && !state.assistant_text().is_empty() {
                 saw_partial = true;
                 break;
@@ -241,7 +270,7 @@ mod tests {
         assert!(state.is_busy(), "the turn should be running");
 
         let action = action_for_key(&state, ctrl('c'));
-        assert_eq!(action, Action::Interrupt);
+        assert_eq!(action, Action::CtrlC);
         dispatch(&mut state, &core, action);
 
         assert!(
@@ -275,7 +304,7 @@ mod tests {
         assert!(state.composer.is_empty(), "submitting clears the composer");
 
         assert!(pump_until_idle(&mut state, &core, Duration::from_secs(5)));
-        terminal.draw(|f| render::draw(f, &state)).unwrap();
+        terminal.draw(|f| render::draw(f, &mut state)).unwrap();
 
         assert_eq!(state.assistant_text(), "hello core");
         assert!(state
@@ -330,12 +359,13 @@ mod tests {
         let mut state = AppState::new();
         core.submit("first", vec![]).unwrap();
 
-        state.composer = "second".to_string();
+        state.composer.set("second".to_string());
         let action = Action::Submit("second".to_string());
         dispatch(&mut state, &core, action);
 
         assert_eq!(
-            state.composer, "second",
+            state.composer.text(),
+            "second",
             "a refused message must be recoverable, not silently dropped"
         );
         assert!(state

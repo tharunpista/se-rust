@@ -162,23 +162,33 @@ fn interactive(cli: &Cli, startup: se_protocol::Running) -> io::Result<()> {
         default_hook(info);
     }));
 
-    let core = match &resolved {
+    // Whether this session will actually reach a model, decided once
+    // and shown everywhere a user could be looking: the header never
+    // calls an echoed response an AI-generated one, and this banner is
+    // the on-screen counterpart of the same fact.
+    let (core, banner) = match &resolved {
         Ok((provider_id, model)) => match ProviderRunner::new(provider_id, model) {
-            Ok(runner) => se_core::start(runner),
+            Ok(runner) => (se_core::start(runner), None),
             Err(e) => {
                 let _ = restore();
                 eprintln!("se: {e}");
                 return Ok(());
             }
         },
-        // No usable provider: the interface still runs, against the echo
-        // runner, so the user sees the application and reads the reason
-        // instead of being dropped back to a bare shell.
-        Err(_) => se_core::start(EchoRunner::instant()),
+        // No usable provider: the interface still runs, against a local
+        // echo, so the user sees the application and reads why rather
+        // than being dropped back to a bare shell -- but it must never
+        // be mistaken for a real reply, which is what this banner is for.
+        Err(reason) => (
+            se_core::start(EchoRunner::instant()),
+            Some(format!(
+                "⚠ no model connected ({reason}) — replies below are a local echo, not AI"
+            )),
+        ),
     };
 
     let first_frame = startup.finish();
-    let result = se_tui::run(&mut terminal, &core);
+    let result = se_tui::run(&mut terminal, &core, banner);
     core.shutdown();
     restore()?;
 

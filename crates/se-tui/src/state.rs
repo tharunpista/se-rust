@@ -56,15 +56,39 @@ pub enum Activity {
     },
 }
 
-#[derive(Debug)]
+/// What a Ctrl+C press resolved to, given application state and timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CtrlC {
+    /// Interrupt the running task (first press while working).
+    Interrupt(TaskId),
+    /// Exit (a second press inside the window, or a press while idle
+    /// after the first was armed).
+    Quit,
+    /// First press while idle: armed, waiting for a confirming second.
+    Armed,
+}
+
+/// How long a second Ctrl+C still counts as confirming the first.
+const CTRL_C_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
+
+#[derive(Debug, Clone)]
 pub struct AppState {
     pub transcript: Vec<Entry>,
-    pub composer: String,
+    pub composer: crate::composer::Composer,
     pub activity: Activity,
     pub status: String,
     pub should_quit: bool,
+    /// A persistent warning shown above the transcript, e.g. that no
+    /// model is connected and replies are a local echo rather than AI.
+    pub banner: Option<String>,
     /// Lines scrolled back from the newest. 0 pins to the latest.
     pub scroll: u16,
+    /// Total wrapped rows the transcript last occupied, and the viewport
+    /// height it was drawn in. Recorded by the renderer so the scroll
+    /// indicator and max-scroll clamp use real measurements, not logical
+    /// line counts.
+    pub last_total_rows: usize,
+    pub last_viewport_rows: usize,
     pub usage: Usage,
     /// Timings of the most recently finished task, shown in diagnostic
     /// mode (the Phase 1 gate requires stage timings to be visible).
@@ -74,22 +98,28 @@ pub struct AppState {
     /// order. Surfaced rather than hidden, so a gap is visible (I6).
     pub dropped_events: u64,
     next_expected_seq: Option<u64>,
+    /// When Ctrl+C was last pressed, for the two-press exit.
+    last_ctrl_c: Option<std::time::Instant>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
         AppState {
             transcript: Vec::new(),
-            composer: String::new(),
+            composer: crate::composer::Composer::new(),
             activity: Activity::Idle,
             status: String::new(),
             should_quit: false,
+            banner: None,
             scroll: 0,
+            last_total_rows: 0,
+            last_viewport_rows: 0,
             usage: Usage::default(),
             last_timings: None,
             show_diagnostics: false,
             dropped_events: 0,
             next_expected_seq: None,
+            last_ctrl_c: None,
         }
     }
 }
@@ -119,9 +149,55 @@ impl AppState {
 
     pub fn push(&mut self, entry: Entry) {
         self.transcript.push(entry);
-        // Any new content pins the view to the bottom, which is what a
-        // reader expects while something is streaming.
-        self.scroll = 0;
+        // Deliberately does NOT force the view to the bottom. When the
+        // user is at the bottom (scroll == 0) the offset is computed
+        // from the end, so new content stays in view automatically; when
+        // they have scrolled up to read, their position is left alone,
+        // which is what "do not jump to the bottom on every render while
+        // I am reading older content" asks for.
+    }
+
+    /// Resolves a Ctrl+C press against state and timing.
+    ///
+    /// An explicit two-press machine (the directive): while working, the
+    /// first press interrupts; while idle, the first press only arms,
+    /// and a second press inside the window exits. This is what stops a
+    /// reflexive Ctrl+C from killing the session, while keeping a
+    /// deliberate double-press as a fast exit.
+    pub fn ctrl_c(&mut self, now: std::time::Instant) -> CtrlC {
+        let armed = self
+            .last_ctrl_c
+            .is_some_and(|t| now.duration_since(t) < CTRL_C_WINDOW);
+        self.last_ctrl_c = Some(now);
+
+        if armed {
+            return CtrlC::Quit;
+        }
+        match self.running_task() {
+            Some(task) => {
+                self.status = "interrupting… (Ctrl+C again to exit)".to_string();
+                CtrlC::Interrupt(task)
+            }
+            None => {
+                self.status = "press Ctrl+C again to exit".to_string();
+                CtrlC::Armed
+            }
+        }
+    }
+
+    /// How many wrapped rows exist below the current viewport, from the
+    /// last render. Zero means the newest line is visible.
+    pub fn rows_below(&self) -> usize {
+        self.scroll as usize
+    }
+
+    /// Clamps `scroll` so it can never go past the oldest content. Uses
+    /// the real measurements the renderer recorded.
+    pub fn clamp_scroll(&mut self) {
+        let max = self.last_total_rows.saturating_sub(self.last_viewport_rows);
+        if (self.scroll as usize) > max {
+            self.scroll = max.min(u16::MAX as usize) as u16;
+        }
     }
 
     /// Folds one core event into the view.
@@ -140,6 +216,10 @@ impl AppState {
             Payload::TaskStarted { request } => {
                 self.push(Entry::User(request.clone()));
                 self.activity = Activity::Working { task: event.task };
+                // A new exchange the user just started is the one thing
+                // that does snap to the bottom: they want to see their
+                // message and the reply to it.
+                self.scroll = 0;
             }
             Payload::TurnStarted { provider, model } => {
                 self.status = format!("{provider} · {model}");
@@ -236,9 +316,11 @@ impl AppState {
     }
 
     fn append_assistant(&mut self, text: &str) {
+        // No scroll reset: streaming into the newest entry stays pinned
+        // when the user is at the bottom and leaves their position alone
+        // when they have scrolled up to read.
         if let Some(Entry::Assistant(existing)) = self.transcript.last_mut() {
             existing.push_str(text);
-            self.scroll = 0;
             return;
         }
         self.push(Entry::Assistant(text.to_string()));
@@ -247,7 +329,6 @@ impl AppState {
     fn append_reasoning(&mut self, text: &str) {
         if let Some(Entry::Reasoning(existing)) = self.transcript.last_mut() {
             existing.push_str(text);
-            self.scroll = 0;
             return;
         }
         self.push(Entry::Reasoning(text.to_string()));
@@ -321,6 +402,67 @@ impl AppState {
 }
 
 #[cfg(test)]
+mod ctrl_c_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn idle_first_press_only_arms_it_does_not_quit() {
+        let mut s = AppState::new();
+        assert_eq!(s.ctrl_c(Instant::now()), CtrlC::Armed);
+        assert!(!s.should_quit, "a single press while idle must not exit");
+    }
+
+    #[test]
+    fn idle_second_press_inside_the_window_quits() {
+        let mut s = AppState::new();
+        let t0 = Instant::now();
+        assert_eq!(s.ctrl_c(t0), CtrlC::Armed);
+        assert_eq!(s.ctrl_c(t0 + Duration::from_millis(200)), CtrlC::Quit);
+    }
+
+    #[test]
+    fn a_second_press_after_the_window_re_arms_instead_of_quitting() {
+        let mut s = AppState::new();
+        let t0 = Instant::now();
+        assert_eq!(s.ctrl_c(t0), CtrlC::Armed);
+        assert_eq!(s.ctrl_c(t0 + Duration::from_millis(2000)), CtrlC::Armed);
+    }
+
+    #[test]
+    fn working_first_press_interrupts_the_running_task_rather_than_arming() {
+        let mut s = AppState::new();
+        let task = TaskId::from_raw(7);
+        s.activity = Activity::Working { task };
+        assert_eq!(s.ctrl_c(Instant::now()), CtrlC::Interrupt(task));
+    }
+
+    #[test]
+    fn a_second_press_while_still_working_quits_rather_than_interrupting_again() {
+        let mut s = AppState::new();
+        let task = TaskId::from_raw(7);
+        s.activity = Activity::Working { task };
+        let t0 = Instant::now();
+        assert_eq!(s.ctrl_c(t0), CtrlC::Interrupt(task));
+        assert_eq!(s.ctrl_c(t0 + Duration::from_millis(100)), CtrlC::Quit);
+    }
+
+    #[test]
+    fn mere_typing_between_two_ctrl_c_presses_does_not_reset_the_window() {
+        // The directive: avoid accidental shutdown while editing, but a
+        // deliberate double Ctrl+C must still exit even if the user kept
+        // typing in between -- typing itself does not call `ctrl_c` at
+        // all, so this is really asserting that nothing except time
+        // resets the arming.
+        let mut s = AppState::new();
+        let t0 = Instant::now();
+        assert_eq!(s.ctrl_c(t0), CtrlC::Armed);
+        s.composer.insert_char('x');
+        assert_eq!(s.ctrl_c(t0 + Duration::from_millis(500)), CtrlC::Quit);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use se_protocol::{SessionId, ToolCallId, TurnId};
@@ -355,6 +497,36 @@ mod tests {
         // One entry, not three: this is what makes it read as streaming
         // rather than as three separate replies.
         assert_eq!(app.transcript.len(), 1);
+    }
+
+    /// What the user actually typed and what the task reports back are
+    /// kept as two distinct entries that can never collapse into one.
+    ///
+    /// This is the regression for "SE appears to repeat the exact text I
+    /// typed": that behaviour was never a rendering bug -- a `Delta`
+    /// carrying the literal input text is exactly what the local echo
+    /// runner's output looks like once it reaches this function. What
+    /// *is* checked here is the one way a real bug could produce the
+    /// same symptom: the user's own `TaskStarted` message must never be
+    /// folded into, or mistaken for, the `Assistant` entry a later
+    /// `Delta` starts.
+    #[test]
+    fn a_users_own_message_never_becomes_the_assistant_entry() {
+        let mut app = AppState::new();
+        app.apply(&ev(
+            0,
+            Payload::TaskStarted {
+                request: "hello".into(),
+            },
+        ));
+        app.apply(&delta(1, "hello"));
+
+        assert_eq!(app.transcript.len(), 2, "{:?}", app.transcript);
+        assert!(matches!(&app.transcript[0], Entry::User(t) if t == "hello"));
+        assert!(matches!(&app.transcript[1], Entry::Assistant(t) if t == "hello"));
+        // They must be genuinely separate entries, not the same String
+        // appearing twice because one was copied from the other.
+        assert_eq!(app.transcript.len(), 2);
     }
 
     #[test]
