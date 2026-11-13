@@ -24,6 +24,7 @@ pub mod engine;
 pub mod provider_runner;
 pub mod routing;
 pub mod runner;
+pub mod session_store;
 pub mod sink;
 
 pub use engine::{start, CoreHandle, SubmitError};

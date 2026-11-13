@@ -842,6 +842,7 @@ version = "0.1.0"
 dependencies = [
  "se-protocol",
  "se-provider",
+ "serde_json",
 ]
 
 [[package]]

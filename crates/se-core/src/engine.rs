@@ -79,11 +79,41 @@ pub struct CoreHandle {
     /// Mirrors the supervisor's view so `submit` can refuse locally
     /// rather than sending an operation that will be rejected anyway.
     active: Arc<std::sync::Mutex<Option<TaskId>>>,
+    /// `None` until [`CoreHandle::attach_session_log`] is called.
+    /// Deliberately not set at [`start`] time: most tests, and any
+    /// caller that has not decided where sessions live, must see
+    /// exactly today's behaviour with no file ever touched.
+    session_log: Arc<std::sync::Mutex<Option<crate::session_store::SessionStore>>>,
 }
 
 impl CoreHandle {
     pub fn session(&self) -> SessionId {
         self.session
+    }
+
+    /// Opens `path` as this session's durable event log. Every event
+    /// this handle hands to an interface from this point on is also
+    /// appended there (see [`CoreHandle::drain`]). Events already
+    /// drained before this call are not retroactively logged -- call
+    /// this before the first `drain` if nothing may be missed.
+    pub fn attach_session_log(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let store = crate::session_store::SessionStore::open(path)?;
+        let mut guard = self.session_log.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(store);
+        Ok(())
+    }
+
+    /// Appends `event` to the attached session log, if any. A write
+    /// failure is not surfaced to the caller of `drain`: the event
+    /// itself was already delivered and losing it would be worse than
+    /// losing one line of a log the caller did not ask to be told
+    /// about mid-loop. (A future diagnostics surface can read this
+    /// back out; nothing today needs to.)
+    fn persist(&self, event: &CoreEvent) {
+        let mut guard = self.session_log.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(store) = guard.as_mut() {
+            let _ = store.append(event);
+        }
     }
 
     /// Hands a request to the core and returns immediately.
@@ -166,6 +196,7 @@ impl CoreHandle {
                 let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
                 *active = None;
             }
+            self.persist(&event);
             out.push(event);
         }
         out
@@ -183,6 +214,7 @@ impl CoreHandle {
                     let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
                     *active = None;
                 }
+                self.persist(&first);
                 let mut out = vec![first];
                 out.extend(self.drain());
                 out
@@ -248,6 +280,7 @@ pub fn start<R: Runner>(runner: R) -> CoreHandle {
         events: event_rx,
         session,
         active,
+        session_log: Arc::new(std::sync::Mutex::new(None)),
     }
 }
 
@@ -586,6 +619,59 @@ mod tests {
             "the override must win over whatever the runner itself returned"
         );
         handle.shutdown();
+    }
+
+    #[test]
+    fn a_killed_mid_turn_session_reads_interrupted_not_completed_on_resume() {
+        // The Phase 2a gate, end to end through the real CoreHandle:
+        // start a slow turn, drain (which is what persists -- nothing
+        // is logged until something reads it, exactly as a real TUI
+        // loop does), then simulate the process dying by dropping the
+        // handle before the turn ever finishes. A fresh load of the
+        // same log must show the task as interrupted, never completed,
+        // and nothing must have been silently replayed.
+        let path = std::env::temp_dir().join(format!(
+            "se-engine-resume-test-{}.jsonl",
+            std::process::id()
+        ));
+        let _cleanup = scopeguard(path.clone());
+
+        let handle = crate::start(EchoRunner::slow(Duration::from_millis(200), 50));
+        handle.attach_session_log(&path).unwrap();
+        let task = handle
+            .submit("a turn that will not finish", vec![])
+            .unwrap();
+        // Pull at least the TaskStarted event so it is actually
+        // persisted, then "crash" -- drop the handle without ever
+        // seeing a terminal event.
+        let _ = handle.drain_blocking(Duration::from_secs(2));
+        drop(handle);
+
+        let (events, errors) = crate::session_store::load(&path);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!events.is_empty(), "the started turn must have been logged");
+        let result = crate::session_store::reconcile(&events);
+        let (logged_task, state) = result
+            .into_iter()
+            .find(|(t, _)| *t == task)
+            .expect("the task must appear in its own session log");
+        assert_eq!(logged_task, task);
+        assert_eq!(
+            state,
+            crate::session_store::TaskState::Interrupted,
+            "a process death mid-turn must never read back as completed"
+        );
+    }
+
+    /// Removes the test's log file even if an assertion above panics.
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    fn scopeguard(path: std::path::PathBuf) -> Cleanup {
+        Cleanup(path)
     }
 
     #[test]

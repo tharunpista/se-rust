@@ -9,3 +9,4 @@ description = "SE's execution core: session, task and turn lifecycle, run off th
 [dependencies]
 se-protocol = { path = "../se-protocol" }
 se-provider = { path = "../se-provider" }
+serde_json = { workspace = true }

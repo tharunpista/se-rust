@@ -197,6 +197,22 @@ fn interactive(cli: &Cli, startup: se_protocol::Running) -> io::Result<()> {
         ),
     };
 
+    // Best-effort: a session that cannot be logged still runs, exactly
+    // as it always did -- persistence is an added guarantee, not a new
+    // way for SE to refuse to start. A failure here is folded into the
+    // banner the user already sees, rather than silently dropped.
+    let mut banner = banner;
+    if let Ok(cwd) = std::env::current_dir() {
+        let path = se_core::session_store::default_sessions_dir(&cwd)
+            .join(format!("{}.jsonl", core.session()));
+        if let Err(e) = core.attach_session_log(&path) {
+            banner = Some(match banner {
+                Some(existing) => format!("{existing} — also: session not logged ({e})"),
+                None => format!("⚠ session not logged ({e})"),
+            });
+        }
+    }
+
     let first_frame = startup.finish();
     let result = se_tui::run(&mut terminal, &core, banner);
     core.shutdown();
