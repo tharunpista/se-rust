@@ -5,6 +5,7 @@ members = [
     "crates/se-provider",
     "crates/se-command",
     "crates/se-permission",
+    "crates/se-catalogue",
     "crates/se-core",
     "crates/se-tui",
     "crates/se",

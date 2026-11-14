@@ -1,0 +1,19 @@
+[package]
+name = "se-catalogue"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Read-only loader over the SE specialist catalogue: 194 agent definitions plus skill trees. Frontmatter parsing only -- never writes to a source it scanned."
+
+[dependencies]
+serde = { workspace = true }
+# The frontmatter is real YAML (folded block scalars, nested maps, a
+# list of {mode, guard} objects for failure_modes) -- not the flat
+# key:value shape `se-command`'s hand-rolled parser already covers.
+# Getting folded-scalar continuation right by hand across 194 real
+# files is exactly the kind of subtle parsing bug a maintained YAML
+# crate already has tests for; this is the "an installed dependency
+# would cost less than reinventing it" case, not "add a dependency for
+# a few lines."
+serde_yaml_ng = "0.10"
