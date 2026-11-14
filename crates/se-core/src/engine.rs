@@ -416,17 +416,24 @@ fn supervise<R: Runner>(
                     worker: Some(worker),
                 });
             }
-            CoreOp::Interrupt { .. } => {
-                // The task id from the interface may be its reserved one
-                // rather than the supervisor's, so the running task is
-                // the one interrupted: with one task per session there
-                // is no ambiguity about which that is.
+            CoreOp::Interrupt { task: target } => {
+                // E8: a stale `Interrupt` for a task that already
+                // finished must never cancel whatever task is current
+                // now. With one task running at a time this is the
+                // only form the defect can take here -- the real
+                // multi-task version (several `ActiveTask`s, not one)
+                // is Phase 4's worker pool -- but the id check costs
+                // nothing and closes it today rather than leaving it
+                // for whenever that pool exists.
                 if let Some(task) = &current {
-                    task.cancelled.store(true, Ordering::SeqCst);
-                    // A worker parked on approval would never see the
-                    // flag. `UNPARK` matches no real call, so the worker
-                    // loops once, re-checks cancellation and unwinds.
-                    let _ = task.approvals.try_send((UNPARK, false));
+                    if task.id == target {
+                        task.cancelled.store(true, Ordering::SeqCst);
+                        // A worker parked on approval would never see
+                        // the flag. `UNPARK` matches no real call, so
+                        // the worker loops once, re-checks
+                        // cancellation and unwinds.
+                        let _ = task.approvals.try_send((UNPARK, false));
+                    }
                 }
             }
             CoreOp::Approve(ApprovalDecision { call, allow }) => {
@@ -941,6 +948,32 @@ mod tests {
                 final_text: "ran: first_tool".to_string()
             }),
             "the denied second tool must not have run"
+        );
+        handle.shutdown();
+    }
+
+    #[test]
+    fn a_stale_interrupt_for_a_finished_task_never_cancels_the_next_one() {
+        // E8: `Interrupt` ignoring the task id it was asked to cancel.
+        // A reserved interrupt that finally arrives after its task
+        // already finished must not reach whatever task is current by
+        // the time it is processed.
+        let handle = start(crate::runner::EchoRunner::instant());
+        let first = handle.submit("first", vec![]).unwrap();
+        let _ = collect_until_terminal(&handle, Duration::from_secs(5));
+
+        let second = handle.submit("second", vec![]).unwrap();
+        // A stale interrupt naming the already-finished first task.
+        handle.interrupt(first);
+        let events = collect_until_terminal(&handle, Duration::from_secs(5));
+        let Some(Payload::TaskFinished { outcome, .. }) = events.last().map(|e| e.payload.clone())
+        else {
+            panic!("expected a terminal event");
+        };
+        assert_ne!(
+            outcome,
+            Outcome::Cancelled,
+            "a stale interrupt for a different task must not cancel {second:?}'s own task"
         );
         handle.shutdown();
     }
