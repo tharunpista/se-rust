@@ -16,6 +16,7 @@ se-core = { path = "../se-core" }
 se-provider = { path = "../se-provider" }
 se-tui = { path = "../se-tui" }
 se-command = { path = "../se-command" }
+se-catalogue = { path = "../se-catalogue" }
 clap = { workspace = true }
 crossterm = { workspace = true }
 ratatui = { workspace = true }

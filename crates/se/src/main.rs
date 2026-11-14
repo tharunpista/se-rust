@@ -71,6 +71,13 @@ enum Command {
     /// `/help` read, so the two surfaces cannot disagree about what
     /// exists (charter §12).
     Commands,
+    /// List or inspect SE specialist agents from the real catalogue
+    /// (`~/SE/se/agents`), never a synthesized or cached description.
+    Agents {
+        /// A specific agent id to show in full (frontmatter + body).
+        /// Omit to list every loaded id with its one-line mission.
+        id: Option<String>,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -90,6 +97,7 @@ fn main() -> std::process::ExitCode {
         Some(Command::Providers) => providers(),
         Some(Command::Models { provider }) => models(&cli, provider.as_deref()),
         Some(Command::Doctor) => doctor(startup),
+        Some(Command::Agents { id }) => agents(id.as_deref()),
         None => {
             // A pipe is not a terminal: entering raw mode would fail or
             // corrupt the stream, so the headless path is named instead
@@ -437,6 +445,86 @@ fn providers() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
+/// `~/SE/se/agents` (`%USERPROFILE%` on Windows, `$HOME` elsewhere),
+/// the same real catalogue tree `se-catalogue`'s own tests load --
+/// overridable by `SE_CATALOGUE_ROOT` for a different install layout.
+fn catalogue_root() -> Option<std::path::PathBuf> {
+    if let Ok(root) = std::env::var("SE_CATALOGUE_ROOT") {
+        return Some(std::path::PathBuf::from(root));
+    }
+    std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()
+        .map(|home| {
+            std::path::PathBuf::from(home)
+                .join("SE")
+                .join("se")
+                .join("agents")
+        })
+}
+
+/// Lists every agent the real catalogue loads, or shows one in full.
+///
+/// Reads the catalogue fresh on every invocation (no cache, no
+/// directory watcher, per the architecture doc) -- a stale list here
+/// would be worse than the cost of a rescan.
+fn agents(id: Option<&str>) -> std::process::ExitCode {
+    let Some(root) = catalogue_root() else {
+        eprintln!("se: could not determine a home directory to find the agent catalogue in");
+        return std::process::ExitCode::FAILURE;
+    };
+    if !root.exists() {
+        eprintln!(
+            "se: no agent catalogue at {} (set SE_CATALOGUE_ROOT to override)",
+            root.display()
+        );
+        return std::process::ExitCode::FAILURE;
+    }
+    let report = match se_catalogue::load(&root) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "se: could not read the catalogue at {}: {e}",
+                root.display()
+            );
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
+    match id {
+        None => {
+            let mut agents = report.agents;
+            agents.sort_by(|a, b| a.frontmatter.id.cmp(&b.frontmatter.id));
+            for a in &agents {
+                println!("{:<32} {}", a.frontmatter.id, a.frontmatter.mission.trim());
+            }
+            eprintln!(
+                "se: {} agent(s) loaded from {}, {} file(s) skipped",
+                agents.len(),
+                root.display(),
+                report.skipped.len()
+            );
+            std::process::ExitCode::SUCCESS
+        }
+        Some(id) => match report.agents.into_iter().find(|a| a.frontmatter.id == id) {
+            Some(a) => {
+                println!("{} — {}", a.frontmatter.id, a.frontmatter.name);
+                println!("department: {}", a.frontmatter.department);
+                if !a.frontmatter.tools.is_empty() {
+                    println!("tools: {}", a.frontmatter.tools.join(", "));
+                }
+                println!();
+                print!("{}", a.body);
+                std::process::ExitCode::SUCCESS
+            }
+            None => {
+                eprintln!("se: no agent `{id}` in the catalogue — try `se agents` to list ids");
+                std::process::ExitCode::from(2)
+            }
+        },
+    }
+}
+
 fn models(cli: &Cli, provider: Option<&str>) -> std::process::ExitCode {
     let registry = Registry::new();
     let id = match provider
@@ -580,11 +668,16 @@ fn doctor(startup: se_protocol::Running) -> std::process::ExitCode {
     println!("                     so every call asks)");
     println!("    sessions         logged to .se/sessions/<id>.jsonl; `se` resumes a");
     println!("                     killed-mid-turn session as interrupted, not completed");
+    println!("    agent catalogue  `se agents` / `se agents <id>` read the real 194-agent");
+    println!("                     catalogue; browse-only -- a specialist cannot be");
+    println!("                     dispatched as a model turn yet");
     println!();
     println!("  Not implemented yet, and not pretended otherwise:");
     println!("    ruleset config   every tool call asks for approval -- no way yet to");
     println!("                     pre-allow or pre-deny by agent/tool/path");
-    println!("    specialists      Phase 3 -- the 194-agent catalogue is not loaded");
+    println!("    specialist       Phase 3 -- the catalogue loads and lists, but a");
+    println!("    dispatch         specialist's body is not yet used as a turn's prompt");
+    println!("    skills           Phase 3 -- not loaded by this build yet");
     println!("    multi-model      Phase 4 -- team orchestration, task graphs");
     println!("    external CLIs    Phase 6 -- Claude Code, Codex, OpenCode");
     std::process::ExitCode::SUCCESS
