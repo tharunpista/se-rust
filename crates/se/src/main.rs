@@ -184,9 +184,16 @@ fn interactive(cli: &Cli, startup: se_protocol::Running) -> io::Result<()> {
     // and shown everywhere a user could be looking: the header never
     // calls an echoed response an AI-generated one, and this banner is
     // the on-screen counterpart of the same fact.
+    let catalogue_root = catalogue_root().filter(|root| root.exists());
+
     let (core, banner) = match &resolved {
         Ok((provider_id, model)) => match ProviderRunner::new(provider_id, model) {
-            Ok(runner) => (se_core::start(runner), None),
+            Ok(mut runner) => {
+                if let Some(root) = catalogue_root.clone() {
+                    runner = runner.with_catalogue_root(root);
+                }
+                (se_core::start(runner), None)
+            }
             Err(e) => {
                 let _ = restore();
                 eprintln!("se: {e}");
@@ -221,8 +228,41 @@ fn interactive(cli: &Cli, startup: se_protocol::Running) -> io::Result<()> {
         }
     }
 
+    // A specialist is browsable/invokable from `/` only if the real
+    // catalogue actually loaded -- a missing or unreadable catalogue
+    // degrades to an empty specialist list plus a banner note, the
+    // same "fold into the banner, don't refuse to start" convention
+    // the session log above already follows, never a hard error.
+    let mut specialists = Vec::new();
+    if let Some(root) = &catalogue_root {
+        match se_catalogue::load(root) {
+            Ok(report) => {
+                specialists = report
+                    .agents
+                    .iter()
+                    .map(|a| se_command::CommandSpec {
+                        id: format!("specialist:{}", a.frontmatter.id),
+                        path: a.frontmatter.id.clone(),
+                        aliases: Vec::new(),
+                        category: a.frontmatter.department.clone(),
+                        description: a.frontmatter.mission.trim().to_string(),
+                        provenance: se_command::Provenance::Builtin,
+                        handler: se_command::HandlerKind::SpecialistInvoke,
+                        security_critical: false,
+                    })
+                    .collect();
+            }
+            Err(e) => {
+                banner = Some(match banner {
+                    Some(existing) => format!("{existing} — also: specialists not loaded ({e})"),
+                    None => format!("⚠ specialists not loaded ({e})"),
+                });
+            }
+        }
+    }
+
     let first_frame = startup.finish();
-    let result = se_tui::run(&mut terminal, &core, banner);
+    let result = se_tui::run(&mut terminal, &core, banner, specialists);
     core.shutdown();
     restore()?;
 
@@ -669,15 +709,18 @@ fn doctor(startup: se_protocol::Running) -> std::process::ExitCode {
     println!("    sessions         logged to .se/sessions/<id>.jsonl; `se` resumes a");
     println!("                     killed-mid-turn session as interrupted, not completed");
     println!("    agent catalogue  `se agents` / `se agents <id>` read the real 194-agent");
-    println!("                     catalogue; browse-only -- a specialist cannot be");
-    println!("                     dispatched as a model turn yet");
+    println!("                     catalogue; in the TUI, typing /<id> <request> dispatches");
+    println!("                     a turn routed through that specialist's own body");
+    println!("                     as its system prompt, with invocation provenance");
+    println!("                     (agent id + content hash) recorded in the session log");
     println!();
     println!("  Not implemented yet, and not pretended otherwise:");
     println!("    ruleset config   every tool call asks for approval -- no way yet to");
     println!("                     pre-allow or pre-deny by agent/tool/path");
-    println!("    specialist       Phase 3 -- the catalogue loads and lists, but a");
-    println!("    dispatch         specialist's body is not yet used as a turn's prompt");
-    println!("    skills           Phase 3 -- not loaded by this build yet");
+    println!("    tool narrowing   a dispatched specialist's own `tools:` field does not");
+    println!("                     yet narrow what the permission gateway allows it to call");
+    println!("    skills           the loader exists (se-catalogue) but nothing in this");
+    println!("                     binary or the TUI calls it yet");
     println!("    multi-model      Phase 4 -- team orchestration, task graphs");
     println!("    external CLIs    Phase 6 -- Claude Code, Codex, OpenCode");
     std::process::ExitCode::SUCCESS

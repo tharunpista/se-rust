@@ -138,6 +138,22 @@ impl TurnSink {
         Ok(turn)
     }
 
+    /// Records which specialist this turn is routed through and the
+    /// content hash of the exact definition that was resolved for it --
+    /// the invocation-provenance record Phase 3 item 4 asks for. Call
+    /// once, right after [`TurnSink::start_turn`], only on the
+    /// specialist path.
+    pub fn specialist_invoked(
+        &mut self,
+        agent_id: &str,
+        content_hash: u64,
+    ) -> Result<(), Disconnected> {
+        self.emit(Payload::SpecialistInvoked {
+            agent_id: agent_id.to_string(),
+            content_hash,
+        })
+    }
+
     pub fn finish_turn(&mut self) -> Result<(), Disconnected> {
         if let Some(turn) = self.turn {
             self.emit(Payload::TurnCompleted { turn })?;

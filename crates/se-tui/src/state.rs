@@ -292,6 +292,16 @@ impl AppState {
             Payload::TurnStarted { provider, model } => {
                 self.status = format!("{provider} · {model}");
             }
+            // The invocation-provenance record (Phase 3 item 4): which
+            // agent, and the content hash of the exact definition that
+            // ran. Durable via the session log already recording every
+            // `Payload` verbatim; a richer panel showing this history
+            // is later TUI work, not this one line.
+            Payload::SpecialistInvoked { agent_id, .. } => {
+                self.push(Entry::Notice(format!(
+                    "routed through specialist: {agent_id}"
+                )));
+            }
             Payload::Delta { kind, text } => match kind {
                 DeltaKind::Text => self.append_assistant(text),
                 DeltaKind::Reasoning => self.append_reasoning(text),

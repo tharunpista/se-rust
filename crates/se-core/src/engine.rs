@@ -126,7 +126,7 @@ impl CoreHandle {
         text: &str,
         attachments: Vec<std::path::PathBuf>,
     ) -> Result<TaskId, SubmitError> {
-        self.submit_with_model(text, attachments, None)
+        self.submit_inner(text, attachments, None, None)
     }
 
     /// Like [`CoreHandle::submit`], with an explicit per-turn model
@@ -139,6 +139,38 @@ impl CoreHandle {
         text: &str,
         attachments: Vec<std::path::PathBuf>,
         model: Option<se_protocol::ModelRef>,
+    ) -> Result<TaskId, SubmitError> {
+        self.submit_inner(text, attachments, model, None)
+    }
+
+    /// Routes this turn through the specialist named by `id` (a
+    /// catalogue agent id, e.g. `"backend-lead"`).
+    ///
+    /// Deliberately does no catalogue I/O here: this method only sets
+    /// [`UserTurn::specialist_id`] and returns, exactly as fast as
+    /// [`CoreHandle::submit`] already is. Resolving `id` against the
+    /// real catalogue (and failing with a clear message if it names no
+    /// agent) happens on the worker thread, inside whichever `Runner`
+    /// is driving the task -- never on this, the caller's, thread. A
+    /// caller on the interface thread calling this method must never
+    /// block on a filesystem scan, which is the whole reason this
+    /// method exists rather than a caller resolving the specialist
+    /// itself and setting a richer field.
+    pub fn submit_specialist(
+        &self,
+        id: &str,
+        text: &str,
+        attachments: Vec<std::path::PathBuf>,
+    ) -> Result<TaskId, SubmitError> {
+        self.submit_inner(text, attachments, None, Some(id.to_string()))
+    }
+
+    fn submit_inner(
+        &self,
+        text: &str,
+        attachments: Vec<std::path::PathBuf>,
+        model: Option<se_protocol::ModelRef>,
+        specialist_id: Option<String>,
     ) -> Result<TaskId, SubmitError> {
         {
             let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
@@ -159,6 +191,7 @@ impl CoreHandle {
             text: text.to_string(),
             attachments,
             model,
+            specialist_id,
         };
         if self.ops.send(CoreOp::SubmitUserTurn(turn)).is_err() {
             let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());

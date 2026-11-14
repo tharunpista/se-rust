@@ -55,6 +55,13 @@ pub enum HandlerKind {
     CoreOp,
     /// Loads a Markdown template and submits the result as a turn.
     PromptTemplate,
+    /// Submits the trailing text as a turn routed through one named
+    /// catalogue specialist (`path` is that specialist's bare agent
+    /// id). Distinct from `PromptTemplate`: there is no template body
+    /// to substitute into, and the specialist's own definition --
+    /// resolved elsewhere, never by this dependency-free crate --
+    /// supplies the system prompt, not the command's own text.
+    SpecialistInvoke,
 }
 
 /// Builds the stable id for a loaded (non-builtin) command: its

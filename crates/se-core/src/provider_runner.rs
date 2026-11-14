@@ -91,6 +91,16 @@ pub struct ProviderRunner {
     /// runs). `NonceLedger`'s own interior `Mutex` is what makes this
     /// safe to share.
     ledger: NonceLedger,
+    /// Where to find the agent catalogue for a specialist-routed turn.
+    /// `None` is honest for a runner no caller gave one to -- such a
+    /// runner can still run ordinary turns; it just fails a
+    /// specialist-routed one with a clear message rather than guessing
+    /// a path. Resolved by the caller (`crates/se/src/main.rs` already
+    /// owns the one true `catalogue_root()` convention for the `se
+    /// agents` CLI command), never by this crate -- the same reasoning
+    /// `session_store::default_sessions_dir` already follows by taking
+    /// its base directory as an explicit parameter.
+    catalogue_root: Option<std::path::PathBuf>,
 }
 
 impl ProviderRunner {
@@ -115,6 +125,7 @@ impl ProviderRunner {
             turn_deadline: DEFAULT_TURN_DEADLINE,
             ruleset: Ruleset::default(),
             ledger: NonceLedger::new(),
+            catalogue_root: None,
         })
     }
 
@@ -136,6 +147,14 @@ impl ProviderRunner {
     /// the safe starting point this crate does not relax on its own.
     pub fn with_ruleset(mut self, ruleset: Ruleset) -> Self {
         self.ruleset = ruleset;
+        self
+    }
+
+    /// Supplies the catalogue root a specialist-routed turn resolves
+    /// against. Without this, `Runner::run` fails any turn that names
+    /// a `specialist_id` -- clearly, not by guessing a default path.
+    pub fn with_catalogue_root(mut self, root: std::path::PathBuf) -> Self {
+        self.catalogue_root = Some(root);
         self
     }
 
@@ -190,10 +209,61 @@ impl Runner for ProviderRunner {
                 detail: format!("`{}` is no longer registered", self.provider_id),
             };
         };
+
+        // Resolved before `start_turn` fires, not after: a failed
+        // lookup must never leave a `TurnStarted` with no matching
+        // terminal event's worth of setup half-done. This is also the
+        // ONLY place the catalogue is read for this turn -- the
+        // resolved `system_prompt` string is reused for every round
+        // trip the loop below makes, which is the entire "pinned for
+        // the run, never re-read mid-run" requirement (Phase 3 item 4):
+        // nothing after this point ever calls `se_catalogue::load`
+        // again.
+        // `invoked` is emitted after `start_turn` below, once this
+        // turn's `TurnId` actually exists, so the provenance event
+        // correlates with the right turn rather than carrying `turn:
+        // None`. The resolution that can fail happens here, though,
+        // before `start_turn` opens anything -- a failed lookup must
+        // never leave a `TurnStarted` with nothing to close it.
+        let (system_prompt, invoked): (String, Option<(String, u64)>) = match &turn.specialist_id {
+            None => (SYSTEM_PROMPT.to_string(), None),
+            Some(id) => {
+                let Some(root) = &self.catalogue_root else {
+                    return Outcome::Failed {
+                        detail: "no catalogue root configured for specialist dispatch".to_string(),
+                    };
+                };
+                let report = match se_catalogue::load(root) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return Outcome::Failed {
+                            detail: format!("could not read the agent catalogue: {e}"),
+                        };
+                    }
+                };
+                let Some(agent) = report.agents.into_iter().find(|a| &a.frontmatter.id == id)
+                else {
+                    return Outcome::Failed {
+                        detail: format!(
+                            "no specialist `{id}` in the catalogue -- try `se agents` to list ids"
+                        ),
+                    };
+                };
+                (agent.body, Some((agent.frontmatter.id, agent.content_hash)))
+            }
+        };
+
         if sink.start_turn(&self.provider_id, &self.model).is_err() {
             return Outcome::Failed {
                 detail: "the interface disconnected".to_string(),
             };
+        }
+        if let Some((agent_id, content_hash)) = invoked {
+            if sink.specialist_invoked(&agent_id, content_hash).is_err() {
+                return Outcome::Failed {
+                    detail: "the interface disconnected".to_string(),
+                };
+            }
         }
 
         // Context assembly is measured even though it is currently
@@ -206,7 +276,7 @@ impl Runner for ProviderRunner {
         // persist `Outcome::Completed`'s `final_text` does that.
         let mut messages: Vec<Message> = sink.timed(Stage::ContextBuild, || {
             let mut messages = Vec::with_capacity(history.len() + 2);
-            messages.push(Message::text(Role::System, SYSTEM_PROMPT));
+            messages.push(Message::text(Role::System, &system_prompt));
             messages.extend_from_slice(history);
             messages.push(Message::text(Role::User, turn.text.clone()));
             messages
@@ -794,6 +864,7 @@ mod tests {
                 turn_deadline: DEFAULT_TURN_DEADLINE,
                 ruleset: Ruleset::default(),
                 ledger: NonceLedger::new(),
+                catalogue_root: None,
             },
             requests,
         )
@@ -928,6 +999,7 @@ mod tests {
             turn_deadline: DEFAULT_TURN_DEADLINE,
             ruleset,
             ledger: NonceLedger::new(),
+            catalogue_root: None,
         };
         (runner, requests_seen)
     }
@@ -1360,6 +1432,7 @@ mod tests {
             turn_deadline: DEFAULT_TURN_DEADLINE,
             ruleset: Ruleset::default(),
             ledger: NonceLedger::new(),
+            catalogue_root: None,
         };
 
         let core = crate::start(runner);
@@ -1511,5 +1584,252 @@ mod tests {
             }
             other => panic!("nothing arrived, so this is a failure: {other:?}"),
         }
+    }
+
+    // --- Phase 3 items 3-4: specialist invocation and provenance ---
+
+    /// Writes one minimal valid agent definition to a fresh temp
+    /// catalogue root and returns the root. Mirrors the fixture shape
+    /// `se-catalogue`'s own tests already use.
+    fn temp_catalogue(agent_id: &str, body: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "se-core-specialist-{agent_id}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dept = root.join("dept");
+        std::fs::create_dir_all(&dept).unwrap();
+        std::fs::write(
+            dept.join(format!("{agent_id}.md")),
+            format!(
+                "---\nschema_version: 1\nid: {agent_id}\nname: Test Specialist\ndepartment: dept\n---\n\n{body}\n"
+            ),
+        )
+        .unwrap();
+        root
+    }
+
+    fn run_specialist(runner: ProviderRunner, id: &str, text: &str) -> (Outcome, Vec<Payload>) {
+        let core = crate::start(runner);
+        core.submit_specialist(id, text, vec![]).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut payloads = Vec::new();
+        while std::time::Instant::now() < deadline {
+            for event in core.drain_blocking(Duration::from_millis(20)) {
+                let terminal = event.is_terminal();
+                payloads.push(event.payload.clone());
+                if terminal {
+                    core.shutdown();
+                    let Payload::TaskFinished { outcome, .. } = event.payload else {
+                        unreachable!()
+                    };
+                    return (outcome, payloads);
+                }
+            }
+        }
+        panic!("the turn never finished");
+    }
+
+    #[test]
+    fn a_specialist_invocation_uses_the_agents_body_as_the_system_prompt() {
+        let root = temp_catalogue("test-specialist", "YOU ARE THE TEST SPECIALIST.");
+        let (mut runner, _r) = runner_with(
+            vec![StreamEvent::TextDelta("hi".into()), StreamEvent::Done],
+            Duration::ZERO,
+            None,
+        );
+        runner = runner.with_catalogue_root(root.clone());
+
+        // `runner_with` builds a `ScriptedProvider`, which does not
+        // record requests; reuse `scripted_runner`'s sibling pattern by
+        // asserting on the *payload* side instead -- `SpecialistInvoked`
+        // itself carries the one fact that matters here (which agent,
+        // which hash), and a second test below proves the body text
+        // actually reaches the provider.
+        let (outcome, payloads) = run_specialist(runner, "test-specialist", "hello");
+        assert_eq!(
+            outcome,
+            Outcome::Completed {
+                final_text: "hi".into()
+            }
+        );
+        let invoked = payloads.iter().find_map(|p| match p {
+            Payload::SpecialistInvoked {
+                agent_id,
+                content_hash,
+            } => Some((agent_id.clone(), *content_hash)),
+            _ => None,
+        });
+        assert!(
+            invoked.is_some(),
+            "a specialist-routed turn must emit SpecialistInvoked: {payloads:?}"
+        );
+        assert_eq!(invoked.unwrap().0, "test-specialist");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_resolved_specialist_body_is_what_the_provider_actually_receives() {
+        let root = temp_catalogue("recorder-specialist", "SPECIALIST SYSTEM PROMPT MARKER");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let recorder = seen.clone();
+
+        struct Recorder {
+            seen: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        }
+        impl ModelProvider for Recorder {
+            fn id(&self) -> &str {
+                "recorder2"
+            }
+            fn display_name(&self) -> &str {
+                "Recorder2"
+            }
+            fn env_var(&self) -> &str {
+                "SE_TEST_RECORDER2_KEY"
+            }
+            fn detect(&self) -> Status {
+                Status {
+                    configured: true,
+                    detail: "recorder2".into(),
+                    source: se_provider::Source::Environment,
+                }
+            }
+            fn stream(
+                &self,
+                request: &ChatRequest,
+                _cancelled: &dyn Fn() -> bool,
+                on_event: &mut dyn FnMut(StreamEvent) -> bool,
+            ) -> Result<(), ProviderError> {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(request.messages.iter().map(|m| m.content.clone()).collect());
+                on_event(StreamEvent::TextDelta("ok".into()));
+                on_event(StreamEvent::Done);
+                Ok(())
+            }
+            fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+                Ok(Vec::new())
+            }
+        }
+
+        let mut registry = Registry::empty();
+        registry.register(Box::new(Recorder { seen: recorder }));
+        let runner = ProviderRunner {
+            registry,
+            provider_id: "recorder2".into(),
+            model: "m".into(),
+            turn_deadline: DEFAULT_TURN_DEADLINE,
+            ruleset: Ruleset::default(),
+            ledger: NonceLedger::new(),
+            catalogue_root: Some(root.clone()),
+        };
+
+        let (outcome, _p) = run_specialist(runner, "recorder-specialist", "do the thing");
+        assert_eq!(
+            outcome,
+            Outcome::Completed {
+                final_text: "ok".into()
+            }
+        );
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0][0].trim(), "SPECIALIST SYSTEM PROMPT MARKER",
+            "the provider's first message must be the agent's own body, not the generic system prompt"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unknown_specialist_id_fails_without_ever_calling_the_provider() {
+        let root = temp_catalogue("real-one", "irrelevant body");
+        let (mut runner, requests) = runner_with(
+            vec![StreamEvent::TextDelta("hi".into()), StreamEvent::Done],
+            Duration::ZERO,
+            None,
+        );
+        runner = runner.with_catalogue_root(root.clone());
+
+        let (outcome, _p) = run_specialist(runner, "no-such-specialist", "hello");
+        match outcome {
+            Outcome::Failed { detail } => {
+                assert!(detail.contains("no-such-specialist"), "{detail}")
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the provider must never be called for an unresolvable specialist"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_missing_catalogue_root_fails_a_specialist_turn_without_guessing_a_path() {
+        let (runner, requests) = runner_with(
+            vec![StreamEvent::TextDelta("hi".into()), StreamEvent::Done],
+            Duration::ZERO,
+            None,
+        );
+        // No `.with_catalogue_root(...)` call at all.
+        let (outcome, _p) = run_specialist(runner, "anything", "hello");
+        match outcome {
+            Outcome::Failed { detail } => assert!(detail.contains("catalogue"), "{detail}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Proves "pinned for the run, never re-read mid-run": across two
+    /// tool-call round trips inside one specialist-invoked turn (forced
+    /// by a ruleset denial, which the existing loop already makes the
+    /// model see and respond to), the exact same system-prompt text
+    /// reaches the provider both times -- read from the catalogue
+    /// exactly once, before the loop started, not re-read per round.
+    #[test]
+    fn the_specialist_system_prompt_is_identical_across_every_round_trip_of_one_turn() {
+        let root = temp_catalogue("pinned-specialist", "PINNED SYSTEM PROMPT");
+        let args = serde_json::json!({"path": "irrelevant.txt", "content": "x"}).to_string();
+        let (mut runner, requests_seen) = tool_calling_runner(
+            "write",
+            args,
+            Ruleset::from_rules(vec![se_permission::Rule::deny_tool("write")]),
+        );
+        runner = runner.with_catalogue_root(root.clone());
+
+        let core = crate::start(runner);
+        core.submit_specialist("pinned-specialist", "please write", vec![])
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if std::time::Instant::now() >= deadline {
+                panic!("the turn never finished");
+            }
+            let events = core.drain_blocking(Duration::from_millis(20));
+            if events.iter().any(|e| e.is_terminal()) {
+                core.shutdown();
+                break;
+            }
+        }
+
+        let seen = requests_seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "a denial forces a second round trip");
+        let first_system = seen[0].messages[0].content.clone();
+        let second_system = seen[1].messages[0].content.clone();
+        assert_eq!(first_system.trim(), "PINNED SYSTEM PROMPT");
+        assert_eq!(
+            first_system, second_system,
+            "the system prompt must be identical across round trips, not re-resolved"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

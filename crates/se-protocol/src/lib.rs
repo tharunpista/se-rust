@@ -47,6 +47,15 @@ pub struct UserTurn {
     /// can carry an override that nothing else can.
     #[serde(default)]
     pub model: Option<ModelRef>,
+    /// The catalogue id of the specialist this turn is routed through,
+    /// if any. Deliberately just the bare id, not the resolved
+    /// definition: setting this costs nothing on the interface thread
+    /// that builds a `UserTurn`. Resolving it (body, content hash)
+    /// happens later, inside `Runner::run` on the worker thread, which
+    /// is where this workspace's provider calls already do blocking
+    /// I/O -- not here, where it would block the render/input loop.
+    #[serde(default)]
+    pub specialist_id: Option<String>,
 }
 
 /// A specific provider and model, named rather than inferred. The same
@@ -206,6 +215,17 @@ pub enum Payload {
         provider: String,
         model: String,
     },
+    /// Emitted once, right after `TurnStarted`, only when the turn is
+    /// routed through a specialist. `content_hash` is the catalogue
+    /// definition's hash at the moment it was resolved for this turn --
+    /// the invocation-provenance record Phase 3 item 4 asks for. No
+    /// separate storage: this flows through the same session log every
+    /// other `CoreEvent` already does, so it is durable and inspectable
+    /// for free.
+    SpecialistInvoked {
+        agent_id: String,
+        content_hash: u64,
+    },
     /// Streamed output. High-frequency: an interface may coalesce these
     /// for rendering (I4 permits it) but must not reorder them.
     Delta {
@@ -360,6 +380,7 @@ mod tests {
             text: "hi".into(),
             attachments: vec![],
             model: None,
+            specialist_id: None,
         });
         let json = serde_json::to_string(&op).unwrap();
         assert_eq!(op, serde_json::from_str::<CoreOp>(&json).unwrap());
@@ -376,6 +397,7 @@ mod tests {
                 provider: "anthropic".into(),
                 model: "sonnet".into(),
             }),
+            specialist_id: None,
         });
         let json = serde_json::to_string(&op).unwrap();
         assert_eq!(op, serde_json::from_str::<CoreOp>(&json).unwrap());

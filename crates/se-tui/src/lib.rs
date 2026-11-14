@@ -58,9 +58,19 @@ pub fn run<B: Backend>(
     terminal: &mut Terminal<B>,
     core: &CoreHandle,
     banner: Option<String>,
+    specialists: Vec<se_command::CommandSpec>,
 ) -> io::Result<()> {
     let mut state = AppState::new();
     discover_and_register_commands(&mut state);
+    // Pre-built by the caller from the real catalogue -- this crate
+    // never calls the catalogue loader itself (construction stays in
+    // `se-core`/the binary, per the architecture doc's rule that the
+    // TUI never reaches in on its own). Plain `CommandSpec`s go through
+    // exactly the same collision/precedence handling as any other
+    // registered command.
+    for spec in specialists {
+        let _ = state.commands.register(spec);
+    }
     state.banner = banner;
     let mut dirty = true;
 
@@ -282,6 +292,14 @@ pub fn run_command(state: &mut AppState, core: &CoreHandle, path: &str, raw_args
         run_prompt_template(state, core, &id, path, raw_args);
         return;
     }
+    if spec.handler == se_command::HandlerKind::SpecialistInvoke {
+        // `spec.path` is the bare catalogue agent id; `spec.id` is
+        // namespaced (`specialist:<id>`) specifically so a specialist
+        // can never collide with a short builtin id under the
+        // registry's same-id-is-a-reload rule.
+        run_specialist_invoke(state, core, &spec.path.clone(), path, raw_args);
+        return;
+    }
     match se_command::builtins::availability(&id) {
         Some(se_command::builtins::Availability::Ready) => match id.as_str() {
             "exit" => state.should_quit = true,
@@ -349,6 +367,33 @@ fn run_prompt_template(
     };
     let rendered = se_command::markdown::render(&def, raw_args);
     if let Err(e) = core.submit(&rendered, Vec::new()) {
+        state.push(Entry::Notice(e.to_string()));
+    }
+}
+
+/// Dispatches `raw_args` as a turn routed through the specialist named
+/// `specialist_id` (the catalogue's own bare agent id, not the
+/// namespaced `CommandSpec::id`).
+///
+/// A specialist invoked with no trailing text is refused here rather
+/// than submitted as an empty turn -- this is also what makes
+/// selecting one from the picker (which always calls this with an
+/// empty `raw_args`) a safe no-op rather than a silent, meaningless
+/// submission.
+fn run_specialist_invoke(
+    state: &mut AppState,
+    core: &CoreHandle,
+    specialist_id: &str,
+    path: &str,
+    raw_args: &str,
+) {
+    if raw_args.trim().is_empty() {
+        state.push(Entry::Notice(format!(
+            "/{path} needs a request after it, e.g. /{path} <what you want>"
+        )));
+        return;
+    }
+    if let Err(e) = core.submit_specialist(specialist_id, raw_args, Vec::new()) {
         state.push(Entry::Notice(e.to_string()));
     }
 }
@@ -846,6 +891,116 @@ mod tests {
         assert!(!state.should_quit);
         run_command(&mut state, &core, "exit", "");
         assert!(state.should_quit);
+        core.shutdown();
+    }
+
+    // --- Phase 3 item 3: specialist invocation wired to `/` ---
+
+    /// Records the `specialist_id` every submitted turn carried, so a
+    /// test can assert on it without this crate needing to depend on
+    /// `se-provider` outside of tests -- `Runner::run`'s signature
+    /// requires naming `se_provider::Message`, which is why this type
+    /// lives behind `[dev-dependencies]`, not the real dependency list.
+    struct RecordingRunner {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    }
+
+    impl se_core::Runner for RecordingRunner {
+        fn describe(&self) -> (String, String) {
+            ("test".to_string(), "recording".to_string())
+        }
+        fn run(
+            &self,
+            turn: &se_protocol::UserTurn,
+            _history: &[se_provider::Message],
+            _sink: &mut se_core::TurnSink,
+        ) -> se_protocol::Outcome {
+            self.seen.lock().unwrap().push(turn.specialist_id.clone());
+            se_protocol::Outcome::Completed {
+                final_text: "ok".into(),
+            }
+        }
+    }
+
+    fn specialist_spec(id: &str) -> se_command::CommandSpec {
+        se_command::CommandSpec {
+            id: format!("specialist:{id}"),
+            path: id.to_string(),
+            aliases: Vec::new(),
+            category: "Agents".to_string(),
+            description: "a test specialist".to_string(),
+            provenance: se_command::Provenance::Builtin,
+            handler: se_command::HandlerKind::SpecialistInvoke,
+            security_critical: false,
+        }
+    }
+
+    #[test]
+    fn a_specialist_command_is_registered_and_resolvable_by_its_bare_id() {
+        let mut state = AppState::new();
+        discover_and_register_commands(&mut state);
+        state
+            .commands
+            .register(specialist_spec("backend-lead"))
+            .unwrap();
+        let resolved = state.commands.resolve("backend-lead").unwrap();
+        assert_eq!(resolved.handler, se_command::HandlerKind::SpecialistInvoke);
+        assert_eq!(resolved.path, "backend-lead");
+    }
+
+    #[test]
+    fn submitting_a_specialist_command_with_text_dispatches_through_submit_specialist() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let core = se_core::start(RecordingRunner { seen: seen.clone() });
+        let mut state = AppState::new();
+        state
+            .commands
+            .register(specialist_spec("backend-lead"))
+            .unwrap();
+
+        run_command(&mut state, &core, "backend-lead", "fix the checkout bug");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !core
+            .drain_blocking(Duration::from_millis(10))
+            .iter()
+            .any(|e| e.is_terminal())
+        {
+            if std::time::Instant::now() > deadline {
+                panic!("the turn never finished");
+            }
+        }
+        core.shutdown();
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [Some("backend-lead".to_string())],
+            "the turn the runner actually saw must carry the specialist id"
+        );
+    }
+
+    #[test]
+    fn selecting_a_specialist_with_no_trailing_text_does_not_submit_anything() {
+        // This is exactly what the picker's accept path calls today:
+        // `run_command(path, "")`. A specialist must refuse rather than
+        // submit a meaningless empty turn.
+        let core = se_core::start(EchoRunner::instant());
+        let mut state = AppState::new();
+        state
+            .commands
+            .register(specialist_spec("backend-lead"))
+            .unwrap();
+
+        run_command(&mut state, &core, "backend-lead", "");
+
+        assert!(
+            !core.is_busy(),
+            "an empty-args specialist invocation must never reach submit_specialist"
+        );
+        assert!(state
+            .transcript
+            .iter()
+            .any(|e| matches!(e, Entry::Notice(n) if n.contains("needs a request"))));
         core.shutdown();
     }
 }

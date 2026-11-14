@@ -10,6 +10,7 @@ description = "SE's execution core: session, task and turn lifecycle, run off th
 se-protocol = { path = "../se-protocol" }
 se-provider = { path = "../se-provider" }
 se-permission = { path = "../se-permission" }
+se-catalogue = { path = "../se-catalogue" }
 serde_json = { workspace = true }
 
 # Minimal, targeted addition for the tools module's OS-level file

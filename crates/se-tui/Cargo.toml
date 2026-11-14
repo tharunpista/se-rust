@@ -12,3 +12,11 @@ se-core = { path = "../se-core" }
 se-command = { path = "../se-command" }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+
+[dev-dependencies]
+# Test-only: a local `Runner` double needs to name `se_provider::Message`
+# in its `Runner::run` signature (the trait requires it). This never
+# ships in the real binary -- dev-dependencies compile for `cargo test`
+# only -- so it does not reopen the reachable-blocking-call concern that
+# keeps `se-provider` out of this crate's normal dependency list.
+se-provider = { path = "../se-provider" }
