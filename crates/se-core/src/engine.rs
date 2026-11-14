@@ -464,14 +464,8 @@ fn spawn_worker<R: Runner>(
             // the next one.
             if let Outcome::Completed { final_text } = &outcome {
                 let mut conversation = history.lock().unwrap_or_else(|e| e.into_inner());
-                conversation.push(Message {
-                    role: Role::User,
-                    content: turn.text.clone(),
-                });
-                conversation.push(Message {
-                    role: Role::Assistant,
-                    content: final_text.clone(),
-                });
+                conversation.push(Message::text(Role::User, turn.text.clone()));
+                conversation.push(Message::text(Role::Assistant, final_text.clone()));
             }
 
             let _ = sink.finish_turn();

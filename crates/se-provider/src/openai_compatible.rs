@@ -365,7 +365,94 @@ pub fn parse_model_list(body: &serde_json::Value) -> Vec<ModelInfo> {
 ///
 /// An empty `Vec` means the frame carried nothing a caller needs
 /// (keep-alives, role-only openers, unparseable lines).
+///
+/// Tool-call arguments arrive as JSON fragments spread across many
+/// frames, keyed by `index` — this single-frame function has nowhere
+/// to keep that state, so it never emits a partial `ToolCallRequested`.
+/// Use [`parse_stream_frame_with_tools`] with a [`ToolCallAccumulator`]
+/// that outlives the whole response to see them.
 pub fn parse_stream_frame(payload: &str) -> Vec<StreamEvent> {
+    let mut acc = ToolCallAccumulator::new();
+    parse_stream_frame_with_tools(payload, &mut acc)
+}
+
+/// Per-call-index accumulator for streamed `tool_calls` deltas.
+///
+/// OpenAI's wire format sends `id` and `function.name` only on the
+/// first delta for a given index, then only `function.arguments`
+/// fragments on every later one for that index — this is where those
+/// fragments are joined back into complete JSON, keyed by index, never
+/// exposed to a caller until [`Self::flush`] is called.
+#[derive(Debug, Default)]
+pub struct ToolCallAccumulator {
+    // `(index, id, name, arguments)`, in first-seen order.
+    partial: Vec<(u64, String, String, String)>,
+}
+
+impl ToolCallAccumulator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn apply(&mut self, tool_calls: &[serde_json::Value]) {
+        for tc in tool_calls {
+            let index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+            let id = tc.get("id").and_then(|v| v.as_str());
+            let function = tc.get("function");
+            let name = function
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str());
+            let args_fragment = function
+                .and_then(|f| f.get("arguments"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            match self.partial.iter_mut().find(|(i, ..)| *i == index) {
+                Some((_, slot_id, slot_name, slot_args)) => {
+                    if let Some(id) = id {
+                        *slot_id = id.to_string();
+                    }
+                    if let Some(name) = name {
+                        *slot_name = name.to_string();
+                    }
+                    slot_args.push_str(args_fragment);
+                }
+                None => self.partial.push((
+                    index,
+                    id.unwrap_or_default().to_string(),
+                    name.unwrap_or_default().to_string(),
+                    args_fragment.to_string(),
+                )),
+            }
+        }
+    }
+
+    /// Emits one [`StreamEvent::ToolCallRequested`] per call accumulated
+    /// so far, in the order their index first appeared, and clears the
+    /// accumulator. Called once the stream's terminal signal for the
+    /// batch of calls (`finish_reason == "tool_calls"`) is seen — the
+    /// same "this frame is the last one for this thing" signal this
+    /// provider already uses for the plain-text case, not a separate
+    /// invention.
+    fn flush(&mut self) -> Vec<StreamEvent> {
+        self.partial
+            .drain(..)
+            .map(|(_, id, name, arguments)| StreamEvent::ToolCallRequested {
+                id,
+                name,
+                arguments,
+            })
+            .collect()
+    }
+}
+
+/// Same as [`parse_stream_frame`], but tool-call argument fragments are
+/// accumulated into `acc` across every call sharing it, and a complete
+/// [`StreamEvent::ToolCallRequested`] is only emitted once that call's
+/// `finish_reason == "tool_calls"` frame arrives.
+pub fn parse_stream_frame_with_tools(
+    payload: &str,
+    acc: &mut ToolCallAccumulator,
+) -> Vec<StreamEvent> {
     let payload = payload.trim();
     if payload.is_empty() {
         return Vec::new();
@@ -435,6 +522,9 @@ pub fn parse_stream_frame(payload: &str) -> Vec<StreamEvent> {
             {
                 events.push(StreamEvent::TextDelta(text.to_string()));
             }
+            if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                acc.apply(tool_calls);
+            }
         }
         // Why the provider stopped. `length` means truncated, which the
         // caller must not report as a finished answer.
@@ -443,6 +533,9 @@ pub fn parse_stream_frame(payload: &str) -> Vec<StreamEvent> {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
         {
+            if reason == "tool_calls" {
+                events.extend(acc.flush());
+            }
             events.push(StreamEvent::FinishReason(reason.to_string()));
         }
     }
@@ -533,18 +626,43 @@ impl ModelProvider for OpenAiCompatible {
             .messages
             .iter()
             .map(|m| {
-                serde_json::json!({
-                    "role": match m.role {
-                        Role::System => "system",
-                        Role::User => "user",
-                        Role::Assistant => "assistant",
-                    },
-                    "content": m.content,
-                })
+                let role = match m.role {
+                    Role::System => "system",
+                    Role::User => "user",
+                    Role::Assistant => "assistant",
+                    Role::Tool => "tool",
+                };
+                // An assistant message that made tool calls carries no
+                // `content` on the wire, only `tool_calls`; a tool
+                // result carries `tool_call_id` and its content as the
+                // call's answer. Both shapes are mutually exclusive
+                // with the plain `{role, content}` turn.
+                if !m.tool_calls.is_empty() {
+                    let calls: Vec<serde_json::Value> = m
+                        .tool_calls
+                        .iter()
+                        .map(|c| {
+                            serde_json::json!({
+                                "id": c.id,
+                                "type": "function",
+                                "function": {"name": c.name, "arguments": c.arguments},
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({"role": role, "content": null, "tool_calls": calls})
+                } else if let Some(call_id) = &m.tool_call_id {
+                    serde_json::json!({
+                        "role": role,
+                        "tool_call_id": call_id,
+                        "content": m.content,
+                    })
+                } else {
+                    serde_json::json!({"role": role, "content": m.content})
+                }
             })
             .collect();
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": request.model,
             "messages": messages,
             "max_tokens": request.max_tokens,
@@ -554,6 +672,26 @@ impl ModelProvider for OpenAiCompatible {
             // estimating.
             "stream_options": {"include_usage": true},
         });
+        // Omitted rather than sent as `[]`, so a no-tools request's
+        // body is unchanged from before tool support existed and every
+        // existing body-shape test stays valid.
+        if !request.tools.is_empty() {
+            let tools: Vec<serde_json::Value> = request
+                .tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        },
+                    })
+                })
+                .collect();
+            body["tools"] = serde_json::Value::Array(tools);
+        }
 
         if cancelled() {
             return Err(ProviderError::Cancelled);
@@ -588,6 +726,10 @@ impl ModelProvider for OpenAiCompatible {
         // the two alike meant a connection dropped mid-answer was
         // reported as a complete reply.
         let mut saw_terminal_signal = false;
+        // Outlives every frame in this one response, so argument
+        // fragments for the same tool-call index join up correctly no
+        // matter how many lines they are split across.
+        let mut tool_call_accumulator = ToolCallAccumulator::new();
         loop {
             if cancelled() {
                 // Dropping the reader closes the connection, so the
@@ -625,7 +767,7 @@ impl ModelProvider for OpenAiCompatible {
                 // Comments, event names and blank separators.
                 continue;
             };
-            for event in parse_stream_frame(payload) {
+            for event in parse_stream_frame_with_tools(payload, &mut tool_call_accumulator) {
                 match event {
                     StreamEvent::Done => {
                         on_event(StreamEvent::Done);
@@ -903,6 +1045,7 @@ fn first_line(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ToolCallRecord, ToolDefinition};
     #[test]
     fn a_credential_echoed_back_by_a_provider_is_redacted_before_it_is_displayed() {
         let body =
@@ -1035,11 +1178,9 @@ mod tests {
     fn request() -> ChatRequest {
         ChatRequest {
             model: "mock-model".into(),
-            messages: vec![Message {
-                role: Role::User,
-                content: "hi".into(),
-            }],
+            messages: vec![Message::text(Role::User, "hi")],
             max_tokens: 64,
+            tools: Vec::new(),
         }
     }
 
@@ -1064,6 +1205,174 @@ mod tests {
             .collect();
         assert_eq!(text, vec!["Hel", "lo", " there"]);
         assert_eq!(events.last(), Some(&StreamEvent::Done));
+    }
+
+    /// `parse_stream_frame_with_tools` directly: arguments split across
+    /// three frames for the same index must join into one complete
+    /// JSON string, and the event is emitted only on the
+    /// `finish_reason == "tool_calls"` frame, not before.
+    #[test]
+    fn tool_call_arguments_are_accumulated_across_frames_and_emitted_once() {
+        let mut acc = ToolCallAccumulator::new();
+
+        let first = parse_stream_frame_with_tools(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"pa"}}]}}]}"#,
+            &mut acc,
+        );
+        assert!(
+            first.is_empty(),
+            "no event before the call's arguments are complete: {first:?}"
+        );
+
+        let second = parse_stream_frame_with_tools(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\": \"a.t"}}]}}]}"#,
+            &mut acc,
+        );
+        assert!(second.is_empty(), "{second:?}");
+
+        let third = parse_stream_frame_with_tools(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"xt\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            &mut acc,
+        );
+        assert_eq!(
+            third,
+            vec![
+                StreamEvent::ToolCallRequested {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path": "a.txt"}"#.into(),
+                },
+                StreamEvent::FinishReason("tool_calls".into()),
+            ]
+        );
+    }
+
+    /// Two calls interleaved by index in the same response: each must
+    /// keep its own id, name and arguments separate.
+    #[test]
+    fn two_interleaved_tool_calls_do_not_mix_arguments() {
+        let mut acc = ToolCallAccumulator::new();
+        let _ = parse_stream_frame_with_tools(
+            r#"{"choices":[{"delta":{"tool_calls":[
+                {"index":0,"id":"call_a","type":"function","function":{"name":"read_file","arguments":"{\"p"}},
+                {"index":1,"id":"call_b","type":"function","function":{"name":"write_file","arguments":"{\"x"}}
+            ]}}]}"#,
+            &mut acc,
+        );
+        let _ = parse_stream_frame_with_tools(
+            r#"{"choices":[{"delta":{"tool_calls":[
+                {"index":0,"function":{"arguments":"\":1}"}},
+                {"index":1,"function":{"arguments":"\":2}"}}
+            ]}}]}"#,
+            &mut acc,
+        );
+        let events = parse_stream_frame_with_tools(
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            &mut acc,
+        );
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ToolCallRequested {
+                    id: "call_a".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"p":1}"#.into(),
+                },
+                StreamEvent::ToolCallRequested {
+                    id: "call_b".into(),
+                    name: "write_file".into(),
+                    arguments: r#"{"x":2}"#.into(),
+                },
+                StreamEvent::FinishReason("tool_calls".into()),
+            ]
+        );
+    }
+
+    /// End-to-end through `stream()`: the real HTTP/SSE path, not just
+    /// the frame parser, produces one complete `ToolCallRequested`.
+    #[test]
+    fn stream_emits_a_complete_tool_call_through_the_real_sse_loop() {
+        const BODY: &str = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_9\",\"type\":\"function\",\"function\":{\"name\":\"run_shell\",\"arguments\":\"{\\\"program\\\":\\\"ec\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ho\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base, _req) = serve("HTTP/1.1 200 OK", "text/event-stream", BODY);
+        let p = provider(&base);
+        let events = collect(&p, &request());
+
+        let tool_calls: Vec<&StreamEvent> = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::ToolCallRequested { .. }))
+            .collect();
+        assert_eq!(
+            tool_calls,
+            vec![&StreamEvent::ToolCallRequested {
+                id: "call_9".into(),
+                name: "run_shell".into(),
+                arguments: r#"{"program":"echo"}"#.into(),
+            }]
+        );
+    }
+
+    /// Request-side serialization: a non-empty `tools` list reaches the
+    /// wire as the OpenAI function-calling shape, and an empty one is
+    /// omitted entirely so every pre-existing body-shape test (which
+    /// never set `tools`) keeps asserting against the same body.
+    #[test]
+    fn tools_are_serialized_as_function_definitions_and_omitted_when_empty() {
+        const BODY: &str = "data: [DONE]\n\n";
+        let (base, requests) = serve("HTTP/1.1 200 OK", "text/event-stream", BODY);
+        let p = provider(&base);
+
+        let mut with_tools = request();
+        with_tools.tools = vec![ToolDefinition {
+            name: "read_file".into(),
+            description: "Reads a file".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        }];
+        collect(&p, &with_tools);
+        let seen = requests.lock().unwrap().join("\n");
+        assert!(seen.contains("\"tools\""), "{seen}");
+        assert!(seen.contains("\"name\":\"read_file\""), "{seen}");
+        assert!(seen.contains("\"type\":\"function\""), "{seen}");
+
+        requests.lock().unwrap().clear();
+        collect(&p, &request());
+        let seen_without = requests.lock().unwrap().join("\n");
+        assert!(
+            !seen_without.contains("\"tools\""),
+            "an empty tools list must not appear on the wire: {seen_without}"
+        );
+    }
+
+    /// Round trip serialization: an assistant tool-calls message and a
+    /// following tool-result message reach the wire in the shape the
+    /// next request must carry, so a provider can match the result to
+    /// the call it answers.
+    #[test]
+    fn assistant_tool_calls_and_tool_results_serialize_to_the_documented_shape() {
+        const BODY: &str = "data: [DONE]\n\n";
+        let (base, requests) = serve("HTTP/1.1 200 OK", "text/event-stream", BODY);
+        let p = provider(&base);
+        let mut req = request();
+        req.messages
+            .push(Message::assistant_tool_calls(vec![ToolCallRecord {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"a.txt"}"#.into(),
+            }]));
+        req.messages
+            .push(Message::tool_result("call_1", "file contents"));
+        collect(&p, &req);
+
+        let seen = requests.lock().unwrap().join("\n");
+        assert!(seen.contains("\"tool_calls\""), "{seen}");
+        assert!(seen.contains("\"id\":\"call_1\""), "{seen}");
+        assert!(seen.contains("\"tool_call_id\":\"call_1\""), "{seen}");
+        assert!(seen.contains("\"role\":\"tool\""), "{seen}");
+        assert!(seen.contains("file contents"), "{seen}");
     }
 
     #[test]
@@ -1831,11 +2140,9 @@ mod streaming_timing {
         let p = OpenAiCompatible::with_fixed(TEST_SERVICE, "k", &base);
         let request = ChatRequest {
             model: "m".into(),
-            messages: vec![Message {
-                role: Role::User,
-                content: "go".into(),
-            }],
+            messages: vec![Message::text(Role::User, "go")],
             max_tokens: 32,
+            tools: Vec::new(),
         };
 
         let started = Instant::now();

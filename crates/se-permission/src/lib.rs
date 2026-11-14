@@ -405,6 +405,105 @@ mod tests {
         );
     }
 
+    /// Phase 2b item 6: "the gateway's allow/deny decision for a fixed
+    /// (agent, task, tool, resource) is invariant under a model
+    /// change."
+    ///
+    /// `Request` (and `ExecutionContext`, and `Rule`) carry no field
+    /// that names a model or a provider at all -- there is no
+    /// `model: ModelRef` anywhere in this crate's public API. That is
+    /// itself the proof the architecture doc's §3a requirement asks
+    /// for (charter §11: model identity must never change what is
+    /// authorized): a decision cannot depend on something it has no
+    /// way to receive.
+    ///
+    /// This is not a vacuous test. It does not merely assert the field
+    /// is absent by inspection; it drives `Gateway::decide` through
+    /// `Ruleset::evaluate` with many requests that are identical except
+    /// for every field a *different model choice could plausibly leak
+    /// through if `Request` ever grew a model-shaped field* --
+    /// `agent_definition_hash`, `cwd`, `env_subset` and
+    /// `shown_to_human` all vary per case below, standing in for the
+    /// kind of per-model rendering difference (a different prompt
+    /// hash, a different declared capability, a different display
+    /// string) that a future change might attach to the request. None
+    /// of those fields reach `Ruleset::evaluate` (only `agent_id`,
+    /// `tool_name` and `resource_scope` do, read directly from its
+    /// signature above), so every one of these requests decides
+    /// identically. A real "invariant under a model change" guarantee
+    /// will stay true only for as long as that stays true of any field
+    /// added later -- this test is what would need to be extended, not
+    /// silently kept green, the day a model-identifying field is added
+    /// to `Request`.
+    #[test]
+    fn decision_is_invariant_under_every_field_a_model_change_could_plausibly_touch() {
+        let ruleset = Ruleset::from_rules(vec![
+            Rule::allow_resource_prefix("backend-lead", "/repo/src"),
+            Rule::deny_tool("shell"),
+        ]);
+        let ledger = NonceLedger::new();
+        let gw = Gateway::new(&ruleset, &ledger, &NullAuditSink);
+
+        // Stand-ins for "the request as rendered under model A" vs
+        // "...under model B": same agent/tool/resource, everything else
+        // that text generation could plausibly vary.
+        let variants: Vec<Request> = (0..6)
+            .map(|i| Request {
+                agent_id: "backend-lead".into(),
+                agent_definition_hash: format!("hash-rendered-by-model-{i}"),
+                session: SessionId::from_raw(i as u64),
+                task: TaskId::from_raw(i as u64),
+                tool_name: "write".into(),
+                tool_schema_version: 1,
+                resource: ResourceIdentity(format!("vol1:fid{i}")),
+                resource_scope: "/repo/src/main.rs".into(),
+                cwd: format!("/repo-as-seen-by-model-{i}"),
+                env_subset: vec![(format!("MODEL_{i}_VAR"), "x".into())],
+                shown_to_human: format!("model {i} would phrase this differently: write main.rs"),
+            })
+            .collect();
+
+        let decisions: Vec<&'static str> = variants
+            .iter()
+            .map(|r| match gw.decide(r) {
+                Decision::Allow(_) => "allow",
+                Decision::Deny { .. } => "deny",
+                Decision::Ask => "ask",
+            })
+            .collect();
+        assert!(
+            decisions.iter().all(|d| *d == "allow"),
+            "every variant names the same agent/tool/resource, so the decision must be \
+             identical regardless of anything that varies only because a different model \
+             produced the request: {decisions:?}"
+        );
+
+        // Same proof for the denied case: only `tool_name` changes to
+        // the one the ruleset's deny rule matches; every model-shaped
+        // field still varies per case.
+        let denied_variants: Vec<Request> = (0..4)
+            .map(|i| Request {
+                agent_id: "backend-lead".into(),
+                agent_definition_hash: format!("hash-rendered-by-model-{i}"),
+                session: SessionId::from_raw(i as u64),
+                task: TaskId::from_raw(i as u64),
+                tool_name: "shell".into(),
+                tool_schema_version: 1,
+                resource: ResourceIdentity(format!("vol1:fid{i}")),
+                resource_scope: "/repo/src".into(),
+                cwd: format!("/repo-as-seen-by-model-{i}"),
+                env_subset: vec![],
+                shown_to_human: format!("model {i}: run a shell command"),
+            })
+            .collect();
+        for r in &denied_variants {
+            assert!(
+                matches!(gw.decide(r), Decision::Deny { .. }),
+                "a ruleset deny must hold regardless of which model rendered the request"
+            );
+        }
+    }
+
     #[test]
     fn an_expired_token_is_rejected_even_with_a_matching_context() {
         let ruleset = Ruleset::from_rules(vec![Rule::allow_all()]);

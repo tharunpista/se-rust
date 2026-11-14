@@ -25,6 +25,20 @@ impl From<std::io::Error> for EditError {
     }
 }
 
+impl std::fmt::Display for EditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EditError::NotUniqueMatch { occurrences } => write!(
+                f,
+                "old_string matched {occurrences} time(s); it must match exactly once"
+            ),
+            EditError::Tool(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for EditError {}
+
 /// Replaces exactly one occurrence of `old_string` with `new_string` in
 /// the file at `path`. Refuses if `old_string` is absent or ambiguous,
 /// and refuses (via [`require_fresh_identity`]) if the file was swapped

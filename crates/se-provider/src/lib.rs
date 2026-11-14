@@ -20,10 +20,64 @@ pub use openai_compatible::{OpenAiCompatible, Service, CATALOGUE};
 use serde::{Deserialize, Serialize};
 
 /// A message in a conversation.
+///
+/// `tool_calls` is non-empty only on an assistant message that made
+/// tool calls (the message carries no `content` in that case, matching
+/// the OpenAI-compatible wire shape); `tool_call_id` is set only on a
+/// `Role::Tool` message, naming which call it answers. Plain
+/// text turns use neither — [`Message::text`] is the constructor for
+/// that common case so the four other construction sites in this
+/// workspace do not each have to spell out the empty fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: String,
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCallRecord>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+}
+
+impl Message {
+    /// An ordinary text turn: no tool calls either way.
+    pub fn text(role: Role, content: impl Into<String>) -> Self {
+        Message {
+            role,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    /// The assistant turn that requested one or more tool calls.
+    pub fn assistant_tool_calls(calls: Vec<ToolCallRecord>) -> Self {
+        Message {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: calls,
+            tool_call_id: None,
+        }
+    }
+
+    /// The result of one tool call, fed back as the next turn's input.
+    pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Message {
+            role: Role::Tool,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(call_id.into()),
+        }
+    }
+}
+
+/// One tool call an assistant message made, as carried back to the
+/// provider on the next round trip (the wire shape's
+/// `assistant.tool_calls[]`, fully accumulated — never partial JSON).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallRecord {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +85,16 @@ pub enum Role {
     System,
     User,
     Assistant,
+    /// A tool's result, answering one call by id (`tool_call_id`).
+    Tool,
+}
+
+/// A function the model may call, advertised as a JSON Schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
 }
 
 /// What to ask the model.
@@ -39,6 +103,9 @@ pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<Message>,
     pub max_tokens: u32,
+    /// Empty means "no tools offered" — the wire format omits the
+    /// `tools` field entirely in that case rather than sending `[]`.
+    pub tools: Vec<ToolDefinition>,
 }
 
 /// One piece of a streamed response.
@@ -68,6 +135,15 @@ pub enum StreamEvent {
     FinishReason(String),
     /// The provider signalled the end of the response (`[DONE]`).
     Done,
+    /// One tool call's arguments are fully accumulated. The provider
+    /// layer does the per-index accumulation internally (OpenAI's wire
+    /// format streams `tool_calls[].function.arguments` as fragments
+    /// keyed by index); callers of `stream()` never see partial JSON.
+    ToolCallRequested {
+        id: String,
+        name: String,
+        arguments: String,
+    },
 }
 
 /// What a provider reports about one of its models.
