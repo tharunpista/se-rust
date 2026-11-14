@@ -229,10 +229,19 @@ impl<'a> Gateway<'a> {
     /// silently granting something a human already said no to in a
     /// still-open approval dialog.
     pub fn decide(&self, req: &Request) -> Decision {
-        match self
-            .ruleset
-            .evaluate(&req.agent_id, &req.tool_name, &req.resource_scope)
-        {
+        self.decide_scoped(req, None)
+    }
+
+    /// Like [`decide`](Self::decide), but narrowed by a specialist's
+    /// own `tools:` allowlist via [`Ruleset::evaluate_scoped`]. `None`
+    /// behaves exactly like `decide`.
+    pub fn decide_scoped(&self, req: &Request, allowed_tools: Option<&[String]>) -> Decision {
+        match self.ruleset.evaluate_scoped(
+            &req.agent_id,
+            &req.tool_name,
+            &req.resource_scope,
+            allowed_tools,
+        ) {
             Effect::Allow => {
                 self.audit(req, Effect::Allow);
                 Decision::Allow(Box::new(self.mint(req)))

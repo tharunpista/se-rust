@@ -225,8 +225,12 @@ impl Runner for ProviderRunner {
         // None`. The resolution that can fail happens here, though,
         // before `start_turn` opens anything -- a failed lookup must
         // never leave a `TurnStarted` with nothing to close it.
-        let (system_prompt, invoked): (String, Option<(String, u64)>) = match &turn.specialist_id {
-            None => (SYSTEM_PROMPT.to_string(), None),
+        let (system_prompt, invoked, allowed_tools): (
+            String,
+            Option<(String, u64)>,
+            Option<Vec<String>>,
+        ) = match &turn.specialist_id {
+            None => (SYSTEM_PROMPT.to_string(), None, None),
             Some(id) => {
                 let Some(root) = &self.catalogue_root else {
                     return Outcome::Failed {
@@ -249,7 +253,21 @@ impl Runner for ProviderRunner {
                         ),
                     };
                 };
-                (agent.body, Some((agent.frontmatter.id, agent.content_hash)))
+                // An empty `tools:` list is "not specified", not "no
+                // tools allowed" -- the 194 real definitions vary in
+                // whether they set it, and an unset allowlist must not
+                // silently deny every call a specialist with no
+                // opinion on tools makes.
+                let allowed = if agent.frontmatter.tools.is_empty() {
+                    None
+                } else {
+                    Some(agent.frontmatter.tools.clone())
+                };
+                (
+                    agent.body,
+                    Some((agent.frontmatter.id, agent.content_hash)),
+                    allowed,
+                )
             }
         };
 
@@ -464,7 +482,8 @@ impl Runner for ProviderRunner {
                             interrupted = true;
                             break;
                         }
-                        let result_text = self.handle_tool_call(sink, call);
+                        let result_text =
+                            self.handle_tool_call(sink, call, allowed_tools.as_deref());
                         messages.push(Message::tool_result(call.id.clone(), result_text));
                     }
                     if interrupted {
@@ -579,7 +598,12 @@ impl ProviderRunner {
     ///   interface (`request_approval` returning `None`, which does not
     ///   distinguish the three) is always treated as a refusal -- a
     ///   withheld decision is never permission.
-    fn handle_tool_call(&self, sink: &mut TurnSink, call: &ToolCallRecord) -> String {
+    fn handle_tool_call(
+        &self,
+        sink: &mut TurnSink,
+        call: &ToolCallRecord,
+        allowed_tools: Option<&[String]>,
+    ) -> String {
         let parsed = match tool_loop::parse_tool_call(&call.name, &call.arguments) {
             Ok(p) => p,
             Err(reason) => {
@@ -608,45 +632,46 @@ impl ProviderRunner {
         };
         let gateway = Gateway::new(&self.ruleset, &self.ledger, &NullAuditSink);
 
-        let (id, approved): (se_protocol::ToolCallId, Box<Approved>) = match gateway.decide(&req) {
-            se_permission::Decision::Deny { reason } => {
-                let id = se_protocol::ToolCallId::next();
-                let _ = sink.tool_requested(id, &call.name, &parsed.display);
-                let _ = sink.tool_completed(
-                    id,
-                    &call.name,
-                    false,
-                    &format!("denied by policy: {reason}"),
-                );
-                return format!("denied by policy: {reason}");
-            }
-            se_permission::Decision::Allow(token) => {
-                let id = se_protocol::ToolCallId::next();
-                if sink
-                    .tool_requested(id, &call.name, &parsed.display)
-                    .is_err()
-                {
-                    return "the interface disconnected before this call could run".to_string();
+        let (id, approved): (se_protocol::ToolCallId, Box<Approved>) =
+            match gateway.decide_scoped(&req, allowed_tools) {
+                se_permission::Decision::Deny { reason } => {
+                    let id = se_protocol::ToolCallId::next();
+                    let _ = sink.tool_requested(id, &call.name, &parsed.display);
+                    let _ = sink.tool_completed(
+                        id,
+                        &call.name,
+                        false,
+                        &format!("denied by policy: {reason}"),
+                    );
+                    return format!("denied by policy: {reason}");
                 }
-                (id, token)
-            }
-            se_permission::Decision::Ask => {
-                let Some(id) = sink.request_approval(&call.name, &parsed.display) else {
-                    return "denied: not approved".to_string();
-                };
-                if sink
-                    .tool_requested(id, &call.name, &parsed.display)
-                    .is_err()
-                {
-                    return "the interface disconnected before this call could run".to_string();
+                se_permission::Decision::Allow(token) => {
+                    let id = se_protocol::ToolCallId::next();
+                    if sink
+                        .tool_requested(id, &call.name, &parsed.display)
+                        .is_err()
+                    {
+                        return "the interface disconnected before this call could run".to_string();
+                    }
+                    (id, token)
                 }
-                if sink.is_cancelled() {
-                    let _ = sink.tool_completed(id, &call.name, false, "cancelled");
-                    return "cancelled before this call ran".to_string();
+                se_permission::Decision::Ask => {
+                    let Some(id) = sink.request_approval(&call.name, &parsed.display) else {
+                        return "denied: not approved".to_string();
+                    };
+                    if sink
+                        .tool_requested(id, &call.name, &parsed.display)
+                        .is_err()
+                    {
+                        return "the interface disconnected before this call could run".to_string();
+                    }
+                    if sink.is_cancelled() {
+                        let _ = sink.tool_completed(id, &call.name, false, "cancelled");
+                        return "cancelled before this call ran".to_string();
+                    }
+                    (id, gateway.approve(&req))
                 }
-                (id, gateway.approve(&req))
-            }
-        };
+            };
 
         let ctx = ExecutionContext {
             agent_id: req.agent_id.clone(),
@@ -1612,6 +1637,35 @@ mod tests {
         root
     }
 
+    /// Like [`temp_catalogue`], but the agent's frontmatter declares a
+    /// `tools:` allowlist -- for proving Phase 4 item 4's "intersect
+    /// with a ceiling, never union".
+    fn temp_catalogue_with_tools(agent_id: &str, body: &str, tools: &[&str]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "se-core-specialist-tools-{agent_id}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dept = root.join("dept");
+        std::fs::create_dir_all(&dept).unwrap();
+        let tools_yaml = tools
+            .iter()
+            .map(|t| format!("  - {t}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            dept.join(format!("{agent_id}.md")),
+            format!(
+                "---\nschema_version: 1\nid: {agent_id}\nname: Test Specialist\ndepartment: dept\ntools:\n{tools_yaml}\n---\n\n{body}\n"
+            ),
+        )
+        .unwrap();
+        root
+    }
+
     fn run_specialist(runner: ProviderRunner, id: &str, text: &str) -> (Outcome, Vec<Payload>) {
         let core = crate::start(runner);
         core.submit_specialist(id, text, vec![]).unwrap();
@@ -1831,5 +1885,55 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Phase 4 item 4: a specialist's own `tools:` allowlist narrows
+    /// what its calls may do, even against a ruleset that would
+    /// otherwise allow everything -- the allowlist can only shrink the
+    /// grant, never widen it (intersect, never union).
+    #[test]
+    fn a_specialists_tool_allowlist_denies_a_call_outside_it_even_under_an_allow_all_ruleset() {
+        let root = temp_catalogue_with_tools("narrow-specialist", "YOU MAY ONLY READ.", &["read"]);
+        let dir =
+            std::env::temp_dir().join(format!("se-core-specialist-narrow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("out.txt");
+        let args =
+            serde_json::json!({"path": file.to_string_lossy(), "content": "should never land"})
+                .to_string();
+
+        let (mut runner, _requests_seen) = tool_calling_runner(
+            "write",
+            args,
+            Ruleset::from_rules(vec![se_permission::Rule::allow_all()]),
+        );
+        runner = runner.with_catalogue_root(root.clone());
+
+        let (outcome, payloads) = run_specialist(runner, "narrow-specialist", "please write");
+
+        assert!(
+            !file.exists(),
+            "the specialist's own allowlist must have denied the write before it ran"
+        );
+        assert_eq!(
+            outcome,
+            Outcome::Completed {
+                final_text: "acknowledged".into()
+            },
+            "the model sees the denial as a tool result, not a failed turn"
+        );
+        let saw_denial = payloads.iter().any(|p| match p {
+            Payload::ToolCompleted { ok, preview, .. } => {
+                !ok && preview.contains("denied by policy")
+            }
+            _ => false,
+        });
+        assert!(
+            saw_denial,
+            "the denial must be reported on the real tool-call lifecycle: {payloads:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

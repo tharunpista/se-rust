@@ -105,6 +105,28 @@ impl Ruleset {
             .map(|r| r.effect)
             .unwrap_or(Effect::Ask)
     }
+
+    /// Like [`evaluate`](Self::evaluate), but first intersects with a
+    /// specialist's own `tools:` allowlist (Phase 4 item 4: "intersect
+    /// with a ceiling, never union"). A tool absent from `allowed` is
+    /// `Deny` regardless of what this ruleset would otherwise say --
+    /// the allowlist can only narrow what the operator's ruleset
+    /// already permits, never grant more. `None` means no specialist
+    /// is narrowing this call, so the ruleset alone decides.
+    pub fn evaluate_scoped(
+        &self,
+        agent_id: &str,
+        tool_name: &str,
+        resource_scope: &str,
+        allowed_tools: Option<&[String]>,
+    ) -> Effect {
+        if let Some(allowed) = allowed_tools {
+            if !allowed.iter().any(|t| t == tool_name) {
+                return Effect::Deny;
+            }
+        }
+        self.evaluate(agent_id, tool_name, resource_scope)
+    }
 }
 
 #[cfg(test)]
@@ -122,6 +144,41 @@ mod tests {
         let rs = Ruleset::from_rules(vec![Rule::allow_all(), Rule::deny_tool("shell")]);
         assert_eq!(rs.evaluate("a", "write", "/x"), Effect::Allow);
         assert_eq!(rs.evaluate("a", "shell", "/x"), Effect::Deny);
+    }
+
+    #[test]
+    fn a_tool_outside_the_specialist_allowlist_is_denied_even_if_the_ruleset_allows_it() {
+        let rs = Ruleset::from_rules(vec![Rule::allow_all()]);
+        let allowed = vec!["read".to_string()];
+        assert_eq!(
+            rs.evaluate_scoped("backend-lead", "shell", "/x", Some(&allowed)),
+            Effect::Deny
+        );
+        assert_eq!(
+            rs.evaluate_scoped("backend-lead", "read", "/x", Some(&allowed)),
+            Effect::Allow
+        );
+    }
+
+    #[test]
+    fn an_allowlisted_tool_still_defers_to_the_base_ruleset() {
+        // The allowlist can only narrow, never widen: a tool the
+        // specialist may use but the ruleset denies stays denied.
+        let rs = Ruleset::from_rules(vec![Rule::deny_tool("shell")]);
+        let allowed = vec!["shell".to_string()];
+        assert_eq!(
+            rs.evaluate_scoped("backend-lead", "shell", "/x", Some(&allowed)),
+            Effect::Deny
+        );
+    }
+
+    #[test]
+    fn no_allowlist_means_the_ruleset_alone_decides() {
+        let rs = Ruleset::from_rules(vec![Rule::allow_all()]);
+        assert_eq!(
+            rs.evaluate_scoped("backend-lead", "shell", "/x", None),
+            Effect::Allow
+        );
     }
 
     #[test]
