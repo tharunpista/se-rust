@@ -94,22 +94,74 @@ fn load_one(path: &Path, report: &mut LoadReport) {
     }
 }
 
-/// Splits `---\n<yaml>\n---\n<body>` and parses the YAML half. A file
-/// with no leading `---` frontmatter block (e.g. `role-inventory.md`,
-/// which opens with an HTML comment, not frontmatter) is reported as
-/// "no frontmatter block", not silently treated as a bodyless agent.
-fn parse(raw: &str) -> Result<(AgentFrontmatter, String), String> {
+/// Finds the `---\n<yaml>\n---` envelope and returns just the YAML
+/// slice, borrowed from `raw`, plus the byte offset in `raw` at which
+/// the body begins. A file with no leading `---` frontmatter block
+/// (e.g. `role-inventory.md`, which opens with an HTML comment, not
+/// frontmatter) is reported as "no frontmatter block", not silently
+/// treated as a bodyless definition.
+///
+/// Deliberately does not allocate a `body` `String` -- a caller that
+/// only wants the frontmatter (the skill scan's lazy-body path) pays
+/// for parsing the YAML and nothing else. Shared by the agent and
+/// skill loaders, since both frontmatter shapes sit inside the same
+/// `---`-delimited envelope.
+pub(crate) fn frontmatter_yaml(raw: &str) -> Result<(&str, usize), String> {
     let rest = raw
         .strip_prefix("---\n")
         .or_else(|| raw.strip_prefix("---\r\n"))
         .ok_or_else(|| "no frontmatter block (file does not start with `---`)".to_string())?;
+    let header_len = raw.len() - rest.len();
     let end = rest
         .find("\n---")
         .ok_or_else(|| "frontmatter block is never closed with `---`".to_string())?;
     let yaml = &rest[..end];
-    // Skip the closing `---` and the newline after it, if present.
-    let after = &rest[end + 4..];
+    let body_start = header_len + end + 4;
+    Ok((yaml, body_start))
+}
+
+/// Byte-oriented twin of [`frontmatter_yaml`]: finds the same
+/// envelope in raw bytes and decodes only the YAML slice as UTF-8,
+/// never the body. A body with invalid UTF-8 (unusual, but not this
+/// loader's business to reject) therefore cannot stop the frontmatter
+/// from being read -- a scan that needs to hash whole files still
+/// reads every byte, but it is never forced to validate or allocate
+/// bytes it was never going to parse.
+pub(crate) fn frontmatter_yaml_bytes(raw: &[u8]) -> Result<(&str, usize), String> {
+    let prefix_len = if raw.starts_with(b"---\r\n") {
+        5
+    } else if raw.starts_with(b"---\n") {
+        4
+    } else {
+        return Err("no frontmatter block (file does not start with `---`)".to_string());
+    };
+    let rest = &raw[prefix_len..];
+    let end = rest
+        .windows(4)
+        .position(|w| w == b"\n---")
+        .ok_or_else(|| "frontmatter block is never closed with `---`".to_string())?;
+    let yaml_bytes = &rest[..end];
+    let yaml = std::str::from_utf8(yaml_bytes)
+        .map_err(|e| format!("frontmatter is not valid UTF-8: {e}"))?;
+    let body_start = prefix_len + end + 4;
+    Ok((yaml, body_start))
+}
+
+/// Splits `---\n<yaml>\n---\n<body>` into its raw YAML half and its
+/// body half, allocating the body. Use [`frontmatter_yaml`] instead
+/// when the body is not actually needed.
+pub(crate) fn split_frontmatter(raw: &str) -> Result<(&str, String), String> {
+    let (yaml, body_start) = frontmatter_yaml(raw)?;
+    // Skip the newline right after the closing `---`, if present.
+    let after = &raw[body_start..];
     let body = after.strip_prefix('\n').unwrap_or(after).to_string();
+    Ok((yaml, body))
+}
+
+/// Splits the frontmatter envelope and parses the YAML half as an
+/// [`AgentFrontmatter`].
+fn parse(raw: &str) -> Result<(AgentFrontmatter, String), String> {
+    let (yaml, body) = split_frontmatter(raw)?;
     let frontmatter: AgentFrontmatter =
         serde_yaml_ng::from_str(yaml).map_err(|e| format!("invalid frontmatter: {e}"))?;
     Ok((frontmatter, body))
