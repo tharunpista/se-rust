@@ -9,4 +9,19 @@ description = "SE's execution core: session, task and turn lifecycle, run off th
 [dependencies]
 se-protocol = { path = "../se-protocol" }
 se-provider = { path = "../se-provider" }
+se-permission = { path = "../se-permission" }
 serde_json = { workspace = true }
+
+# Minimal, targeted addition for the tools module's OS-level file
+# identity resolver (SE_TARGET_ARCHITECTURE.md §3a: a tool must bind to
+# volume+file-id, not a path string, to survive a symlink swapped
+# between approval and execution). Nothing in the workspace already
+# pins a `windows` crate; `windows-sys` is the thinnest available
+# option (raw FFI signatures only, no wrapper object model) and is
+# already present several times over in the lockfile transitively, so
+# this does not introduce a new major version family.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+] }

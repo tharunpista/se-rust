@@ -840,9 +840,11 @@ version = "0.1.0"
 name = "se-core"
 version = "0.1.0"
 dependencies = [
+ "se-permission",
  "se-protocol",
  "se-provider",
  "serde_json",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
