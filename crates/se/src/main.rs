@@ -574,11 +574,18 @@ fn doctor(startup: se_protocol::Running) -> std::process::ExitCode {
     println!("                     from this build, so `se models <id>` is the real check");
     println!("    credentials      OS-native secure storage");
     println!("    conversation     history is sent back on later turns (in memory only)");
+    println!("    tools            read, write, edit, search, shell -- gated behind a");
+    println!("                     permission gateway; every call asks for approval");
+    println!("                     unless a ruleset says otherwise (none is configured yet,");
+    println!("                     so every call asks)");
+    println!("    sessions         logged to .se/sessions/<id>.jsonl; `se` resumes a");
+    println!("                     killed-mid-turn session as interrupted, not completed");
     println!();
     println!("  Not implemented yet, and not pretended otherwise:");
-    println!("    tools / sandbox  Phase 3 — the model cannot read or change files");
-    println!("    persistence      Phase 4 — sessions do not survive exit");
-    println!("    specialists      Phase 5");
-    println!("    external CLIs    Phase 6 — Claude Code, Codex, OpenCode");
+    println!("    ruleset config   every tool call asks for approval -- no way yet to");
+    println!("                     pre-allow or pre-deny by agent/tool/path");
+    println!("    specialists      Phase 3 -- the 194-agent catalogue is not loaded");
+    println!("    multi-model      Phase 4 -- team orchestration, task graphs");
+    println!("    external CLIs    Phase 6 -- Claude Code, Codex, OpenCode");
     std::process::ExitCode::SUCCESS
 }
