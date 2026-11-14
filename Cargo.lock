@@ -846,6 +846,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "se-permission"
+version = "0.1.0"
+dependencies = [
+ "se-protocol",
+]
+
+[[package]]
 name = "se-protocol"
 version = "0.1.0"
 dependencies = [

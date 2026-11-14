@@ -4,6 +4,7 @@ members = [
     "crates/se-protocol",
     "crates/se-provider",
     "crates/se-command",
+    "crates/se-permission",
     "crates/se-core",
     "crates/se-tui",
     "crates/se",

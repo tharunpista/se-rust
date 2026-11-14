@@ -1,0 +1,10 @@
+[package]
+name = "se-permission"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The permission gateway: a pure (agent, task, tool, resource) -> allow/deny/ask decision, plus the unconstructible Approved token that proves a decision happened."
+
+[dependencies]
+se-protocol = { path = "../se-protocol" }
