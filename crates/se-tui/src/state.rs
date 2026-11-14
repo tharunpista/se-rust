@@ -221,12 +221,35 @@ impl AppState {
     /// Deliberately not cached: a stored candidate list is how "what
     /// is highlighted" and "what Enter runs" drift apart.
     pub fn picker_candidates(&self) -> Vec<&se_command::CommandSpec> {
-        match self
+        let query = match self
             .picker
             .query(self.composer.text(), self.composer.cursor())
         {
-            Some(query) => self.commands.query(query),
-            None => Vec::new(),
+            Some(q) => q,
+            None => return Vec::new(),
+        };
+        let is_specialist =
+            |c: &&se_command::CommandSpec| c.handler == se_command::HandlerKind::SpecialistInvoke;
+        match self.picker.scope() {
+            // `/agents` is the one gateway into the specialist
+            // catalogue (mirrors upstream OpenCode's single
+            // `agent.list` command opening a dedicated dialog, rather
+            // than one slash entry per agent) -- the default, mixed
+            // list never shows one of the 194 real specialists, so
+            // `/` alone stays a short, memorable list of actual
+            // commands.
+            crate::picker::PickerScope::Commands => self
+                .commands
+                .query(query)
+                .into_iter()
+                .filter(|c| !is_specialist(c))
+                .collect(),
+            crate::picker::PickerScope::Agents => self
+                .commands
+                .query(query)
+                .into_iter()
+                .filter(is_specialist)
+                .collect(),
         }
     }
 
@@ -298,9 +321,18 @@ impl AppState {
             // `Payload` verbatim; a richer panel showing this history
             // is later TUI work, not this one line.
             Payload::SpecialistInvoked { agent_id, .. } => {
-                self.push(Entry::Notice(format!(
-                    "routed through specialist: {agent_id}"
-                )));
+                // Enriched from the already-registered `CommandSpec`
+                // (department + mission), not a new protocol field --
+                // this is a synchronous, local lookup, never a second
+                // round trip to the core.
+                let notice = match self.commands.resolve(agent_id) {
+                    Ok(spec) => format!(
+                        "routed through {agent_id} ({}) — mission: {}",
+                        spec.category, spec.description
+                    ),
+                    Err(_) => format!("routed through specialist: {agent_id}"),
+                };
+                self.push(Entry::Notice(notice));
             }
             Payload::Delta { kind, text } => match kind {
                 DeltaKind::Text => self.append_assistant(text),

@@ -18,6 +18,22 @@
 //! registry each frame, which is what keeps "what is on screen" and
 //! "what Enter will run" from ever drifting apart.
 
+/// What the picker is browsing. Mirrors upstream OpenCode's split
+/// between its `/` command autocomplete
+/// (`autocomplete.tsx@9bbb8ce`) and its dedicated agent-select dialog
+/// (`component/dialog-agent.tsx@9bbb8ce`, bound to a single `/agents`
+/// command rather than one slash entry per agent): the 194 real SE
+/// specialists are never shown in the default, everything-mixed-in
+/// candidate list a bare `/` opens -- only `/agents` pivots the same
+/// inline picker into `Agents` scope, where the candidate list is the
+/// other way round, specialists only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PickerScope {
+    #[default]
+    Commands,
+    Agents,
+}
+
 /// Whether the picker is open, and if so where its trigger sits.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Picker {
@@ -31,6 +47,7 @@ pub enum Picker {
         /// on store, because the list length changes as the user types
         /// and a stored index would go stale between frames.
         selected: usize,
+        scope: PickerScope,
     },
 }
 
@@ -39,16 +56,31 @@ impl Picker {
         matches!(self, Picker::Open { .. })
     }
 
-    /// Opens the picker at `trigger`, the offset of the `/` just typed.
+    /// Opens the picker at `trigger`, the offset of the `/` just typed,
+    /// browsing ordinary commands.
     pub fn open(&mut self, trigger: usize) {
+        self.open_scoped(trigger, PickerScope::Commands);
+    }
+
+    /// Opens the picker scoped to browse only one kind of candidate --
+    /// `/agents` uses this to pivot into [`PickerScope::Agents`].
+    pub fn open_scoped(&mut self, trigger: usize, scope: PickerScope) {
         *self = Picker::Open {
             trigger,
             selected: 0,
+            scope,
         };
     }
 
     pub fn close(&mut self) {
         *self = Picker::Closed;
+    }
+
+    pub fn scope(&self) -> PickerScope {
+        match self {
+            Picker::Open { scope, .. } => *scope,
+            Picker::Closed => PickerScope::Commands,
+        }
     }
 
     pub fn trigger(&self) -> Option<usize> {

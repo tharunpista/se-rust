@@ -173,9 +173,23 @@ fn dispatch(state: &mut AppState, core: &CoreHandle, action: Action) -> bool {
             // structural guarantee -- not a string check before
             // sending.
             if let Some(path) = state.highlighted_command_path() {
+                let is_specialist = state
+                    .commands
+                    .resolve(&path)
+                    .is_ok_and(|s| s.handler == se_command::HandlerKind::SpecialistInvoke);
                 state.picker.close();
-                state.composer.clear();
-                run_command(state, core, &path, "");
+                if is_specialist {
+                    // A specialist needs a request after it (refused
+                    // otherwise, see `run_specialist_invoke`), so
+                    // accepting one from the picker prefills it ready
+                    // to type rather than clearing-then-immediately-
+                    // refusing an empty submission the user then has
+                    // to retype from scratch.
+                    state.composer.set(format!("/{path} "));
+                } else {
+                    state.composer.clear();
+                    run_command(state, core, &path, "");
+                }
             } else {
                 // Nothing matched; leave the draft alone so the user
                 // can correct it rather than losing what they typed.
@@ -303,6 +317,18 @@ pub fn run_command(state: &mut AppState, core: &CoreHandle, path: &str, raw_args
     match se_command::builtins::availability(&id) {
         Some(se_command::builtins::Availability::Ready) => match id.as_str() {
             "exit" => state.should_quit = true,
+            "agents" => {
+                // The single gateway into the 194-specialist catalogue
+                // (OpenCode's `agent.list` -> dedicated dialog, ported
+                // as a scope pivot of the same inline picker rather
+                // than a second UI component). Reopening at a fresh
+                // `/` means the live query starts empty, so every
+                // specialist is a candidate until the user narrows it.
+                state.composer.set("/".to_string());
+                state
+                    .picker
+                    .open_scoped(0, crate::picker::PickerScope::Agents);
+            }
             "keys" => {
                 let report = state.keys.report();
                 state.push(Entry::Notice(report));
@@ -806,8 +832,10 @@ mod tests {
     fn an_unavailable_command_explains_why_instead_of_failing_silently() {
         let core = se_core::start(EchoRunner::instant());
         let mut state = AppState::new();
-        // `/agents` is honest-unavailable until the Phase 3 loader.
-        for c in "/agents".chars() {
+        // `/skills` is honest-unavailable until skill discovery is
+        // wired into the TUI (`/agents`, its sibling, is Ready now
+        // that Phase 3 lands specialist dispatch).
+        for c in "/skills".chars() {
             crate::input::apply_local(&mut state, &Action::InsertChar(c));
         }
         dispatch(&mut state, &core, Action::PickerAccept);
@@ -946,6 +974,88 @@ mod tests {
         let resolved = state.commands.resolve("backend-lead").unwrap();
         assert_eq!(resolved.handler, se_command::HandlerKind::SpecialistInvoke);
         assert_eq!(resolved.path, "backend-lead");
+    }
+
+    /// The structural point of the whole `/agents` gateway: a
+    /// registered specialist must never appear in the default,
+    /// everything-mixed-in picker list -- mirroring upstream
+    /// OpenCode's split between its `/` autocomplete and its separate
+    /// agent-select dialog, so `/` alone stays a short list of real
+    /// commands rather than 194 specialist rows plus a handful of
+    /// builtins.
+    #[test]
+    fn the_default_picker_scope_never_shows_a_registered_specialist() {
+        let mut state = AppState::new();
+        discover_and_register_commands(&mut state);
+        state
+            .commands
+            .register(specialist_spec("backend-lead"))
+            .unwrap();
+        for c in "/".chars() {
+            crate::input::apply_local(&mut state, &Action::InsertChar(c));
+        }
+        let candidates = state.picker_candidates();
+        assert!(
+            candidates.iter().all(|c| c.path != "backend-lead"),
+            "a specialist must be invisible in the default picker scope: {:?}",
+            candidates.iter().map(|c| &c.path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn running_slash_agents_pivots_the_picker_into_a_specialists_only_scope() {
+        let core = se_core::start(EchoRunner::instant());
+        let mut state = AppState::new();
+        discover_and_register_commands(&mut state);
+        state
+            .commands
+            .register(specialist_spec("backend-lead"))
+            .unwrap();
+
+        run_command(&mut state, &core, "agents", "");
+
+        assert_eq!(state.picker.scope(), crate::picker::PickerScope::Agents);
+        let candidates = state.picker_candidates();
+        assert!(
+            candidates.iter().any(|c| c.path == "backend-lead"),
+            "the agents scope must show the registered specialist: {:?}",
+            candidates.iter().map(|c| &c.path).collect::<Vec<_>>()
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|c| c.handler == se_command::HandlerKind::SpecialistInvoke),
+            "the agents scope must never mix in an ordinary command: {:?}",
+            candidates.iter().map(|c| &c.path).collect::<Vec<_>>()
+        );
+        core.shutdown();
+    }
+
+    #[test]
+    fn accepting_a_specialist_from_the_picker_prefills_rather_than_submits_empty() {
+        let core = se_core::start(EchoRunner::instant());
+        let mut state = AppState::new();
+        discover_and_register_commands(&mut state);
+        state
+            .commands
+            .register(specialist_spec("backend-lead"))
+            .unwrap();
+        run_command(&mut state, &core, "agents", "");
+        for c in "backend-lead".chars() {
+            crate::input::apply_local(&mut state, &Action::InsertChar(c));
+        }
+
+        dispatch(&mut state, &core, Action::PickerAccept);
+
+        assert_eq!(state.composer.text(), "/backend-lead ");
+        assert!(
+            !state
+                .transcript
+                .iter()
+                .any(|e| matches!(e, Entry::Notice(n) if n.contains("needs a request"))),
+            "accepting from the picker must prefill, not submit empty and then refuse"
+        );
+        core.shutdown();
     }
 
     #[test]

@@ -136,11 +136,23 @@ fn draw_picker(f: &mut Frame, transcript_area: Rect, state: &AppState) {
         } else {
             theme::base()
         };
-        lines.push(Line::from(vec![
+        // In `Agents` scope every row is a specialist (never mixed
+        // with an ordinary command in the same list -- that is the
+        // whole point of the scope split), so the department is shown
+        // as a tag rather than needing a type marker to disambiguate
+        // row kinds the way a mixed list would.
+        let mut spans = vec![
             Span::styled(marker, Style::default().fg(theme::LAVENDER)),
-            Span::styled(format!(" /{:<13}", spec.path), name_style),
-            Span::styled(spec.description.clone(), theme::muted()),
-        ]));
+            Span::styled(format!(" /{:<16}", spec.path), name_style),
+        ];
+        if state.picker.scope() == crate::picker::PickerScope::Agents {
+            spans.push(Span::styled(
+                format!("[{}] ", spec.category),
+                theme::accent(),
+            ));
+        }
+        spans.push(Span::styled(spec.description.clone(), theme::muted()));
+        lines.push(Line::from(spans));
     }
     let inner = Rect {
         x: area.x + 1,

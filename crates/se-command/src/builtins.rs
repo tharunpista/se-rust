@@ -162,9 +162,7 @@ pub fn builtins() -> Vec<Builtin> {
             description: "Browse the specialist catalogue",
             handler: HandlerKind::UiAction,
             security_critical: false,
-            availability: Availability::NotImplemented(
-                "the agent loader lands in Phase 3; the catalogue is not read yet",
-            ),
+            availability: Availability::Ready,
         },
         Builtin {
             id: "skills",
