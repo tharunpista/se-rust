@@ -38,6 +38,10 @@ enum Line {
     Limits {
         limits: Limits,
     },
+    /// (normalised path, owning node).
+    Claim {
+        claim: (String, String),
+    },
 }
 
 /// Everything a journal holds, read back.
@@ -48,6 +52,8 @@ pub struct Resumed {
     /// `None` for a journal written before limits were recorded.
     pub limits: Option<Limits>,
     pub records: HashMap<String, NodeRecord>,
+    /// File claims, in the order they were made.
+    pub claims: Vec<(String, String)>,
 }
 
 pub struct RunJournal {
@@ -98,6 +104,12 @@ impl RunJournal {
         })
     }
 
+    pub fn record_claim(&mut self, key: &str, node: &str) -> std::io::Result<()> {
+        self.write(&Line::Claim {
+            claim: (key.to_string(), node.to_string()),
+        })
+    }
+
     /// Who ran `node` and what it reported spending (rows 4.2/4.15).
     pub fn record_attribution(&mut self, node: &str, record: &NodeRecord) -> std::io::Result<()> {
         self.write(&Line::Attribution {
@@ -133,6 +145,7 @@ pub fn resume(path: &Path) -> std::io::Result<Resumed> {
     let mut outputs = HashMap::new();
     let mut records = HashMap::new();
     let mut limits = None;
+    let mut claims = Vec::new();
     for line in lines {
         match line {
             Line::State { node, state } => {
@@ -147,6 +160,7 @@ pub fn resume(path: &Path) -> std::io::Result<Resumed> {
                 records.insert(node, record);
             }
             Line::Limits { limits: l } => limits = Some(l),
+            Line::Claim { claim } => claims.push(claim),
             Line::Graph { .. } => {}
         }
     }
@@ -176,5 +190,6 @@ pub fn resume(path: &Path) -> std::io::Result<Resumed> {
         outputs,
         limits,
         records,
+        claims,
     })
 }

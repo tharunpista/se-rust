@@ -121,6 +121,9 @@ pub struct TeamRun {
     submitted: HashMap<TaskId, String>,
     /// The vendor each running task is using, for per-provider limits.
     running_provider: HashMap<TaskId, String>,
+    /// Running tasks that have asked for a tool call: their side effects
+    /// are unknown, so they are never silently re-run.
+    touched: std::collections::HashSet<TaskId>,
     default_provider: String,
     limits: Limits,
     /// Every node's final outcome, kept even when a later node fails, so
@@ -151,6 +154,7 @@ impl TeamRun {
             None,
             HashMap::new(),
             HashMap::new(),
+            Vec::new(),
         )
     }
 
@@ -171,6 +175,7 @@ impl TeamRun {
             Some(journal),
             HashMap::new(),
             HashMap::new(),
+            Vec::new(),
         ))
     }
 
@@ -199,6 +204,7 @@ impl TeamRun {
             Some(r.journal),
             outcomes,
             r.records,
+            r.claims,
         ))
     }
 
@@ -209,6 +215,7 @@ impl TeamRun {
         journal: Option<RunJournal>,
         outcomes: HashMap<String, Outcome>,
         records: HashMap<String, NodeRecord>,
+        claims: Vec<(String, String)>,
     ) -> Self {
         let default_provider = runner.describe().0;
         let team = TeamContext::new(
@@ -217,6 +224,7 @@ impl TeamRun {
             limits.review_reserve_tokens,
             |node| records.get(node).and_then(NodeRecord::tokens).unwrap_or(0),
         );
+        team.restore_claims(claims);
         runner.attach_team(team.clone());
         let mut run = Self {
             graph,
@@ -224,6 +232,7 @@ impl TeamRun {
             running: HashMap::new(),
             submitted: HashMap::new(),
             running_provider: HashMap::new(),
+            touched: std::collections::HashSet::new(),
             default_provider,
             approvals: ApprovalLimiter::new(limits.approvals_per_minute),
             limits,
@@ -257,7 +266,13 @@ impl TeamRun {
             return;
         };
         let mut failed = None;
-        for n in self.graph.nodes() {
+        for (key, node) in self.team.take_new_claims() {
+            if let Err(e) = journal.record_claim(&key, &node) {
+                failed = Some(e.to_string());
+                break;
+            }
+        }
+        for n in self.graph.nodes().iter().take_while(|_| failed.is_none()) {
             let state = self.graph.state(&n.id).expect("own node");
             if self.recorded.get(&n.id) == Some(&state) {
                 continue;
@@ -434,16 +449,31 @@ impl TeamRun {
                 Payload::UsageUpdated(u) => {
                     self.records.entry(node.clone()).or_default().usage = Some(*u);
                 }
-                Payload::ToolRequested { .. } | Payload::ToolDenied { .. }
-                    if state == Some(NodeState::WaitingApproval) =>
-                {
-                    let _ = self.graph.approval_answered(&node);
+                Payload::ToolRequested { .. } | Payload::ToolDenied { .. } => {
+                    self.touched.insert(event.task);
+                    if state == Some(NodeState::WaitingApproval) {
+                        let _ = self.graph.approval_answered(&node);
+                    }
                 }
                 Payload::TaskFinished { outcome, .. } => {
                     self.running.remove(&event.task);
                     self.running_provider.remove(&event.task);
-                    let outcome = self.evaluated(&node, outcome.clone());
-                    self.finish_node(&node, &outcome);
+                    let touched = self.touched.remove(&event.task);
+                    if !touched && stopped_by_budget(outcome) {
+                        // Nothing ran but model calls: safe to run again
+                        // once a human raises the budget (row 4.16).
+                        let _ = self.graph.requeue(&node);
+                        if let Some(journal) = self.journal.as_mut() {
+                            if let Some(record) = self.records.get(&node) {
+                                if let Err(e) = journal.record_attribution(&node, record) {
+                                    self.stop_on_journal_error(e.to_string());
+                                }
+                            }
+                        }
+                    } else {
+                        let outcome = self.evaluated(&node, outcome.clone());
+                        self.finish_node(&node, &outcome);
+                    }
                 }
                 _ => {}
             }
@@ -459,12 +489,23 @@ impl TeamRun {
         let Some(spec) = self.graph.node(node) else {
             return outcome;
         };
-        let Outcome::Completed { final_text } = &outcome else {
-            return outcome;
-        };
         if spec.kind != NodeKind::Evaluate {
             return outcome;
         }
+        // The verdict, or why there is none. A failed evaluator call still
+        // yields the report with every member's answer, marked as not
+        // compared: one failed call must not erase the members' work, and
+        // its absence must never read as agreement. A cancellation stays
+        // a cancellation.
+        let verdict = match &outcome {
+            Outcome::Completed { final_text } => super::evaluate::parse(final_text),
+            Outcome::Cancelled => return outcome,
+            Outcome::Failed { detail } => Err(format!("the evaluator failed: {detail}")),
+            Outcome::Incomplete { reason, .. } => {
+                Err(format!("the evaluator did not finish: {reason}"))
+            }
+            other => Err(format!("the evaluator did not finish: {}", other.label())),
+        };
         let members: Vec<super::evaluate::Member<'_>> = spec
             .deps
             .iter()
@@ -483,7 +524,7 @@ impl TeamRun {
             })
             .collect();
         Outcome::Completed {
-            final_text: super::evaluate::report(&members, super::evaluate::parse(final_text)),
+            final_text: super::evaluate::report(&members, verdict),
         }
     }
 
@@ -575,6 +616,15 @@ impl TeamRun {
         }
         self.sync_journal();
     }
+}
+
+fn stopped_by_budget(outcome: &Outcome) -> bool {
+    let why = match outcome {
+        Outcome::Failed { detail } => detail,
+        Outcome::Incomplete { reason, .. } => reason,
+        _ => return false,
+    };
+    why.starts_with(super::context::BUDGET_SPENT)
 }
 
 /// Total characters of upstream output handed to one node.
@@ -887,6 +937,7 @@ mod tests {
             Some(journal),
             HashMap::new(),
             HashMap::new(),
+            Vec::new(),
         );
         drive(&mut run);
         assert!(run.journal_error().is_some());

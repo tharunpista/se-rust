@@ -154,6 +154,8 @@ Phases 0–3 are done. **Phase 4 is built and mock-verified; its live and manual
 Tests: `crates/se-core/src/team_run_tests.rs` runs real `ProviderRunner` team runs against mock vendors (rows 4.2–4.4, 4.13–4.17). The full-run test uses a three-specialist catalogue and reads 3 agent ids and 2 vendors back from the journal. A mutation check (disabling the claim check) fails 2 of them.
 Smoke-tested 2026-11-17 with the release binary against a local mock vendor: a 2-vendor ensemble surfaced both positions with evidence, a review stage ran, usage was attributed per task, and a 120-token budget stopped the run with no further request sent, after the evaluator still ran on the review reserve. The `se` launcher in `~/.local/bin` was repointed to `SE\se-rust`.
 
+**Closed on 2026-11-17 (senior-level pass):** file claims are journaled and restored on resume (`file_ownership_survives_a_resume`); a failed evaluator call still delivers every member's answer, marked as not compared; the audit trail fails closed (an unrecordable decision is a denial, and with no writable audit log, tools are disabled); a worker-thread spawn failure fails only its task; the nonce ledger survives a poisoned lock. Repository standards: README, LICENSE, SECURITY, CONTRIBUTING, CHANGELOG, a CI workflow (Windows, Linux and macOS; MSRV; cargo-deny), a workspace lint policy (`unsafe_code` and `unwrap_used` denied), and MSRV corrected from 1.85 to 1.88, which the dependency tree actually requires (verified with both toolchains).
+
 **Still open in Phase 4 (honest list):**
 - Row 4.17's **manual Windows Terminal run** and **any live-provider run** (every test uses mock vendors).
 - Row 4.12's real case: a killed process with a real shell call in flight.
@@ -161,9 +163,7 @@ Smoke-tested 2026-11-17 with the release binary against a local mock vendor: a 2
 - The budget can overshoot by up to one in-flight call per parallel task (a call is charged after it returns; `shortcut:` in `context.rs`).
 - Per-model context-window sizing for upstream hand-off (fixed 64k chars).
 - `credentials::load` is still a free function; the gate is the runner.
-- File claims are in memory only, so a resumed run forgets who owns which file.
-- A node that hits the budget mid-turn fails, and is not retried after the budget is raised.
-- If the evaluator's own model call fails, the evaluate node fails and no comparison is produced (the members' answers remain in their own outputs).
+- A node that hits the budget mid-turn **after** a tool call fails rather than re-running (its side effects are unknown). One with no tool calls yet goes back to ready and runs once the budget is raised.
 - The `/team` wiring through `dispatch_with` has no TUI-level test (the panel itself has one), and the TUI has not been run by hand.
 
 Carry-over debt closed on 2026-11-16:

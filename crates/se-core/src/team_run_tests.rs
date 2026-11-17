@@ -45,6 +45,14 @@ impl ModelProvider for Vendor {
     ) -> Result<(), ProviderError> {
         self.seen.lock().unwrap().push(request.clone());
         let last = request.messages.last().expect("a request has messages");
+        // Fails only an evaluator's call (its request opens this way),
+        // when the task asked for it.
+        if last.content.starts_with("Compare these answers") && last.content.contains("FAIL-EVAL") {
+            return Err(ProviderError::Server {
+                status: 503,
+                detail: "evaluator vendor down".into(),
+            });
+        }
         let mut events = Vec::new();
         if last.role == Role::Tool {
             events.push(StreamEvent::TextDelta("done".into()));
@@ -471,5 +479,126 @@ fn a_denied_vendor_gets_no_routing_calls_and_the_refusal_is_audited() {
             && l["effect"] == "Deny"),
         "{lines:?}"
     );
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+/// Item 6: when the evaluator's own call fails, the comparison still
+/// arrives with every member's answer, says plainly that nothing was
+/// compared, and never reads as agreement; dependents still run.
+#[test]
+fn a_failed_evaluator_still_delivers_every_answer_marked_uncompared() {
+    let ws = workspace("evalfail");
+    let (r, _) = runner(&ws, &[("p1", None), ("p2", None), ("p3", None)]);
+    let team = file::parse(
+        "tasks:
+  - id: db
+    ensemble: [p2/m2, p3/m3]
+    request: Which database? FAIL-EVAL
+  - id: after
+    deps: [db]
+    request: Use the comparison.
+",
+    )
+    .unwrap();
+    let mut run = TeamRun::start(team.graph, r, 3);
+    drive(&mut run);
+    let report = final_text(&run, "db");
+    assert!(
+        report.contains("could not be read (the evaluator failed"),
+        "{report}"
+    );
+    assert!(report.contains("p2 says") && report.contains("p3 says"));
+    assert!(!report.contains("no substantive disagreement"));
+    assert_eq!(run.graph().state("after"), Some(NodeState::Completed));
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+/// Row 4.16, mid-turn: the routing call spends the budget, so the main
+/// call is refused. Nothing with side effects ran, so the task goes back
+/// to ready (not failed), waits for a human, and completes once the
+/// budget is raised.
+#[test]
+fn a_task_stopped_by_the_budget_before_any_tool_runs_is_retried_after_a_raise() {
+    let ws = workspace("requeue");
+    // One routing call (the mock's answer names no department, so the
+    // router falls back to keywords) costs 110 of a 100-token budget.
+    let (r, seen) = runner(&ws, &[("p1", Some((90, 20)))]);
+    let r = r
+        .with_catalogue_root(catalogue(&ws, &["developer"]))
+        .with_auto_route(true);
+    let graph = TaskGraph::new(vec![node("x", "Build it.", &[])]).unwrap();
+    let limits = Limits {
+        max_concurrent: 1,
+        budget_tokens: Some(100),
+        ..Limits::default()
+    };
+    let mut run = TeamRun::start(graph, r, limits);
+    drive(&mut run);
+    assert_eq!(
+        run.graph().state("x"),
+        Some(NodeState::Ready),
+        "requeued, not failed"
+    );
+    assert!(run.budget_stalled().is_some());
+    let calls_before = seen[0].lock().unwrap().len();
+    assert_eq!(calls_before, 1, "only the routing call was made");
+
+    run.raise_budget(1_000);
+    drive(&mut run);
+    assert_eq!(run.graph().state("x"), Some(NodeState::Completed));
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+/// Row 4.13 across a restart: who owns which file is journaled, so after
+/// a resume a sibling still cannot overwrite a file the first task wrote.
+#[test]
+fn file_ownership_survives_a_resume() {
+    let ws = workspace("claimresume");
+    let journal = ws.join(".se/runs/run.jsonl");
+    let graph = || {
+        TaskGraph::new(vec![
+            node("a", "write:owned.txt", &[]),
+            node("b", "write:owned.txt", &["gate"]),
+            // `gate` holds b back, so b has not run when the process
+            // stops right after a finishes.
+            node("gate", "Wait.", &[]),
+        ])
+        .unwrap()
+    };
+    {
+        let (r, _) = runner(&ws, &[("p1", None)]);
+        let mut run = TeamRun::start_journaled(graph(), r, 1, &journal).unwrap();
+        // Run until `a` has written its file, then stop the process.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while run.graph().state("a") != Some(NodeState::Completed) {
+            assert!(Instant::now() < deadline);
+            run.tick_blocking(Duration::from_millis(20));
+        }
+        run.shutdown();
+    }
+    let r = crate::team::journal::resume(&journal).unwrap();
+    assert!(
+        r.claims
+            .iter()
+            .any(|(k, n)| k.ends_with("owned.txt") && n == "a"),
+        "{:?}",
+        r.claims
+    );
+    let (runner2, _) = runner(&ws, &[("p1", None)]);
+    let mut run = TeamRun::resume(&journal, runner2, None).unwrap();
+    for n in ["gate"] {
+        if run.graph().state(n) == Some(NodeState::NeedsConfirmation) {
+            run.confirm(n, false).unwrap();
+        }
+    }
+    let log = drive(&mut run);
+    assert!(
+        tool_results(&log, "b")
+            .iter()
+            .any(|(ok, t)| !*ok && t.contains("file conflict") && t.contains("`a`")),
+        "b is still refused after the resume: {:?}",
+        tool_results(&log, "b")
+    );
+    assert_eq!(std::fs::read_to_string(ws.join("owned.txt")).unwrap(), "p1");
     let _ = std::fs::remove_dir_all(&ws);
 }

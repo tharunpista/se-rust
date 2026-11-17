@@ -20,6 +20,10 @@ use std::sync::{Arc, Mutex};
 
 use super::graph::{NodeKind, TaskGraph};
 
+/// Every budget refusal starts with this, so the driver can tell a
+/// budget stop from any other failure without guessing.
+pub const BUDGET_SPENT: &str = "the run's token budget is spent";
+
 /// A write refused because another node owns the file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conflict {
@@ -52,6 +56,8 @@ struct Shared {
     nodes: HashMap<String, NodeInfo>,
     /// Normalised path -> owning node.
     claims: HashMap<String, String>,
+    /// Claims made since the driver last journaled them.
+    unjournaled: Vec<(String, String)>,
     limit_tokens: Option<u64>,
     review_reserve_tokens: u64,
     /// Spent by work nodes and by review/evaluate nodes, kept apart so
@@ -147,8 +153,25 @@ impl TeamContext {
         let mut shared = self.lock();
         let k = key(path);
         owner_allows(&shared, node, &k, path)?;
-        shared.claims.insert(k, node.to_string());
+        if shared.claims.get(&k).map(String::as_str) != Some(node) {
+            shared.claims.insert(k.clone(), node.to_string());
+            shared.unjournaled.push((k, node.to_string()));
+        }
         Ok(())
+    }
+
+    /// Claims made since the last call, as (path key, node), for the
+    /// run journal: a resumed run must still know who owns which file.
+    pub fn take_new_claims(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.lock().unjournaled)
+    }
+
+    /// Restores journaled claims, in journal order (a later owner wins).
+    pub fn restore_claims(&self, claims: Vec<(String, String)>) {
+        let mut shared = self.lock();
+        for (k, node) in claims {
+            shared.claims.insert(k, node);
+        }
     }
 
     /// Whether `node` may make another model call (item 9). Work may
@@ -173,7 +196,7 @@ impl TeamContext {
                 return Ok(());
             }
             return Err(format!(
-                "the run's token budget is spent ({total} of {limit} tokens, including the {reserve}-token review reserve)"
+                "{BUDGET_SPENT} ({total} of {limit} tokens, including the {reserve}-token review reserve)"
             ));
         }
         let work_ceiling = limit - reserve;
@@ -182,7 +205,7 @@ impl TeamContext {
             Ok(())
         } else {
             Err(format!(
-                "the run's token budget is spent ({used} of the {work_ceiling} tokens not reserved for review)"
+                "{BUDGET_SPENT} ({used} of the {work_ceiling} tokens not reserved for review)"
             ))
         }
     }
