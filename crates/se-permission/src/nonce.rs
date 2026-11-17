@@ -31,7 +31,14 @@ impl NonceLedger {
     /// every time after — including the very first `issue()`, a
     /// nonce is never valid until a token actually presents it here.
     pub fn consume(&self, nonce: &Nonce) -> bool {
-        self.spent.lock().unwrap().insert(*nonce)
+        // A panic elsewhere while holding the lock cannot leave an
+        // insert-only set half-updated, so a poisoned lock is still a
+        // correct ledger: recovering it keeps single-use enforced instead
+        // of crashing every later tool call.
+        self.spent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(*nonce)
     }
 }
 

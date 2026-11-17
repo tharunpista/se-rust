@@ -189,8 +189,11 @@ pub struct AuditRecord {
     pub effect: Effect,
 }
 
+/// Where gateway decisions are recorded. A sink that cannot record
+/// says so: the gateway then refuses to allow anything, so no action
+/// ever happens without a record of the decision behind it.
 pub trait AuditSink {
-    fn record(&self, record: AuditRecord);
+    fn record(&self, record: AuditRecord) -> Result<(), String>;
 }
 
 /// An audit sink that drops every record. Only for tests and for
@@ -200,7 +203,9 @@ pub trait AuditSink {
 pub struct NullAuditSink;
 
 impl AuditSink for NullAuditSink {
-    fn record(&self, _record: AuditRecord) {}
+    fn record(&self, _record: AuditRecord) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Default token lifetime: long enough to cover a human's approval
@@ -242,12 +247,14 @@ impl<'a> Gateway<'a> {
             &req.resource_scope,
             allowed_tools,
         ) {
-            Effect::Allow => {
-                self.audit(req, Effect::Allow);
-                Decision::Allow(Box::new(self.mint(req)))
-            }
+            // Fail closed: an Allow or Ask that cannot be recorded is a
+            // Deny. A Deny stands either way.
+            Effect::Allow => match self.audit(req, Effect::Allow) {
+                Ok(()) => Decision::Allow(Box::new(self.mint(req))),
+                Err(reason) => Decision::Deny { reason },
+            },
             Effect::Deny => {
-                self.audit(req, Effect::Deny);
+                let _ = self.audit(req, Effect::Deny);
                 Decision::Deny {
                     reason: format!(
                         "denied by ruleset: {} may not use {} on {}",
@@ -255,37 +262,42 @@ impl<'a> Gateway<'a> {
                     ),
                 }
             }
-            Effect::Ask => {
-                self.audit(req, Effect::Ask);
-                Decision::Ask
-            }
+            Effect::Ask => match self.audit(req, Effect::Ask) {
+                Ok(()) => Decision::Ask,
+                Err(reason) => Decision::Deny { reason },
+            },
         }
     }
 
     /// Mints a token for a request a human has just approved out of
     /// band (the `Ask` path). Still goes through the ruleset's audit
-    /// trail as an `Allow`, since that is what actually happened.
-    pub fn approve(&self, req: &Request) -> Box<Approved> {
-        self.audit(req, Effect::Allow);
-        Box::new(self.mint(req))
+    /// trail as an `Allow`, since that is what actually happened. No
+    /// token is minted if that record cannot be written.
+    pub fn approve(&self, req: &Request) -> Result<Box<Approved>, String> {
+        self.audit(req, Effect::Allow)?;
+        Ok(Box::new(self.mint(req)))
     }
 
     /// Records that an `Ask` ended without approval: a human said no,
     /// the task was cancelled, or the interface went away. Without this
     /// the trail would show the question but never the answer.
     pub fn refuse(&self, req: &Request) {
-        self.audit(req, Effect::Deny);
+        // Refusing is already the safe outcome; a failed record cannot
+        // make it less safe.
+        let _ = self.audit(req, Effect::Deny);
     }
 
-    fn audit(&self, req: &Request, effect: Effect) {
-        self.audit.record(AuditRecord {
-            agent_id: req.agent_id.clone(),
-            session: req.session,
-            task: req.task,
-            tool_name: req.tool_name.clone(),
-            resource_scope: req.resource_scope.clone(),
-            effect,
-        });
+    fn audit(&self, req: &Request, effect: Effect) -> Result<(), String> {
+        self.audit
+            .record(AuditRecord {
+                agent_id: req.agent_id.clone(),
+                session: req.session,
+                task: req.task,
+                tool_name: req.tool_name.clone(),
+                resource_scope: req.resource_scope.clone(),
+                effect,
+            })
+            .map_err(|e| format!("refused: the audit log could not record this decision ({e})"))
     }
 
     fn mint(&self, req: &Request) -> Approved {
@@ -536,5 +548,34 @@ mod tests {
             token.verify_and_consume(&ctx, &ledger),
             Err(VerifyError::Expired)
         );
+    }
+
+    struct BrokenAudit;
+    impl AuditSink for BrokenAudit {
+        fn record(&self, _record: AuditRecord) -> Result<(), String> {
+            Err("disk full".into())
+        }
+    }
+
+    /// Fail closed: nothing is allowed, asked for or approved when its
+    /// decision cannot be recorded; a deny still stands.
+    #[test]
+    fn an_unrecordable_decision_never_allows_anything() {
+        let ledger = NonceLedger::new();
+        for rules in [vec![Rule::allow_all()], vec![]] {
+            let ruleset = Ruleset::from_rules(rules);
+            let gw = Gateway::new(&ruleset, &ledger, &BrokenAudit);
+            match gw.decide(&req()) {
+                Decision::Deny { reason } => assert!(reason.contains("disk full"), "{reason}"),
+                Decision::Allow(_) => panic!("allowed with no record"),
+                Decision::Ask => panic!("asked a human with no record"),
+            }
+        }
+        let ruleset = Ruleset::from_rules(vec![]);
+        let gw = Gateway::new(&ruleset, &ledger, &BrokenAudit);
+        assert!(gw.approve(&req()).is_err(), "no token without a record");
+        let ruleset = Ruleset::from_rules(vec![Rule::deny_all()]);
+        let gw = Gateway::new(&ruleset, &ledger, &BrokenAudit);
+        assert!(matches!(gw.decide(&req()), Decision::Deny { .. }));
     }
 }

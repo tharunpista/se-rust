@@ -574,14 +574,22 @@ fn providers() -> std::process::ExitCode {
 /// overridable by `SE_CATALOGUE_ROOT` for a different install layout.
 /// Attaches `.se/audit.jsonl` (every gateway decision, row 2.5). A file
 /// that cannot be opened is reported, not fatal, matching session logs.
+/// Fail closed: with no writable audit log, tools are refused rather
+/// than run unrecorded, and the operator is told why.
 fn with_audit_log(runner: ProviderRunner) -> (ProviderRunner, Option<String>) {
-    let path = match std::env::current_dir() {
-        Ok(cwd) => cwd.join(".se").join("audit.jsonl"),
-        Err(e) => return (runner, Some(format!("⚠ tool decisions not audited ({e})"))),
-    };
-    match se_core::audit_log::FileAuditSink::open(&path) {
+    let opened = std::env::current_dir()
+        .map(|cwd| cwd.join(".se").join("audit.jsonl"))
+        .and_then(|path| se_core::audit_log::FileAuditSink::open(&path));
+    match opened {
         Ok(sink) => (runner.with_audit_sink(std::sync::Arc::new(sink)), None),
-        Err(e) => (runner, Some(format!("⚠ tool decisions not audited ({e})"))),
+        Err(e) => (
+            runner.with_audit_sink(std::sync::Arc::new(
+                se_core::audit_log::UnavailableAuditSink(e.to_string()),
+            )),
+            Some(format!(
+                "⚠ no audit log ({e}): tools are disabled until .se/audit.jsonl is writable"
+            )),
+        ),
     }
 }
 

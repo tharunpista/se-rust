@@ -852,7 +852,8 @@ impl ProviderRunner {
         let id = se_protocol::ToolCallId::next();
         let _ = sink.tool_requested(id, &call.name, &call.name);
         let _ = sink.tool_completed(id, &call.name, false, &text);
-        self.audit.record(se_permission::AuditRecord {
+        // Already a refusal, so a failed record cannot make it unsafe.
+        let _ = self.audit.record(se_permission::AuditRecord {
             agent_id: agent.0.clone(),
             session: sink.session(),
             task: sink.task(),
@@ -975,8 +976,7 @@ impl ProviderRunner {
             se_permission::Decision::Deny { reason } => Err(reason),
             se_permission::Decision::Ask => {
                 if sink.request_approval("use_provider", &shown).is_some() {
-                    gateway.approve(&req);
-                    Ok(())
+                    gateway.approve(&req).map(|_| ())
                 } else {
                     gateway.refuse(&req);
                     Err(format!("not approved: {shown}"))
@@ -1096,7 +1096,13 @@ impl ProviderRunner {
                         let _ = sink.tool_completed(id, &call.name, false, "cancelled");
                         return "cancelled before this call ran".to_string();
                     }
-                    (id, gateway.approve(&req))
+                    match gateway.approve(&req) {
+                        Ok(token) => (id, token),
+                        Err(reason) => {
+                            let _ = sink.tool_completed(id, &call.name, false, &reason);
+                            return reason;
+                        }
+                    }
                 }
             };
 

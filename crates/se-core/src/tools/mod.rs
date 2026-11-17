@@ -136,7 +136,9 @@ pub(crate) mod test_support {
 
     pub struct NullSink;
     impl AuditSink for NullSink {
-        fn record(&self, _r: AuditRecord) {}
+        fn record(&self, _r: AuditRecord) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     /// Builds a `Granted` for `tool_name` acting on `path`, resolving

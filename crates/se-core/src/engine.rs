@@ -498,7 +498,7 @@ fn supervise<R: Runner>(
                 // the queue cannot grow meaningfully.
                 let (approval_tx, approval_rx) = channel();
                 let finished = Arc::new(AtomicBool::new(false));
-                let worker = spawn_worker(
+                let spawned = spawn_worker(
                     id,
                     session,
                     turn,
@@ -510,6 +510,26 @@ fn supervise<R: Runner>(
                     history.clone(),
                     finished.clone(),
                 );
+                // Out of threads or memory: fail this one task, with the
+                // OS's reason, and keep the core serving the others.
+                let worker = match spawned {
+                    Ok(w) => w,
+                    Err(e) => {
+                        let _ = events.send(CoreEvent {
+                            seq: seq.next(),
+                            session,
+                            task: id,
+                            turn: None,
+                            payload: Payload::TaskFinished {
+                                outcome: Outcome::Failed {
+                                    detail: format!("could not start a worker thread: {e}"),
+                                },
+                                timings: se_protocol::Timings::default(),
+                            },
+                        });
+                        continue;
+                    }
+                };
                 running.push(ActiveTask {
                     id,
                     cancelled,
@@ -561,7 +581,11 @@ fn spawn_worker<R: Runner>(
     approvals: Receiver<(ToolCallId, bool)>,
     history: History,
     finished: Arc<AtomicBool>,
-) -> std::thread::JoinHandle<()> {
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    #[cfg(test)]
+    if turn.text == FAIL_SPAWN_TEXT {
+        return Err(std::io::Error::other("test: no threads left"));
+    }
     std::thread::Builder::new()
         .name(format!("se-task-{id}"))
         .spawn(move || {
@@ -619,13 +643,46 @@ fn spawn_worker<R: Runner>(
             finished.store(true, Ordering::SeqCst);
             let _ = sink.emit(Payload::TaskFinished { outcome, timings });
         })
-        .expect("spawning a task worker thread")
 }
+
+/// A request with exactly this text fails to spawn, to test that path
+/// without exhausting the machine's threads (keyed on the task, not a
+/// global flag, so parallel tests cannot take each other's failure).
+#[cfg(test)]
+const FAIL_SPAWN_TEXT: &str = "se-test: fail this worker spawn";
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::EchoRunner;
+
+    /// A worker that cannot be spawned fails its own task with the OS
+    /// reason; the core survives and runs the next task normally.
+    #[test]
+    fn a_failed_worker_spawn_fails_only_that_task() {
+        let core = start(EchoRunner::instant());
+        let first = core.submit(FAIL_SPAWN_TEXT, vec![]).unwrap();
+        let outcome_of = |task: TaskId| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                for e in core.drain_blocking(Duration::from_millis(20)) {
+                    if let (true, Payload::TaskFinished { outcome, .. }) =
+                        (e.task == task, e.payload)
+                    {
+                        return outcome;
+                    }
+                }
+            }
+            panic!("task never finished");
+        };
+        match outcome_of(first) {
+            Outcome::Failed { detail } => assert!(detail.contains("worker thread"), "{detail}"),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        let second = core.submit("two", vec![]).unwrap();
+        assert!(matches!(outcome_of(second), Outcome::Completed { .. }));
+        core.shutdown();
+    }
 
     /// Ignores cancellation entirely and always reports success, after
     /// a short delay so a test has time to call `interrupt` first. The

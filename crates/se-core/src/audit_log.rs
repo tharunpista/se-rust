@@ -31,10 +31,9 @@ impl FileAuditSink {
 }
 
 impl AuditSink for FileAuditSink {
-    // shortcut: a failed write is dropped, not fatal, because `AuditSink`
-    // returns nothing. Make `record` fallible and refuse the call if
-    // audit completeness ever becomes a compliance requirement.
-    fn record(&self, record: AuditRecord) {
+    /// A failed write is returned, and the gateway then refuses the
+    /// action: nothing runs without its decision on record.
+    fn record(&self, record: AuditRecord) -> Result<(), String> {
         let line = serde_json::json!({
             "at_unix_ms": std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -49,8 +48,20 @@ impl AuditSink for FileAuditSink {
         });
         let mut file = self.file.lock().unwrap_or_else(|e| e.into_inner());
         // One write per line so a crash can truncate at most the last one.
-        let _ = file.write_all(format!("{line}\n").as_bytes());
-        let _ = file.flush();
+        file.write_all(format!("{line}\n").as_bytes())
+            .and_then(|()| file.flush())
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Stands in when the audit file could not be opened: every record
+/// fails, so the gateway refuses every tool call and provider switch
+/// instead of letting them run unrecorded. Plain chat still works.
+pub struct UnavailableAuditSink(pub String);
+
+impl AuditSink for UnavailableAuditSink {
+    fn record(&self, _record: AuditRecord) -> Result<(), String> {
+        Err(format!("the audit log is unavailable: {}", self.0))
     }
 }
 
