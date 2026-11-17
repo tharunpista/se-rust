@@ -1,5 +1,7 @@
 [package]
 name = "se-tui"
+# Not on crates.io; SE ships as a binary.
+publish = false
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -20,3 +22,6 @@ crossterm = { workspace = true }
 # only -- so it does not reopen the reachable-blocking-call concern that
 # keeps `se-provider` out of this crate's normal dependency list.
 se-provider = { path = "../se-provider" }
+
+[lints]
+workspace = true

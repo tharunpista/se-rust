@@ -163,7 +163,9 @@ impl TaskGraph {
         while let Some(id) = queue.pop() {
             seen += 1;
             for n in nodes.iter().filter(|n| n.deps.iter().any(|d| d == id)) {
-                let d = indegree.get_mut(n.id.as_str()).unwrap();
+                let d = indegree
+                    .get_mut(n.id.as_str())
+                    .expect("every node has an in-degree entry");
                 *d -= 1;
                 if *d == 0 {
                     queue.push(&n.id);
@@ -171,7 +173,10 @@ impl TaskGraph {
             }
         }
         if seen < nodes.len() {
-            let stuck = nodes.iter().find(|n| indegree[n.id.as_str()] > 0).unwrap();
+            let stuck = nodes
+                .iter()
+                .find(|n| indegree[n.id.as_str()] > 0)
+                .expect("fewer nodes seen than exist means one is still blocked");
             return Err(GraphError::Cycle(stuck.id.clone()));
         }
         let state = nodes
@@ -278,6 +283,17 @@ impl TaskGraph {
         self.cancel_nodes(all)
     }
 
+    /// A running node that stopped before doing anything with side
+    /// effects goes back to `Ready`, to run again later.
+    pub fn requeue(&mut self, id: &str) -> Result<(), TransitionError> {
+        self.transition(
+            id,
+            "be requeued",
+            &[NodeState::Running, NodeState::WaitingApproval],
+            NodeState::Ready,
+        )
+    }
+
     /// For resume: a node recorded as running or waiting when the
     /// process stopped is marked as needing confirmation.
     pub fn mark_interrupted(&mut self, id: &str) -> Result<(), TransitionError> {
@@ -321,7 +337,10 @@ impl TaskGraph {
     fn cancel_nodes(&mut self, ids: Vec<String>) -> Vec<String> {
         let mut interrupt = Vec::new();
         for id in ids {
-            let s = self.state.get_mut(&id).unwrap();
+            let s = self
+                .state
+                .get_mut(&id)
+                .expect("cancel targets come from this graph");
             if s.is_terminal() {
                 continue;
             }

@@ -12,6 +12,7 @@ use std::io;
 use std::path::Path;
 
 #[cfg(windows)]
+#[allow(unsafe_code)] // The one FFI call; its SAFETY argument is inline below.
 pub fn resolve_resource_identity(path: &Path) -> io::Result<ResourceIdentity> {
     use std::fs::OpenOptions;
     use std::os::windows::fs::OpenOptionsExt;

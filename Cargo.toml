@@ -13,7 +13,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "Apache-2.0"
 
 # Pinned centrally so the crates cannot drift to different versions of
@@ -30,6 +30,20 @@ clap = { version = "4.5", features = ["derive"] }
 # would be a dependency with no job to do (see docs/ARCHITECTURE.md).
 ureq = { version = "2.12", features = ["json", "tls"] }
 keyring = "3.6"
+
+# One lint policy for every crate (each opts in with `[lints] workspace = true`).
+[workspace.lints.rust]
+# The only unsafe code is the Windows file-identity FFI call, allowed at
+# that one site with its safety argument.
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+# Panicking on input the user, a file, the network or the OS controls is a
+# bug. `expect` stays allowed for invariants the code itself guarantees;
+# tests may unwrap (see clippy.toml).
+unwrap_used = "deny"
+dbg_macro = "deny"
+todo = "deny"
 
 [profile.release]
 # A CLI's startup cost is part of its user experience (see the latency
