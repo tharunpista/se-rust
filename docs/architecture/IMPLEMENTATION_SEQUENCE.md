@@ -146,7 +146,7 @@ Phases 0–3 are done. **Phase 4 is built and mock-verified; its live and manual
 | 4 Artifacts and data/instruction boundary | Done for current needs | Upstream outputs are fenced as data (`with_upstream`); outputs are journaled with agent/vendor attribution; the evaluator gets no tools. No separate bus: nothing needs one yet |
 | 5 Three strategies | Done | Parallel = independent nodes; pipeline = a chain plus upstream fencing plus claim hand-off; ensemble = `ensemble: [p/m, ...]` in the team file, expanded to members `x#n` and an evaluate node `x`. Members with no named agent run unrouted, so their packets are identical (row 4.3) |
 | 6 Evaluator, never majority | Done | `team::evaluate`: a typed `Verdict` with no winner/score field; quotes are checked against the cited member's answer (`[UNVERIFIED]` otherwise); an unreadable verdict is reported as unreadable, never as agreement; all full answers are always kept. It runs on the survivors when a member fails. Row 4.5 at 2–1 and 1–1–1 |
-| 7 File-conflict safety | Done (write/edit) | `team::context`: run-long ownership; a dependent may take over its ancestor's file, a sibling gets a typed `Conflict`. Windows keys are case-folded and the `\\?\` long-path prefix is stripped. Rows 4.13, 4.14 through the real runner and file system. **Limit:** `shell` is not claim-checked (it is gated by approval) |
+| 7 File-conflict safety | Done (write/edit) | `team::context`: run-long ownership; a dependent may take over its ancestor's file, a sibling gets a typed `Conflict`. Windows keys are case-folded and the `\\?\` long-path prefix is stripped. Rows 4.13, 4.14 through the real runner and file system. `shell` is refused in any task that can overlap another (`TeamContext::shell_refused`), since its writes are invisible to claims |
 | 8 Approval rate limit and labels | Done | `ApprovalLimiter` (default 10 per task per minute; the excess is refused unasked and reported). Every team approval shows task, agent, model and target, in the CLI and in `/team` |
 | 9 Reserved review budget | Done | `budget_tokens` / `review_reserve_tokens`; Two ledgers: work spends `limit - reserve`; review and evaluate nodes always keep the reserve, even when work overshoots the whole limit (found in the smoke run and fixed). Checked before **every** model call, routing calls included |
 | 10 Monitor and attribution | Done | `team::monitor::rows` (pure, row 4.18); the `se team run` summary table; `/team` in the TUI (`run`, status, `allow`, `deny`, `budget`, `cancel`). Unreported usage reads "not reported", never 0 (row 4.15) |
@@ -156,10 +156,10 @@ Smoke-tested 2026-11-17 with the release binary against a local mock vendor: a 2
 
 **Closed on 2026-11-17 (senior-level pass):** file claims are journaled and restored on resume (`file_ownership_survives_a_resume`); a failed evaluator call still delivers every member's answer, marked as not compared; the audit trail fails closed (an unrecordable decision is a denial, and with no writable audit log, tools are disabled); a worker-thread spawn failure fails only its task; the nonce ledger survives a poisoned lock. Repository standards: README, LICENSE, SECURITY, CONTRIBUTING, CHANGELOG, a CI workflow (Windows, Linux and macOS; MSRV; cargo-deny), a workspace lint policy (`unsafe_code` and `unwrap_used` denied), and MSRV corrected from 1.85 to 1.88, which the dependency tree actually requires (verified with both toolchains).
 
+Also closed: row 4.12 with a real shell command in flight (`a_crash_with_a_shell_call_in_flight_never_replays_it`: it is not re-run on resume, and confirming it as done never replays it), and row 4.7 at 32 streams.
+
 **Still open in Phase 4 (honest list):**
 - Row 4.17's **manual Windows Terminal run** and **any live-provider run** (every test uses mock vendors).
-- Row 4.12's real case: a killed process with a real shell call in flight.
-- Row 4.7 at 32 streams.
 - The budget can overshoot by up to one in-flight call per parallel task (a call is charged after it returns; `shortcut:` in `context.rs`).
 - Per-model context-window sizing for upstream hand-off (fixed 64k chars).
 - `credentials::load` is still a free function; the gate is the runner.

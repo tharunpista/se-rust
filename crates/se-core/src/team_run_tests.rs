@@ -57,6 +57,14 @@ impl ModelProvider for Vendor {
         if last.role == Role::Tool {
             events.push(StreamEvent::TextDelta("done".into()));
             events.push(StreamEvent::FinishReason("stop".into()));
+        } else if last.content.contains("shell:append") {
+            let (program, args) = append_marker_command();
+            events.push(StreamEvent::ToolCallRequested {
+                id: "call-1".into(),
+                name: "shell".into(),
+                arguments: serde_json::json!({"program": program, "args": args}).to_string(),
+            });
+            events.push(StreamEvent::FinishReason("tool_calls".into()));
         } else if let Some(path) = last
             .content
             .split("write:")
@@ -91,6 +99,23 @@ impl ModelProvider for Vendor {
     fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         Ok(Vec::new())
     }
+}
+
+/// A real shell command that appends one line to `marker.txt` in the
+/// workspace, then lingers a moment, so a test can count real runs.
+fn append_marker_command() -> (&'static str, Vec<&'static str>) {
+    if cfg!(windows) {
+        (
+            "cmd",
+            vec!["/c", "echo ran>>marker.txt & ping -n 2 127.0.0.1 >nul"],
+        )
+    } else {
+        ("sh", vec!["-c", "echo ran >> marker.txt; sleep 1"])
+    }
+}
+
+fn marker_lines(ws: &Path) -> usize {
+    std::fs::read_to_string(ws.join("marker.txt")).map_or(0, |s| s.lines().count())
 }
 
 type Seen = Arc<Mutex<Vec<ChatRequest>>>;
@@ -600,5 +625,75 @@ fn file_ownership_survives_a_resume() {
         tool_results(&log, "b")
     );
     assert_eq!(std::fs::read_to_string(ws.join("owned.txt")).unwrap(), "p1");
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+/// Row 4.12: the process dies with a real shell command in flight. On
+/// resume the task is marked as needing confirmation, the command is not
+/// run again on its own, and confirming it as done never re-runs it.
+#[test]
+fn a_crash_with_a_shell_call_in_flight_never_replays_it() {
+    let ws = workspace("crashshell");
+    let journal = ws.join(".se/runs/run.jsonl");
+    {
+        let (r, _) = runner(&ws, &[("p1", None)]);
+        let graph = TaskGraph::new(vec![node("x", "shell:append", &[])]).unwrap();
+        let mut run = TeamRun::start_journaled(graph, r, 1, &journal).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        // ToolRequested on the allow path means execution has begun.
+        'started: loop {
+            assert!(Instant::now() < deadline, "the shell call never started");
+            for e in run.tick_blocking(Duration::from_millis(20)) {
+                if matches!(e.payload, Payload::ToolRequested { ref name, .. } if name == "shell") {
+                    break 'started;
+                }
+            }
+        }
+        // "Crash": the process stops without recording another line.
+        drop(run);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while marker_lines(&ws) == 0 {
+        assert!(Instant::now() < deadline, "the shell command never ran");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let (r, seen) = runner(&ws, &[("p1", None)]);
+    let mut run = TeamRun::resume(&journal, r, None).unwrap();
+    assert_eq!(run.graph().state("x"), Some(NodeState::NeedsConfirmation));
+    for _ in 0..5 {
+        run.tick_blocking(Duration::from_millis(20));
+    }
+    assert!(seen[0].lock().unwrap().is_empty(), "nothing re-ran unasked");
+    assert_eq!(marker_lines(&ws), 1);
+
+    run.confirm("x", true).unwrap();
+    drive(&mut run);
+    assert_eq!(run.graph().state("x"), Some(NodeState::Completed));
+    assert_eq!(marker_lines(&ws), 1, "confirmed as done, never replayed");
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+/// A task that can overlap another may not run `shell`: its writes are
+/// invisible to file claims. The command never runs.
+#[test]
+fn shell_is_refused_in_a_task_that_can_run_in_parallel() {
+    let ws = workspace("shellpeer");
+    let (r, _) = runner(&ws, &[("p1", None)]);
+    let graph = TaskGraph::new(vec![
+        node("x", "shell:append", &[]),
+        node("y", "Other work.", &[]),
+    ])
+    .unwrap();
+    let mut run = TeamRun::start(graph, r, 2);
+    let log = drive(&mut run);
+    assert!(
+        tool_results(&log, "x")
+            .iter()
+            .any(|(ok, t)| !*ok && t.contains("shell is disabled")),
+        "{:?}",
+        tool_results(&log, "x")
+    );
+    assert_eq!(marker_lines(&ws), 0, "the command never ran");
     let _ = std::fs::remove_dir_all(&ws);
 }

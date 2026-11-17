@@ -24,6 +24,8 @@ Expect an acknowledgement within 7 days.
 
 ## Known limits
 
-- A `shell` command can write any file in the workspace. It is gated by
-  approval, not by the per-task file claims that protect `write` and `edit`.
+- A `shell` command's file writes are invisible to the per-task file
+  claims, so in a team run `shell` is refused in any task that can run at
+  the same time as another. A task that runs alone still has it, gated by
+  approval.
 - Arguments to `shell` are not path-confined.

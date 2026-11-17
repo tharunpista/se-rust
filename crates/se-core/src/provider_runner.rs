@@ -1036,6 +1036,13 @@ impl ProviderRunner {
                 return self.reject_unparsed(sink, call, agent, &conflict.to_string());
             }
         }
+        if let (Some(team), Some(node), ToolAction::Shell { .. }) =
+            (&self.team, node, &parsed.action)
+        {
+            if let Some(reason) = team.shell_refused(node) {
+                return self.reject_unparsed(sink, call, agent, &reason);
+            }
+        }
         let resource = match tool_loop::resolve_identity(&parsed) {
             Ok(r) => r,
             Err(e) => return self.reject_unparsed(sink, call, agent, &e.to_string()),

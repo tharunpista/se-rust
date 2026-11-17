@@ -223,6 +223,7 @@ impl TeamRun {
             limits.budget_tokens,
             limits.review_reserve_tokens,
             |node| records.get(node).and_then(NodeRecord::tokens).unwrap_or(0),
+            limits.max_concurrent,
         );
         team.restore_claims(claims);
         runner.attach_team(team.clone());

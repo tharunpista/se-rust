@@ -10,9 +10,14 @@
 //!   review/evaluate nodes may spend, so ordinary work can never starve
 //!   the verification stage.
 //!
-//! shortcut: only the `write` and `edit` tools are claim-checked. A
-//! `shell` command can still write any file in the workspace; it is
-//! gated by human approval, not by claims.
+//! A `shell` command can write any file, beyond what claims can see, so
+//! it is refused in any node that can run at the same time as another
+//! (see [`TeamContext::shell_refused`]). Pipelines and runs with
+//! `max_concurrent: 1` keep it.
+//!
+//! shortcut: a sequential node's shell can still overwrite a file an
+//! earlier, unrelated node wrote; give each node its own git worktree if
+//! that ever matters.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -49,6 +54,9 @@ struct NodeInfo {
     /// A dependency of an evaluate node: runs unrouted when it names no
     /// agent, so every member of an ensemble gets the same packet.
     ensemble_member: bool,
+    /// Some other node is neither its ancestor nor its descendant, so the
+    /// two can run at once.
+    has_peer: bool,
 }
 
 #[derive(Debug, Default)]
@@ -81,6 +89,7 @@ impl TeamContext {
         limit_tokens: Option<u64>,
         review_reserve_tokens: u64,
         spent: impl Fn(&str) -> u64,
+        max_concurrent: usize,
     ) -> Self {
         let (mut spent_work, mut spent_review) = (0, 0);
         for n in graph.nodes() {
@@ -96,16 +105,28 @@ impl TeamContext {
             .filter(|n| n.kind == NodeKind::Evaluate)
             .flat_map(|n| n.deps.iter().map(String::as_str))
             .collect();
+        let anc: HashMap<&str, HashSet<String>> = graph
+            .nodes()
+            .iter()
+            .map(|n| (n.id.as_str(), ancestors(graph, &n.id)))
+            .collect();
         let nodes = graph
             .nodes()
             .iter()
             .map(|n| {
+                let has_peer = max_concurrent > 1
+                    && graph.nodes().iter().any(|m| {
+                        m.id != n.id
+                            && !anc[n.id.as_str()].contains(&m.id)
+                            && !anc[m.id.as_str()].contains(&n.id)
+                    });
                 (
                     n.id.clone(),
                     NodeInfo {
-                        ancestors: ancestors(graph, &n.id),
+                        ancestors: anc[n.id.as_str()].clone(),
                         kind: n.kind,
                         ensemble_member: evaluated.contains(n.id.as_str()),
+                        has_peer,
                     },
                 )
             })
@@ -138,6 +159,24 @@ impl TeamContext {
             .nodes
             .get(node)
             .is_some_and(|n| n.ensemble_member)
+    }
+
+    /// Why `node` may not run `shell`, if it may not: it can run at the
+    /// same time as another node, and a shell command's writes are
+    /// invisible to file claims.
+    pub fn shell_refused(&self, node: &str) -> Option<String> {
+        self.lock()
+            .nodes
+            .get(node)
+            .is_some_and(|n| n.has_peer)
+            .then(|| {
+                format!(
+                    "shell is disabled in task `{node}`: it can run at the same time as \
+                     another task, and a shell command's file writes cannot be checked \
+                     for conflicts. Use write/edit, make it depend on the other tasks, \
+                     or set max_concurrent: 1"
+                )
+            })
     }
 
     /// Whether `node` may write `path`, without claiming it. Checked
@@ -316,7 +355,32 @@ mod tests {
             node("review", &["schema", "api"], NodeKind::Review),
         ])
         .unwrap();
-        TeamContext::new(&graph, limit, reserve, |_| 0)
+        TeamContext::new(&graph, limit, reserve, |_| 0, 2)
+    }
+
+    #[test]
+    fn shell_is_refused_only_where_tasks_can_overlap() {
+        // plan -> {schema, api} -> review: only the two siblings overlap.
+        let c = ctx(None, 0);
+        assert!(c.shell_refused("plan").is_none());
+        assert!(c.shell_refused("review").is_none());
+        assert!(c
+            .shell_refused("schema")
+            .unwrap()
+            .contains("max_concurrent: 1"));
+        assert!(c.shell_refused("api").is_some());
+        let one_at_a_time = TeamContext::new(
+            &TaskGraph::new(vec![
+                node("a", &[], NodeKind::Work),
+                node("b", &[], NodeKind::Work),
+            ])
+            .unwrap(),
+            None,
+            0,
+            |_| 0,
+            1,
+        );
+        assert!(one_at_a_time.shell_refused("a").is_none());
     }
 
     #[test]
