@@ -189,10 +189,18 @@ fn interactive(cli: &Cli, startup: se_protocol::Running) -> io::Result<()> {
     let mut terminal = enter()?;
     // Restoration must survive a panic, or a crash leaves the user with
     // no echo and no cursor.
+    // A panic on a task's worker thread is reported by the engine as a
+    // failed task while the interface keeps running, so only a panic on
+    // this (the interface) thread may tear the screen down. Every panic is
+    // kept in `.se/crash.log`, because whatever reaches stderr while the
+    // alternate screen is up is lost.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = restore();
-        default_hook(info);
+        append_crash_log(info);
+        if std::thread::current().name() == Some("main") {
+            let _ = restore();
+            default_hook(info);
+        }
     }));
 
     // Whether this session will actually reach a model, decided once
@@ -574,6 +582,35 @@ fn providers() -> std::process::ExitCode {
 /// overridable by `SE_CATALOGUE_ROOT` for a different install layout.
 /// Attaches `.se/audit.jsonl` (every gateway decision, row 2.5). A file
 /// that cannot be opened is reported, not fatal, matching session logs.
+/// Appends one panic, with its thread and a backtrace, to
+/// `.se/crash.log`. Best effort: a crash report must never cause a
+/// second panic.
+fn append_crash_log(info: &std::panic::PanicHookInfo<'_>) {
+    use std::io::Write;
+    let Ok(dir) = std::env::current_dir().map(|d| d.join(".se")) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("crash.log"))
+    else {
+        return;
+    };
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let thread = std::thread::current();
+    let _ = writeln!(
+        file,
+        "--- se {} panic at unix {at} on thread `{}`\n{info}\n{}",
+        env!("CARGO_PKG_VERSION"),
+        thread.name().unwrap_or("unnamed"),
+        std::backtrace::Backtrace::force_capture()
+    );
+}
+
 /// Fail closed: with no writable audit log, tools are refused rather
 /// than run unrecorded, and the operator is told why.
 fn with_audit_log(runner: ProviderRunner) -> (ProviderRunner, Option<String>) {

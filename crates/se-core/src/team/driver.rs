@@ -852,8 +852,10 @@ mod tests {
     /// reaches the cap and never exceeds it.
     #[test]
     fn concurrency_never_exceeds_the_pool() {
-        for cap in [1, 3, 8] {
-            let nodes: Vec<NodeSpec> = (0..12)
+        // Row 4.7 asks for 8 and 32 streams, always with more ready
+        // tasks than slots.
+        for cap in [1, 3, 8, 32] {
+            let nodes: Vec<NodeSpec> = (0..(cap * 2).max(12))
                 .map(|i| node(&format!("n{i}"), "sleep:40", &[]))
                 .collect();
             let mock = Arc::new(MockRunner::default());
