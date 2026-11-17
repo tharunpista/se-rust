@@ -270,6 +270,13 @@ impl<'a> Gateway<'a> {
         Box::new(self.mint(req))
     }
 
+    /// Records that an `Ask` ended without approval: a human said no,
+    /// the task was cancelled, or the interface went away. Without this
+    /// the trail would show the question but never the answer.
+    pub fn refuse(&self, req: &Request) {
+        self.audit(req, Effect::Deny);
+    }
+
     fn audit(&self, req: &Request, effect: Effect) {
         self.audit.record(AuditRecord {
             agent_id: req.agent_id.clone(),

@@ -67,6 +67,17 @@ impl Rule {
         }
     }
 
+    /// Allows exactly `tool` on exactly `resource`, for any agent. How a
+    /// team file pre-approves the vendors it names (`use_provider`).
+    pub fn allow_tool_on(tool: impl Into<String>, resource: impl Into<String>) -> Self {
+        Self {
+            agent: Pattern::Any,
+            tool: Pattern::Exact(tool.into()),
+            resource: Pattern::Exact(resource.into()),
+            effect: Effect::Allow,
+        }
+    }
+
     pub fn allow_resource_prefix(agent: impl Into<String>, prefix: impl Into<String>) -> Self {
         Self {
             agent: Pattern::Exact(agent.into()),

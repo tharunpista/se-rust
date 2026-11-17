@@ -11,7 +11,9 @@ se-protocol = { path = "../se-protocol" }
 se-provider = { path = "../se-provider" }
 se-permission = { path = "../se-permission" }
 se-catalogue = { path = "../se-catalogue" }
+serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml_ng = "0.10"
 
 # Minimal, targeted addition for the tools module's OS-level file
 # identity resolver (SE_TARGET_ARCHITECTURE.md §3a: a tool must bind to

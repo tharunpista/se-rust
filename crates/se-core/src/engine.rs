@@ -15,7 +15,7 @@
 //! implementation had. The supervisor is always idle enough to listen.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,10 +48,12 @@ const UNPARK: ToolCallId = ToolCallId::from_raw(0);
 /// Why a submission was not accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitError {
-    /// A task is already running. SE runs one task per session in this
-    /// phase; the blueprint defers real concurrency until ownership and
-    /// worktree isolation exist, and pretending otherwise now would just
-    /// mean two workers writing the same files.
+    /// Every worker slot is taken. [`start`] has one slot, so the
+    /// interactive session still runs one task at a time: two workers
+    /// writing the same files is unsafe until file-conflict safety
+    /// (Phase 4 item 7) exists. [`start_pool`] widens the cap for callers
+    /// that own that risk, such as the team scheduler. `running` is one
+    /// of the occupying tasks.
     Busy { running: TaskId },
     /// The core has shut down.
     Stopped,
@@ -78,7 +80,9 @@ pub struct CoreHandle {
     session: SessionId,
     /// Mirrors the supervisor's view so `submit` can refuse locally
     /// rather than sending an operation that will be rejected anyway.
-    active: Arc<std::sync::Mutex<Option<TaskId>>>,
+    active: Arc<std::sync::Mutex<Vec<TaskId>>>,
+    /// The worker-pool size this core was started with.
+    max_concurrent: usize,
     /// `None` until [`CoreHandle::attach_session_log`] is called.
     /// Deliberately not set at [`start`] time: most tests, and any
     /// caller that has not decided where sessions live, must see
@@ -126,7 +130,7 @@ impl CoreHandle {
         text: &str,
         attachments: Vec<std::path::PathBuf>,
     ) -> Result<TaskId, SubmitError> {
-        self.submit_inner(text, attachments, None, None)
+        self.submit_inner(text, attachments, None, None, None)
     }
 
     /// Like [`CoreHandle::submit`], with an explicit per-turn model
@@ -140,7 +144,7 @@ impl CoreHandle {
         attachments: Vec<std::path::PathBuf>,
         model: Option<se_protocol::ModelRef>,
     ) -> Result<TaskId, SubmitError> {
-        self.submit_inner(text, attachments, model, None)
+        self.submit_inner(text, attachments, model, None, None)
     }
 
     /// Routes this turn through the specialist named by `id` (a
@@ -162,7 +166,36 @@ impl CoreHandle {
         text: &str,
         attachments: Vec<std::path::PathBuf>,
     ) -> Result<TaskId, SubmitError> {
-        self.submit_inner(text, attachments, None, Some(id.to_string()))
+        self.submit_inner(text, attachments, None, Some(id.to_string()), None)
+    }
+
+    /// [`CoreHandle::submit_specialist`] with a per-turn model override.
+    pub fn submit_specialist_with_model(
+        &self,
+        id: &str,
+        text: &str,
+        attachments: Vec<std::path::PathBuf>,
+        model: Option<se_protocol::ModelRef>,
+    ) -> Result<TaskId, SubmitError> {
+        self.submit_inner(text, attachments, model, Some(id.to_string()), None)
+    }
+
+    /// Submits one node of a team run. `specialist` `None` lets the
+    /// runner pick one; the turn is marked as scheduled work.
+    pub fn submit_team_node(
+        &self,
+        node: &str,
+        specialist: Option<&str>,
+        text: &str,
+        model: Option<se_protocol::ModelRef>,
+    ) -> Result<TaskId, SubmitError> {
+        self.submit_inner(
+            text,
+            Vec::new(),
+            model,
+            specialist.map(str::to_string),
+            Some(node.to_string()),
+        )
     }
 
     fn submit_inner(
@@ -171,19 +204,19 @@ impl CoreHandle {
         attachments: Vec<std::path::PathBuf>,
         model: Option<se_protocol::ModelRef>,
         specialist_id: Option<String>,
+        team_node: Option<String>,
     ) -> Result<TaskId, SubmitError> {
-        {
-            let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(running) = *active {
-                return Err(SubmitError::Busy { running });
-            }
-        }
         // Allocated here and carried in the operation, so the id the
         // caller receives is the id every event about this task uses.
         let task = TaskId::next();
         {
+            // Check and reserve under one lock, so two callers cannot
+            // both see the last free slot.
             let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-            *active = Some(task);
+            if active.len() >= self.max_concurrent {
+                return Err(SubmitError::Busy { running: active[0] });
+            }
+            active.push(task);
         }
         let turn = UserTurn {
             session: self.session,
@@ -192,13 +225,18 @@ impl CoreHandle {
             attachments,
             model,
             specialist_id,
+            team_node,
         };
         if self.ops.send(CoreOp::SubmitUserTurn(turn)).is_err() {
-            let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-            *active = None;
+            self.release(task);
             return Err(SubmitError::Stopped);
         }
         Ok(task)
+    }
+
+    fn release(&self, task: TaskId) {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        active.retain(|t| *t != task);
     }
 
     /// Requests cancellation of a running task.
@@ -226,8 +264,7 @@ impl CoreHandle {
         // there is nothing more to hand the interface this tick.
         while let Ok(event) = self.events.try_recv() {
             if event.is_terminal() {
-                let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-                *active = None;
+                self.release(event.task);
             }
             self.persist(&event);
             out.push(event);
@@ -244,8 +281,7 @@ impl CoreHandle {
         match self.events.recv_timeout(timeout) {
             Ok(first) => {
                 if first.is_terminal() {
-                    let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-                    *active = None;
+                    self.release(first.task);
                 }
                 self.persist(&first);
                 let mut out = vec![first];
@@ -258,30 +294,37 @@ impl CoreHandle {
 
     /// Whether a task is currently running, from the interface's view.
     pub fn is_busy(&self) -> bool {
-        self.active
+        !self
+            .active
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .is_some()
+            .is_empty()
     }
 }
 
-/// The conversation so far, shared between the supervisor and the one
-/// worker that may be running.
+/// The session transcript: completed user/assistant exchanges only.
 ///
-/// A mutex rather than message-passing because only one task runs at a
-/// time, so it is uncontended, and because the alternative -- the
-/// supervisor reading the event stream to learn what was said -- would
-/// make the transcript's correctness depend on the supervisor keeping up
-/// with it. The lock is never held across a model call: a worker takes a
-/// snapshot, releases, and appends once at the end.
-type History = Arc<std::sync::Mutex<Vec<Message>>>;
+/// Shared on purpose: it is the conversation the user sees, not task
+/// state. What E8 calls "per-task history" -- a task's own in-flight
+/// messages, tool calls and results -- never lives here; it stays local
+/// to the runner's loop. A worker snapshots this before its model call
+/// and appends its exchange as one locked push of both messages, so
+/// concurrent tasks can never interleave half an exchange.
+/// `None` for an isolated pool: each task starts from nothing and
+/// leaves nothing behind (see [`start_isolated_pool`]).
+type History = Option<Arc<std::sync::Mutex<Vec<Message>>>>;
 
 /// A task the supervisor is tracking.
 struct ActiveTask {
     id: TaskId,
     cancelled: Arc<AtomicBool>,
-    approvals: SyncSender<(ToolCallId, bool)>,
+    approvals: Sender<(ToolCallId, bool)>,
     worker: Option<std::thread::JoinHandle<()>>,
+    /// Set by the worker just before it emits `TaskFinished`. Admission
+    /// counts only unfinished tasks: once the interface has drained the
+    /// terminal event it may submit again, possibly before this thread
+    /// has exited and been reaped, and that must not be refused.
+    finished: Arc<AtomicBool>,
 }
 
 /// Starts the core and returns the interface's handle.
@@ -293,19 +336,54 @@ struct ActiveTask {
 /// interface, which is the test of whether this boundary was drawn in
 /// the right place.
 pub fn start<R: Runner>(runner: R) -> CoreHandle {
+    start_pool(runner, 1)
+}
+
+/// Starts a core that runs up to `max_concurrent` tasks at once, each on
+/// its own worker thread, with interrupts and approvals routed by task id
+/// (E8). Panics if `max_concurrent` is zero, which could never run
+/// anything.
+///
+/// shortcut: one global cap only. Per-provider/account semaphores need
+/// the runner to choose a provider per turn (Phase 2a item 6), and today
+/// a core has exactly one provider, so a per-provider cap would equal
+/// this one. Add them when the runner is registry-backed.
+pub fn start_pool<R: Runner>(runner: R, max_concurrent: usize) -> CoreHandle {
+    start_with(runner, max_concurrent, true)
+}
+
+/// Like [`start_pool`], but no task sees or extends a shared transcript.
+/// For scheduled team work: one task's finished output must never reach
+/// another task as conversation it appears to have had (Phase 4 item 1).
+pub fn start_isolated_pool<R: Runner>(runner: R, max_concurrent: usize) -> CoreHandle {
+    start_with(runner, max_concurrent, false)
+}
+
+fn start_with<R: Runner>(runner: R, max_concurrent: usize, shared_history: bool) -> CoreHandle {
+    assert!(max_concurrent > 0, "a worker pool needs at least one slot");
     let (op_tx, op_rx) = sync_channel(OP_QUEUE);
     let (event_tx, event_rx) = sync_channel(EVENT_QUEUE);
     let session = SessionId::next();
-    let active = Arc::new(std::sync::Mutex::new(None));
+    let active = Arc::new(std::sync::Mutex::new(Vec::new()));
 
     let runner = Arc::new(runner);
     let seq = Arc::new(SeqCounter::new());
     let supervisor_events = event_tx.clone();
-    let history: History = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let history: History = shared_history.then(|| Arc::new(std::sync::Mutex::new(Vec::new())));
 
     std::thread::Builder::new()
         .name("se-supervisor".to_string())
-        .spawn(move || supervise(op_rx, supervisor_events, runner, seq, session, history))
+        .spawn(move || {
+            supervise(
+                op_rx,
+                supervisor_events,
+                runner,
+                seq,
+                session,
+                history,
+                max_concurrent,
+            )
+        })
         .expect("spawning the supervisor thread");
 
     CoreHandle {
@@ -313,8 +391,17 @@ pub fn start<R: Runner>(runner: R) -> CoreHandle {
         events: event_rx,
         session,
         active,
+        max_concurrent,
         session_log: Arc::new(std::sync::Mutex::new(None)),
     }
+}
+
+/// Wakes a worker parked on an approval so it re-checks cancellation.
+fn cancel(task: &ActiveTask) {
+    task.cancelled.store(true, Ordering::SeqCst);
+    // `UNPARK` matches no real call, so the worker loops once, sees the
+    // flag and unwinds.
+    let _ = task.approvals.send((UNPARK, false));
 }
 
 fn supervise<R: Runner>(
@@ -324,8 +411,9 @@ fn supervise<R: Runner>(
     seq: Arc<SeqCounter>,
     session: SessionId,
     history: History,
+    max_concurrent: usize,
 ) {
-    let mut current: Option<ActiveTask> = None;
+    let mut running: Vec<ActiveTask> = Vec::new();
 
     loop {
         // A timeout rather than a blocking receive so finished workers
@@ -337,37 +425,43 @@ fn supervise<R: Runner>(
             Err(RecvTimeoutError::Disconnected) => break,
         };
 
-        if let Some(task) = current.as_mut() {
-            if task.worker.as_ref().is_some_and(|w| w.is_finished()) {
-                if let Some(worker) = task.worker.take() {
-                    // A panicking worker is reported, not swallowed: the
-                    // task must still reach a terminal state (I5). The
-                    // worker emits its own `TaskFinished` on the normal
-                    // paths, so this covers only the abnormal one.
-                    if worker.join().is_err() {
-                        let _ = events.send(CoreEvent {
-                            seq: seq.next(),
-                            session,
-                            task: task.id,
-                            turn: None,
-                            payload: Payload::TaskFinished {
-                                outcome: Outcome::Failed {
-                                    detail: "the task worker stopped unexpectedly".to_string(),
-                                },
-                                timings: se_protocol::Timings::default(),
-                            },
-                        });
-                    }
-                }
-                current = None;
+        running.retain_mut(|task| {
+            if !task.worker.as_ref().is_some_and(|w| w.is_finished()) {
+                return true;
             }
-        }
+            if let Some(worker) = task.worker.take() {
+                // A panicking worker is reported, not swallowed: the
+                // task must still reach a terminal state (I5). The
+                // worker emits its own `TaskFinished` on the normal
+                // paths, so this covers only the abnormal one.
+                if worker.join().is_err() {
+                    let _ = events.send(CoreEvent {
+                        seq: seq.next(),
+                        session,
+                        task: task.id,
+                        turn: None,
+                        payload: Payload::TaskFinished {
+                            outcome: Outcome::Failed {
+                                detail: "the task worker stopped unexpectedly".to_string(),
+                            },
+                            timings: se_protocol::Timings::default(),
+                        },
+                    });
+                }
+            }
+            false
+        });
 
         let Some(op) = op else { continue };
 
         match op {
             CoreOp::SubmitUserTurn(turn) => {
-                if let Some(running) = &current {
+                let occupied: Vec<&ActiveTask> = running
+                    .iter()
+                    .filter(|t| !t.finished.load(Ordering::SeqCst))
+                    .collect();
+                if occupied.len() >= max_concurrent {
+                    let busy = occupied[0];
                     // The handle refuses first, so this is the narrow
                     // window where it believed the previous task was
                     // over (its terminal event had been drained) while
@@ -387,7 +481,7 @@ fn supervise<R: Runner>(
                             outcome: Outcome::Failed {
                                 detail: format!(
                                     "task {} was still running; nothing was sent",
-                                    running.id
+                                    busy.id
                                 ),
                             },
                             timings: se_protocol::Timings::default(),
@@ -397,7 +491,13 @@ fn supervise<R: Runner>(
                 }
                 let id = turn.task;
                 let cancelled = Arc::new(AtomicBool::new(false));
-                let (approval_tx, approval_rx) = sync_channel(1);
+                // Unbounded on purpose (E9, row 4.9): a 1-slot channel with
+                // `try_send` silently dropped a real decision whenever a stray
+                // duplicate still occupied the slot, hanging the task. Decisions
+                // arrive at human speed and the worker discards mismatches, so
+                // the queue cannot grow meaningfully.
+                let (approval_tx, approval_rx) = channel();
+                let finished = Arc::new(AtomicBool::new(false));
                 let worker = spawn_worker(
                     id,
                     session,
@@ -408,45 +508,37 @@ fn supervise<R: Runner>(
                     cancelled.clone(),
                     approval_rx,
                     history.clone(),
+                    finished.clone(),
                 );
-                current = Some(ActiveTask {
+                running.push(ActiveTask {
                     id,
                     cancelled,
                     approvals: approval_tx,
                     worker: Some(worker),
+                    finished,
                 });
             }
+            // E8: both route by task id. A stale interrupt or decision
+            // for a task that is gone matches nothing and is dropped; it
+            // can never land on whichever task happens to be running.
             CoreOp::Interrupt { task: target } => {
-                // E8: a stale `Interrupt` for a task that already
-                // finished must never cancel whatever task is current
-                // now. With one task running at a time this is the
-                // only form the defect can take here -- the real
-                // multi-task version (several `ActiveTask`s, not one)
-                // is Phase 4's worker pool -- but the id check costs
-                // nothing and closes it today rather than leaving it
-                // for whenever that pool exists.
-                if let Some(task) = &current {
-                    if task.id == target {
-                        task.cancelled.store(true, Ordering::SeqCst);
-                        // A worker parked on approval would never see
-                        // the flag. `UNPARK` matches no real call, so
-                        // the worker loops once, re-checks
-                        // cancellation and unwinds.
-                        let _ = task.approvals.try_send((UNPARK, false));
-                    }
+                if let Some(task) = running.iter().find(|t| t.id == target) {
+                    cancel(task);
                 }
             }
-            CoreOp::Approve(ApprovalDecision { call, allow }) => {
-                if let Some(task) = &current {
-                    // The call id travels with the decision so the
-                    // worker can reject one meant for anything else.
-                    let _ = task.approvals.try_send((call, allow));
+            CoreOp::Approve(ApprovalDecision { task, call, allow }) => {
+                if let Some(task) = running.iter().find(|t| t.id == task) {
+                    // The worker still compares the call id, so a stale
+                    // decision for an earlier call in the same task is
+                    // rejected there.
+                    let _ = task.approvals.send((call, allow));
                 }
             }
             CoreOp::Shutdown => {
-                if let Some(task) = &mut current {
-                    task.cancelled.store(true, Ordering::SeqCst);
-                    let _ = task.approvals.try_send((UNPARK, false));
+                // Signal every task before joining any, so they unwind
+                // in parallel rather than one after another.
+                running.iter().for_each(cancel);
+                for task in &mut running {
                     if let Some(worker) = task.worker.take() {
                         let _ = worker.join();
                     }
@@ -468,6 +560,7 @@ fn spawn_worker<R: Runner>(
     cancelled: Arc<AtomicBool>,
     approvals: Receiver<(ToolCallId, bool)>,
     history: History,
+    finished: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name(format!("se-task-{id}"))
@@ -486,7 +579,10 @@ fn spawn_worker<R: Runner>(
 
             // A snapshot, taken and released before the model call so
             // the lock is never held across it.
-            let prior: Vec<Message> = history.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let prior: Vec<Message> = history
+                .as_ref()
+                .map(|h| h.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .unwrap_or_default();
 
             let outcome = runner.run(&turn, &prior, &mut sink);
 
@@ -502,7 +598,7 @@ fn spawn_worker<R: Runner>(
             // The conversation grows only on a real answer. A cancelled
             // or failed turn leaves no half-exchange behind to confuse
             // the next one.
-            if let Outcome::Completed { final_text } = &outcome {
+            if let (Outcome::Completed { final_text }, Some(history)) = (&outcome, &history) {
                 let mut conversation = history.lock().unwrap_or_else(|e| e.into_inner());
                 conversation.push(Message::text(Role::User, turn.text.clone()));
                 conversation.push(Message::text(Role::Assistant, final_text.clone()));
@@ -520,6 +616,7 @@ fn spawn_worker<R: Runner>(
                 duration: elapsed.duration.saturating_sub(waited),
             });
 
+            finished.store(true, Ordering::SeqCst);
             let _ = sink.emit(Payload::TaskFinished { outcome, timings });
         })
         .expect("spawning a task worker thread")
@@ -865,6 +962,7 @@ mod tests {
                     Payload::ApprovalRequired { call, .. } => {
                         approval_required_call = Some(*call);
                         handle.approve(se_protocol::ApprovalDecision {
+                            task: event.task,
                             call: *call,
                             allow: true,
                         });
@@ -912,6 +1010,7 @@ mod tests {
                             // second decision for the same call -- what
                             // a user hammering `y` produces.
                             handle.approve(se_protocol::ApprovalDecision {
+                                task: event.task,
                                 call: *call,
                                 allow: true,
                             });
@@ -920,6 +1019,7 @@ mod tests {
                             // waiting for a decision.
                             std::thread::sleep(Duration::from_millis(40));
                             handle.approve(se_protocol::ApprovalDecision {
+                                task: event.task,
                                 call: *call,
                                 allow: true,
                             });
@@ -930,6 +1030,7 @@ mod tests {
                             // stray decision above. Deny it.
                             assert_eq!(name, "second_tool");
                             handle.approve(se_protocol::ApprovalDecision {
+                                task: event.task,
                                 call: *call,
                                 allow: false,
                             });
@@ -1039,12 +1140,247 @@ mod admission {
                     "round {round}: the accepted submission never finished"
                 );
                 for event in handle.drain_blocking(Duration::from_millis(20)) {
-                    if event.is_terminal() {
+                    if let Payload::TaskFinished { outcome, .. } = &event.payload {
+                        // Accepted means it runs: a worker that had
+                        // already reported must not still occupy the slot.
+                        assert!(
+                            matches!(outcome, Outcome::Completed { .. }),
+                            "round {round}: an accepted submission was refused: {outcome:?}"
+                        );
                         finished = true;
                     }
                 }
             }
         }
+        handle.shutdown();
+    }
+
+    /// Drains until `done` says stop, failing loudly on timeout.
+    fn drain_until(
+        handle: &CoreHandle,
+        limit: Duration,
+        mut done: impl FnMut(&CoreEvent) -> bool,
+    ) -> Vec<CoreEvent> {
+        let deadline = std::time::Instant::now() + limit;
+        let mut all = Vec::new();
+        while std::time::Instant::now() < deadline {
+            for event in handle.drain_blocking(Duration::from_millis(20)) {
+                let stop = done(&event);
+                all.push(event);
+                if stop {
+                    return all;
+                }
+            }
+        }
+        panic!("condition not reached within {limit:?}; got {all:?}");
+    }
+
+    /// Verification row 4.8 (E8). Two tasks are both parked on approval.
+    /// Approving A must run only A's call; B must still be waiting, not
+    /// approved by A's decision and not executed.
+    #[test]
+    fn approving_one_task_never_runs_another_tasks_waiting_call() {
+        let handle = start_pool(crate::runner::ApprovalRunner { tool: "run_shell" }, 2);
+        let a = handle.submit("a", vec![]).unwrap();
+        let b = handle.submit("b", vec![]).unwrap();
+
+        let mut waiting = std::collections::HashMap::new();
+        drain_until(&handle, Duration::from_secs(5), |e| {
+            if let Payload::ApprovalRequired { call, .. } = &e.payload {
+                waiting.insert(e.task, *call);
+            }
+            waiting.len() == 2
+        });
+
+        handle.approve(ApprovalDecision {
+            task: a,
+            call: waiting[&a],
+            allow: true,
+        });
+        let after = drain_until(&handle, Duration::from_secs(5), |e| {
+            e.task == a && e.is_terminal()
+        });
+
+        // The negative case is the whole test.
+        assert!(
+            after.iter().all(|e| e.task != b),
+            "task B must emit nothing while still waiting; got {after:?}"
+        );
+        assert!(
+            after
+                .iter()
+                .any(|e| e.task == a && matches!(e.payload, Payload::ToolCompleted { .. })),
+            "task A's approved call must have run"
+        );
+        assert!(handle.is_busy(), "B still occupies a slot");
+
+        handle.approve(ApprovalDecision {
+            task: b,
+            call: waiting[&b],
+            allow: false,
+        });
+        let rest = drain_until(&handle, Duration::from_secs(5), |e| {
+            e.task == b && e.is_terminal()
+        });
+        assert!(
+            !rest
+                .iter()
+                .any(|e| matches!(e.payload, Payload::ToolCompleted { .. })),
+            "B was denied, so its call must not have run"
+        );
+        handle.shutdown();
+    }
+
+    /// E8, interrupt half: interrupting A leaves B running to completion.
+    #[test]
+    fn interrupting_one_task_leaves_the_other_running() {
+        let handle = start_pool(EchoRunner::slow(Duration::from_millis(20), 10), 2);
+        let a = handle.submit("aaaa", vec![]).unwrap();
+        let b = handle.submit("bbbb", vec![]).unwrap();
+        handle.interrupt(a);
+
+        let mut outcomes = std::collections::HashMap::new();
+        drain_until(&handle, Duration::from_secs(5), |e| {
+            if let Payload::TaskFinished { outcome, .. } = &e.payload {
+                outcomes.insert(e.task, outcome.clone());
+            }
+            outcomes.len() == 2
+        });
+        assert_eq!(outcomes[&a], Outcome::Cancelled);
+        assert!(
+            matches!(outcomes[&b], Outcome::Completed { .. }),
+            "B must not be cancelled by A's interrupt; got {:?}",
+            outcomes[&b]
+        );
+        handle.shutdown();
+    }
+
+    /// Verification row 4.1: overlap proven from event order, not
+    /// wall-clock. B starts before A finishes.
+    #[test]
+    fn two_tasks_in_a_pool_overlap() {
+        let handle = start_pool(EchoRunner::slow(Duration::from_millis(20), 10), 2);
+        let a = handle.submit("aaaa", vec![]).unwrap();
+        let b = handle.submit("bbbb", vec![]).unwrap();
+
+        let mut finished = 0;
+        let events = drain_until(&handle, Duration::from_secs(5), |e| {
+            if e.is_terminal() {
+                finished += 1;
+            }
+            finished == 2
+        });
+        let pos = |task, started: bool| {
+            events
+                .iter()
+                .position(|e| {
+                    e.task == task
+                        && if started {
+                            matches!(e.payload, Payload::TaskStarted { .. })
+                        } else {
+                            e.is_terminal()
+                        }
+                })
+                .unwrap()
+        };
+        assert!(
+            pos(b, true) < pos(a, false),
+            "B must start before A finishes"
+        );
+        assert!(
+            pos(a, true) < pos(b, false),
+            "A must start before B finishes"
+        );
+        handle.shutdown();
+    }
+
+    #[test]
+    fn a_full_pool_refuses_the_next_submission() {
+        let handle = start_pool(EchoRunner::slow(Duration::from_millis(50), 50), 2);
+        let a = handle.submit("a", vec![]).unwrap();
+        handle.submit("b", vec![]).unwrap();
+        assert_eq!(
+            handle.submit("c", vec![]),
+            Err(SubmitError::Busy { running: a })
+        );
+        handle.shutdown();
+    }
+
+    /// Announces a call, then holds off waiting until the test opens the
+    /// gate, so the test controls exactly when the worker parks.
+    struct GatedApprovalRunner {
+        gate: std::sync::Mutex<Receiver<()>>,
+    }
+
+    impl Runner for GatedApprovalRunner {
+        fn describe(&self) -> (String, String) {
+            ("test".to_string(), "gated".to_string())
+        }
+        fn run(&self, _turn: &UserTurn, _history: &[Message], sink: &mut TurnSink) -> Outcome {
+            let Some(call) = sink.announce_approval("gated_tool", "x") else {
+                return Outcome::Failed {
+                    detail: "disconnected".into(),
+                };
+            };
+            let _ = self.gate.lock().unwrap().recv();
+            let allowed = sink.await_decision(call, "gated_tool").is_some();
+            Outcome::Completed {
+                final_text: format!("allowed={allowed}"),
+            }
+        }
+    }
+
+    /// Verification row 4.9 (E9), forced deterministically rather than
+    /// by looping: three stray decisions and then the real one are all
+    /// delivered *before* the worker parks. The old 1-slot channel kept
+    /// the first stray and silently dropped the rest, the real answer
+    /// included, so the worker waited forever.
+    #[test]
+    fn a_reply_delivered_before_the_worker_parks_is_still_observed() {
+        let (open_gate, gate) = sync_channel(1);
+        let handle = start(GatedApprovalRunner {
+            gate: std::sync::Mutex::new(gate),
+        });
+        let task = handle.submit("go", vec![]).unwrap();
+
+        let mut call = None;
+        drain_until(&handle, Duration::from_secs(5), |e| {
+            if let Payload::ApprovalRequired { call: c, .. } = &e.payload {
+                call = Some(*c);
+            }
+            call.is_some()
+        });
+        let call = call.unwrap();
+
+        for _ in 0..3 {
+            handle.approve(ApprovalDecision {
+                task,
+                call: ToolCallId::from_raw(u64::MAX),
+                allow: true,
+            });
+        }
+        handle.approve(ApprovalDecision {
+            task,
+            call,
+            allow: true,
+        });
+        // Lets the supervisor forward all four before the worker parks.
+        // If it were ever slower, this test loses detection power but
+        // can never fail falsely: the correct code passes either way.
+        std::thread::sleep(Duration::from_millis(100));
+        open_gate.send(()).unwrap();
+
+        let events = drain_until(&handle, Duration::from_secs(5), |e| e.is_terminal());
+        let outcome = events.iter().find_map(|e| match &e.payload {
+            Payload::TaskFinished { outcome, .. } => Some(outcome.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            outcome,
+            Some(Outcome::Completed {
+                final_text: "allowed=true".into()
+            })
+        );
         handle.shutdown();
     }
 }

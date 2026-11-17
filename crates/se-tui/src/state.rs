@@ -99,6 +99,9 @@ pub struct AppState {
     /// A persistent warning shown above the transcript, e.g. that no
     /// model is connected and replies are a local echo rather than AI.
     pub banner: Option<String>,
+    /// The model chosen with `/models <provider>/<model>` for this
+    /// session; `None` means the runner's configured default.
+    pub model_override: Option<se_protocol::ModelRef>,
     /// Lines scrolled back from the newest. 0 pins to the latest.
     pub scroll: u16,
     /// Total wrapped rows the transcript last occupied, and the viewport
@@ -133,6 +136,7 @@ impl Default for AppState {
             status: String::new(),
             should_quit: false,
             banner: None,
+            model_override: None,
             scroll: 0,
             last_total_rows: 0,
             last_viewport_rows: 0,
@@ -314,6 +318,12 @@ impl AppState {
             }
             Payload::TurnStarted { provider, model } => {
                 self.status = format!("{provider} · {model}");
+                // A pre-turn approval (a specialist's `use_provider`) has
+                // no tool lifecycle after it; the turn starting is the
+                // proof it was answered.
+                if let Activity::AwaitingApproval { task, .. } = self.activity {
+                    self.activity = Activity::Working { task };
+                }
             }
             // The invocation-provenance record (Phase 3 item 4): which
             // agent, and the content hash of the exact definition that
@@ -881,5 +891,36 @@ mod tests {
             kept.of(se_protocol::Stage::Generation),
             Some(std::time::Duration::from_millis(42))
         );
+    }
+
+    /// A pre-turn provider approval has no tool lifecycle; once the turn
+    /// starts the interface must stop showing an approval prompt.
+    #[test]
+    fn an_approved_provider_prompt_clears_when_the_turn_starts() {
+        let mut app = AppState::new();
+        app.apply(&ev(
+            0,
+            Payload::TaskStarted {
+                request: "hi".into(),
+            },
+        ));
+        app.apply(&ev(
+            1,
+            Payload::ApprovalRequired {
+                call: ToolCallId::from_raw(9),
+                name: "use_provider".into(),
+                summary: "spec wants to use beta/m".into(),
+            },
+        ));
+        assert!(app.awaiting_approval().is_some());
+        app.apply(&ev(
+            2,
+            Payload::TurnStarted {
+                provider: "beta".into(),
+                model: "m".into(),
+            },
+        ));
+        assert_eq!(app.awaiting_approval(), None);
+        assert!(app.is_busy(), "the turn is now running");
     }
 }

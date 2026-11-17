@@ -96,10 +96,31 @@ pub struct Service {
     /// and an `Authorization: Bearer <nonsense>` header sent to a
     /// server that does not want one is worse than sending none.
     pub key_required: bool,
+    /// Which request/stream format the service speaks.
+    pub wire: Wire,
+}
+
+/// The two wire formats SE speaks. Everything else about a service --
+/// origin pinning, no redirects, redaction, timeouts -- is shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wire {
+    /// `/chat/completions`, `Authorization: Bearer`.
+    OpenAi,
+    /// Anthropic's `/messages`, `x-api-key` + `anthropic-version`.
+    Anthropic,
 }
 
 /// The services SE registers.
 pub const CATALOGUE: &[Service] = &[
+    Service {
+        id: "anthropic",
+        display_name: "Anthropic (Claude)",
+        key_var: "ANTHROPIC_API_KEY",
+        default_base_url: "https://api.anthropic.com/v1",
+        base_url_var: "ANTHROPIC_BASE_URL",
+        key_required: true,
+        wire: Wire::Anthropic,
+    },
     Service {
         id: "nvidia",
         display_name: "NVIDIA NIM",
@@ -107,6 +128,7 @@ pub const CATALOGUE: &[Service] = &[
         default_base_url: "https://integrate.api.nvidia.com/v1",
         base_url_var: "NVIDIA_BASE_URL",
         key_required: true,
+        wire: Wire::OpenAi,
     },
     Service {
         id: "openai",
@@ -115,6 +137,7 @@ pub const CATALOGUE: &[Service] = &[
         default_base_url: "https://api.openai.com/v1",
         base_url_var: "OPENAI_BASE_URL",
         key_required: true,
+        wire: Wire::OpenAi,
     },
     Service {
         id: "gemini",
@@ -123,6 +146,7 @@ pub const CATALOGUE: &[Service] = &[
         default_base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
         base_url_var: "GEMINI_BASE_URL",
         key_required: true,
+        wire: Wire::OpenAi,
     },
     Service {
         id: "openrouter",
@@ -131,6 +155,7 @@ pub const CATALOGUE: &[Service] = &[
         default_base_url: "https://openrouter.ai/api/v1",
         base_url_var: "OPENROUTER_BASE_URL",
         key_required: true,
+        wire: Wire::OpenAi,
     },
     Service {
         id: "deepseek",
@@ -139,6 +164,7 @@ pub const CATALOGUE: &[Service] = &[
         default_base_url: "https://api.deepseek.com/v1",
         base_url_var: "DEEPSEEK_BASE_URL",
         key_required: true,
+        wire: Wire::OpenAi,
     },
     Service {
         id: "groq",
@@ -147,6 +173,7 @@ pub const CATALOGUE: &[Service] = &[
         default_base_url: "https://api.groq.com/openai/v1",
         base_url_var: "GROQ_BASE_URL",
         key_required: true,
+        wire: Wire::OpenAi,
     },
     Service {
         id: "ollama",
@@ -155,6 +182,7 @@ pub const CATALOGUE: &[Service] = &[
         default_base_url: "http://localhost:11434/v1",
         base_url_var: "OLLAMA_BASE_URL",
         key_required: false,
+        wire: Wire::OpenAi,
     },
     Service {
         id: "custom",
@@ -163,6 +191,7 @@ pub const CATALOGUE: &[Service] = &[
         default_base_url: "",
         base_url_var: "SE_CUSTOM_BASE_URL",
         key_required: true,
+        wire: Wire::OpenAi,
     },
 ];
 
@@ -305,6 +334,24 @@ impl OpenAiCompatible {
     /// origin than `url` resolves to (E2). Called with the exact URL a
     /// request is about to be sent to, after `key_or_error` -- a
     /// keyless service has nothing pinned and this is always `Ok`.
+    /// Attaches the credential the way this service's wire format wants.
+    fn authorize(
+        &self,
+        request: ureq::Request,
+        key: Option<&credentials::HeaderSafeKey>,
+    ) -> ureq::Request {
+        match (self.service.wire, key) {
+            (Wire::Anthropic, Some(key)) => request
+                .set("x-api-key", key.as_header_value())
+                .set("anthropic-version", crate::anthropic::API_VERSION),
+            (Wire::Anthropic, None) => {
+                request.set("anthropic-version", crate::anthropic::API_VERSION)
+            }
+            (Wire::OpenAi, Some(key)) => request.set("Authorization", &key.as_bearer()),
+            (Wire::OpenAi, None) => request,
+        }
+    }
+
     fn check_pinned_origin(&self, url: &str) -> Result<(), ProviderError> {
         if self.fixed_key.is_some() {
             // Test-only construction, never touches the keyring.
@@ -619,7 +666,12 @@ impl ModelProvider for OpenAiCompatible {
         on_event: &mut dyn FnMut(StreamEvent) -> bool,
     ) -> Result<(), ProviderError> {
         let key = self.key_or_error()?;
-        let url = self.endpoint("/chat/completions")?;
+        let anthropic = self.service.wire == Wire::Anthropic;
+        let url = self.endpoint(if anthropic {
+            "/messages"
+        } else {
+            "/chat/completions"
+        })?;
         self.check_pinned_origin(&url)?;
 
         let messages: Vec<serde_json::Value> = request
@@ -693,17 +745,19 @@ impl ModelProvider for OpenAiCompatible {
             body["tools"] = serde_json::Value::Array(tools);
         }
 
+        if anthropic {
+            body = crate::anthropic::request_body(request);
+        }
+
         if cancelled() {
             return Err(ProviderError::Cancelled);
         }
 
-        let mut request = agent()
+        let request = agent()
             .post(&url)
             .set("Content-Type", "application/json")
             .set("Accept", "text/event-stream");
-        if let Some(key) = &key {
-            request = request.set("Authorization", &key.as_bearer());
-        }
+        let request = self.authorize(request, key.as_ref());
         let response = request.send_json(body);
 
         let response = match response {
@@ -730,6 +784,7 @@ impl ModelProvider for OpenAiCompatible {
         // fragments for the same tool-call index join up correctly no
         // matter how many lines they are split across.
         let mut tool_call_accumulator = ToolCallAccumulator::new();
+        let mut anthropic_state = crate::anthropic::StreamState::default();
         loop {
             if cancelled() {
                 // Dropping the reader closes the connection, so the
@@ -767,7 +822,12 @@ impl ModelProvider for OpenAiCompatible {
                 // Comments, event names and blank separators.
                 continue;
             };
-            for event in parse_stream_frame_with_tools(payload, &mut tool_call_accumulator) {
+            let events = if anthropic {
+                crate::anthropic::parse_frame(payload, &mut anthropic_state)
+            } else {
+                parse_stream_frame_with_tools(payload, &mut tool_call_accumulator)
+            };
+            for event in events {
                 match event {
                     StreamEvent::Done => {
                         on_event(StreamEvent::Done);
@@ -828,11 +888,8 @@ impl ModelProvider for OpenAiCompatible {
         let key = self.key_or_error()?;
         let url = self.endpoint("/models")?;
         self.check_pinned_origin(&url)?;
-        let mut request = agent().get(&url).timeout(METADATA_TIMEOUT);
-        if let Some(key) = &key {
-            request = request.set("Authorization", &key.as_bearer());
-        }
-        let response = request.call();
+        let request = agent().get(&url).timeout(METADATA_TIMEOUT);
+        let response = self.authorize(request, key.as_ref()).call();
 
         let body: serde_json::Value = match response {
             Ok(r) => r.into_json().map_err(|e| {
@@ -1113,6 +1170,7 @@ mod tests {
         default_base_url: "",
         base_url_var: "SE_TEST_MOCK_BASE_URL",
         key_required: true,
+        wire: Wire::OpenAi,
     };
 
     /// Serves one HTTP response and records the request body it read.
@@ -1159,6 +1217,45 @@ mod tests {
             }
         });
         (format!("http://{addr}"), requests)
+    }
+
+    /// The Claude path through the real HTTP client: `/messages`, the
+    /// key in `x-api-key` (never as a Bearer token), the version header,
+    /// Anthropic's body, and its stream parsed into SE's events.
+    #[test]
+    fn anthropic_wire_sends_its_own_headers_and_parses_its_stream() {
+        const BODY: &str = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi there\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (base, requests) = serve("HTTP/1.1 200 OK", "text/event-stream", BODY);
+        let service = Service {
+            wire: Wire::Anthropic,
+            ..TEST_SERVICE
+        };
+        let p = OpenAiCompatible::with_fixed(service, "sk-ant-test", &base);
+        let mut req = request();
+        req.messages.insert(0, Message::text(Role::System, "sys"));
+        let events = collect(&p, &req);
+        assert!(
+            events.contains(&StreamEvent::TextDelta("Hi there".into())),
+            "{events:?}"
+        );
+        assert_eq!(events.last(), Some(&StreamEvent::Done));
+
+        let sent = requests.lock().unwrap()[0].clone();
+        let lower = sent.to_ascii_lowercase();
+        assert!(sent.starts_with("POST /messages"), "{sent}");
+        assert!(lower.contains("x-api-key: sk-ant-test"), "{sent}");
+        assert!(lower.contains("anthropic-version: 2023-06-01"), "{sent}");
+        assert!(!lower.contains("authorization:"), "no bearer token: {sent}");
+        assert!(sent.contains("\"system\":\"sys\""), "{sent}");
     }
 
     fn provider(base_url: &str) -> OpenAiCompatible {
@@ -1816,6 +1913,7 @@ mod tests {
             default_base_url: "",
             base_url_var: "SE_TEST_KEYLESS_BASE",
             key_required: false,
+            wire: Wire::OpenAi,
         };
         const BODY: &str = "data: [DONE]
 
@@ -1862,6 +1960,7 @@ mod tests {
             default_base_url: "",
             base_url_var: "SE_TEST_KEYLESS_ORDERING_BASE",
             key_required: false,
+            wire: Wire::OpenAi,
         };
         const BODY: &str = "data: [DONE]\n\n";
         let (base, requests) = serve("HTTP/1.1 200 OK", "text/event-stream", BODY);
@@ -1908,6 +2007,7 @@ mod tests {
             default_base_url: "",
             base_url_var: "SE_TEST_PIN_BASE",
             key_required: true,
+            wire: Wire::OpenAi,
         };
 
         // Store exactly as /connect does: through the real credential
@@ -2007,6 +2107,7 @@ mod tests {
             default_base_url: "",
             base_url_var: "SE_TEST_KEYLESS_REMOTE_BASE",
             key_required: false,
+            wire: Wire::OpenAi,
         };
         let p = OpenAiCompatible {
             service: KEYLESS,

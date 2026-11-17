@@ -25,6 +25,7 @@ pub mod keys;
 pub mod picker;
 pub mod render;
 pub mod state;
+pub mod team;
 
 pub use composer::Composer;
 pub use input::{action_for_key, action_for_mouse, apply_local, Action};
@@ -59,8 +60,10 @@ pub fn run<B: Backend>(
     core: &CoreHandle,
     banner: Option<String>,
     specialists: Vec<se_command::CommandSpec>,
+    team: Option<team::Launcher>,
 ) -> io::Result<()> {
     let mut state = AppState::new();
+    let mut panel = team::Panel::new(team);
     discover_and_register_commands(&mut state);
     // Pre-built by the caller from the real catalogue -- this crate
     // never calls the catalogue loader itself (construction stays in
@@ -82,6 +85,7 @@ pub fn run<B: Backend>(
             state.apply(&event);
             dirty = true;
         }
+        dirty |= panel.tick(&mut state);
 
         // 2. Input, with a short bounded wait.
         if event::poll(TICK)? {
@@ -92,11 +96,11 @@ pub fn run<B: Backend>(
                     // chord SE does not currently bind.
                     state.keys.observe(key);
                     let action = action_for_key(&state, key);
-                    dirty |= dispatch(&mut state, core, action);
+                    dirty |= dispatch_with(&mut state, core, &mut panel, action);
                 }
                 Event::Mouse(mouse) => {
                     let action = action_for_mouse(&state, mouse);
-                    dirty |= dispatch(&mut state, core, action);
+                    dirty |= dispatch_with(&mut state, core, &mut panel, action);
                 }
                 Event::Paste(text) => {
                     // Bracketed paste must be enabled by the binary for
@@ -123,7 +127,33 @@ pub fn run<B: Backend>(
 
 /// Performs an action: local effects here, core-bound ones as operations.
 /// Returns whether the view needs redrawing.
+#[cfg(test)]
 fn dispatch(state: &mut AppState, core: &CoreHandle, action: Action) -> bool {
+    dispatch_with(state, core, &mut team::Panel::default(), action)
+}
+
+/// `/team` is answered by the team panel, which owns the run; every
+/// other command goes through `run_command`.
+fn command(
+    state: &mut AppState,
+    core: &CoreHandle,
+    panel: &mut team::Panel,
+    path: &str,
+    args: &str,
+) {
+    if state.commands.resolve(path).is_ok_and(|s| s.id == "team") {
+        panel.command(state, args);
+    } else {
+        run_command(state, core, path, args);
+    }
+}
+
+fn dispatch_with(
+    state: &mut AppState,
+    core: &CoreHandle,
+    panel: &mut team::Panel,
+    action: Action,
+) -> bool {
     match &action {
         Action::Nothing => false,
         Action::Submit(text) => {
@@ -134,10 +164,10 @@ fn dispatch(state: &mut AppState, core: &CoreHandle, action: Action) -> bool {
             // only ever closes on whitespace, so a command with
             // arguments reaches here, not `Action::PickerAccept`.
             if let Some((path, raw_args)) = leading_command(text, &state.commands) {
-                run_command(state, core, &path, &raw_args);
+                command(state, core, panel, &path, &raw_args);
                 return true;
             }
-            match core.submit(text, Vec::new()) {
+            match core.submit_with_model(text, Vec::new(), state.model_override.clone()) {
                 Ok(_task) => {}
                 Err(e) => {
                     // Refusals are shown, never swallowed: the user's
@@ -188,7 +218,7 @@ fn dispatch(state: &mut AppState, core: &CoreHandle, action: Action) -> bool {
                     state.composer.set(format!("/{path} "));
                 } else {
                     state.composer.clear();
-                    run_command(state, core, &path, "");
+                    command(state, core, panel, &path, "");
                 }
             } else {
                 // Nothing matched; leave the draft alone so the user
@@ -198,8 +228,9 @@ fn dispatch(state: &mut AppState, core: &CoreHandle, action: Action) -> bool {
             true
         }
         Action::Decide(allow) => {
-            if let Some(call) = state.awaiting_approval() {
+            if let (Some(call), Some(task)) = (state.awaiting_approval(), state.running_task()) {
                 core.approve(ApprovalDecision {
+                    task,
                     call,
                     allow: *allow,
                 });
@@ -329,6 +360,7 @@ pub fn run_command(state: &mut AppState, core: &CoreHandle, path: &str, raw_args
                     .picker
                     .open_scoped(0, crate::picker::PickerScope::Agents);
             }
+            "models" => set_model(state, raw_args),
             "keys" => {
                 let report = state.keys.report();
                 state.push(Entry::Notice(report));
@@ -371,6 +403,40 @@ pub fn run_command(state: &mut AppState, core: &CoreHandle, path: &str, raw_args
     }
 }
 
+/// `/models <provider>/<model>` selects the model for later turns,
+/// `/models default` clears it, and bare `/models` shows the choice.
+/// Nothing is validated here: listing or probing a provider is network
+/// I/O and this runs on the interface thread (I1). An unknown or
+/// unconfigured provider fails the next turn with the reason instead.
+fn set_model(state: &mut AppState, raw_args: &str) {
+    let arg = raw_args.trim();
+    let message = if arg.is_empty() {
+        match &state.model_override {
+            Some(m) => format!(
+                "model: {}/{} (`/models default` to reset)",
+                m.provider, m.model
+            ),
+            None => "model: the configured default — set one with `/models <provider>/<model>`"
+                .to_string(),
+        }
+    } else if arg == "default" {
+        state.model_override = None;
+        "model reset to the configured default".to_string()
+    } else {
+        match arg.split_once('/') {
+            Some((provider, model)) if !provider.is_empty() && !model.is_empty() => {
+                state.model_override = Some(se_protocol::ModelRef {
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                });
+                format!("model set to {provider}/{model} for this session")
+            }
+            _ => format!("expected `/models <provider>/<model>`, got `{arg}`"),
+        }
+    };
+    state.push(Entry::Notice(message));
+}
+
 /// Renders a loaded command's template against `raw_args` and submits
 /// the result as a normal turn. The template body is cached at
 /// discovery time in `state.templates`; its absence here means the
@@ -392,7 +458,7 @@ fn run_prompt_template(
         return;
     };
     let rendered = se_command::markdown::render(&def, raw_args);
-    if let Err(e) = core.submit(&rendered, Vec::new()) {
+    if let Err(e) = core.submit_with_model(&rendered, Vec::new(), state.model_override.clone()) {
         state.push(Entry::Notice(e.to_string()));
     }
 }
@@ -419,7 +485,12 @@ fn run_specialist_invoke(
         )));
         return;
     }
-    if let Err(e) = core.submit_specialist(specialist_id, raw_args, Vec::new()) {
+    if let Err(e) = core.submit_specialist_with_model(
+        specialist_id,
+        raw_args,
+        Vec::new(),
+        state.model_override.clone(),
+    ) {
         state.push(Entry::Notice(e.to_string()));
     }
 }
@@ -1056,6 +1127,64 @@ mod tests {
             "accepting from the picker must prefill, not submit empty and then refuse"
         );
         core.shutdown();
+    }
+
+    struct ModelRecordingRunner {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Option<se_protocol::ModelRef>>>>,
+    }
+
+    impl se_core::Runner for ModelRecordingRunner {
+        fn describe(&self) -> (String, String) {
+            ("test".to_string(), "model-recording".to_string())
+        }
+        fn run(
+            &self,
+            turn: &se_protocol::UserTurn,
+            _history: &[se_provider::Message],
+            _sink: &mut se_core::TurnSink,
+        ) -> se_protocol::Outcome {
+            self.seen.lock().unwrap().push(turn.model.clone());
+            se_protocol::Outcome::Completed {
+                final_text: "ok".into(),
+            }
+        }
+    }
+
+    #[test]
+    fn slash_models_selects_the_model_every_later_turn_carries() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let core = se_core::start(ModelRecordingRunner { seen: seen.clone() });
+        let mut state = AppState::new();
+        state
+            .commands
+            .register(specialist_spec("backend-lead"))
+            .unwrap();
+        let wait = |core: &CoreHandle| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !core
+                .drain_blocking(Duration::from_millis(10))
+                .iter()
+                .any(|e| e.is_terminal())
+            {
+                assert!(std::time::Instant::now() < deadline, "turn never finished");
+            }
+        };
+
+        run_command(&mut state, &core, "models", "not-a-ref");
+        assert_eq!(state.model_override, None, "a malformed ref sets nothing");
+        run_command(&mut state, &core, "models", "beta/beta-large");
+        run_command(&mut state, &core, "backend-lead", "fix it");
+        wait(&core);
+        run_command(&mut state, &core, "models", "default");
+        run_command(&mut state, &core, "backend-lead", "again");
+        wait(&core);
+        core.shutdown();
+
+        let beta = se_protocol::ModelRef {
+            provider: "beta".into(),
+            model: "beta-large".into(),
+        };
+        assert_eq!(seen.lock().unwrap().as_slice(), [Some(beta), None]);
     }
 
     #[test]

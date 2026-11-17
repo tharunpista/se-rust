@@ -56,6 +56,12 @@ pub struct UserTurn {
     /// I/O -- not here, where it would block the render/input loop.
     #[serde(default)]
     pub specialist_id: Option<String>,
+    /// The team-run graph node this turn executes, if any. Set only by a
+    /// team scheduler: such a turn is never the user's own choice, so a
+    /// non-default vendor goes through the gateway even when no
+    /// specialist is named (it will be picked automatically).
+    #[serde(default)]
+    pub team_node: Option<String>,
 }
 
 /// A specific provider and model, named rather than inferred. The same
@@ -72,6 +78,9 @@ pub struct ModelRef {
 /// A decision about a tool call that needed one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalDecision {
+    /// The task that asked. The supervisor routes on this (E8); the
+    /// worker still checks `call` so a stale decision is never applied.
+    pub task: TaskId,
     pub call: ToolCallId,
     pub allow: bool,
 }
@@ -381,6 +390,7 @@ mod tests {
             attachments: vec![],
             model: None,
             specialist_id: None,
+            team_node: None,
         });
         let json = serde_json::to_string(&op).unwrap();
         assert_eq!(op, serde_json::from_str::<CoreOp>(&json).unwrap());
@@ -398,6 +408,7 @@ mod tests {
                 model: "sonnet".into(),
             }),
             specialist_id: None,
+            team_node: None,
         });
         let json = serde_json::to_string(&op).unwrap();
         assert_eq!(op, serde_json::from_str::<CoreOp>(&json).unwrap());

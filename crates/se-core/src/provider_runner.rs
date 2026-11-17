@@ -32,7 +32,7 @@ use se_provider::{
 };
 
 use crate::sink::TurnSink;
-use crate::tool_loop;
+use crate::tool_loop::{self, ToolAction};
 use crate::tools::Granted;
 use crate::Runner;
 
@@ -45,6 +45,8 @@ use crate::Runner;
 /// runner, will own this once it exists.
 const NATIVE_LOOP_AGENT_ID: &str = "native-tool-loop";
 const NATIVE_LOOP_AGENT_DEFINITION_HASH: &str = "native-tool-loop-v1";
+/// Who a scheduled turn acts as while its specialist is being picked.
+const AUTO_ROUTE_AGENT_ID: &str = "auto-router";
 
 /// Hard ceiling on how many model/tool round trips one turn may make,
 /// independent of the turn deadline: the deadline bounds wall time, but
@@ -101,6 +103,17 @@ pub struct ProviderRunner {
     /// `session_store::default_sessions_dir` already follows by taking
     /// its base directory as an explicit parameter.
     catalogue_root: Option<std::path::PathBuf>,
+    /// Every tool path is confined under this directory (row 2.10).
+    /// Defaults to the process's working directory at construction.
+    workspace_root: std::path::PathBuf,
+    /// Where every gateway decision is recorded. Null unless a caller
+    /// supplies a durable one (`crate::audit_log::FileAuditSink`).
+    audit: std::sync::Arc<dyn se_permission::AuditSink + Send + Sync>,
+    /// Pick a specialist automatically when a turn names none.
+    auto_route: bool,
+    /// Set by a team run: file claims and the token budget, keyed by the
+    /// node a turn executes (`UserTurn::team_node`).
+    team: Option<crate::team::TeamContext>,
 }
 
 impl ProviderRunner {
@@ -126,7 +139,34 @@ impl ProviderRunner {
             ruleset: Ruleset::default(),
             ledger: NonceLedger::new(),
             catalogue_root: None,
+            workspace_root: std::env::current_dir()
+                .map_err(|e| ProviderError::NotConfigured(format!("no working directory: {e}")))?,
+            audit: std::sync::Arc::new(NullAuditSink),
+            auto_route: false,
+            team: None,
         })
+    }
+
+    /// Automatically picks one of the catalogue's specialists for any
+    /// turn that names none. Needs a catalogue root to have any effect.
+    pub fn with_auto_route(mut self, on: bool) -> Self {
+        self.auto_route = on;
+        self
+    }
+
+    /// Records every gateway decision to `audit` (row 2.5).
+    pub fn with_audit_sink(
+        mut self,
+        audit: std::sync::Arc<dyn se_permission::AuditSink + Send + Sync>,
+    ) -> Self {
+        self.audit = audit;
+        self
+    }
+
+    /// Confines every tool path to `root` instead of the working directory.
+    pub fn with_workspace_root(mut self, root: std::path::PathBuf) -> Self {
+        self.workspace_root = root;
+        self
     }
 
     /// Overrides the whole-turn deadline. Rejects a non-positive value
@@ -198,17 +238,123 @@ fn deadline_precedence(
     }
 }
 
+/// The newest suffix of `history` that fits `budget_tokens` alongside
+/// `fixed_chars` of system prompt and request, which are never dropped.
+/// Whole messages only, oldest first, so no message is ever cut mid-way.
+///
+/// shortcut: tokens are estimated as chars / 4 and only prior history is
+/// trimmed, not tool results growing within a turn. Use the provider's
+/// tokenizer and trim mid-turn when a real overflow is observed.
+fn fit_history(history: &[Message], budget_tokens: Option<u32>, fixed_chars: usize) -> &[Message] {
+    let Some(budget) = budget_tokens else {
+        return history;
+    };
+    let size = |m: &Message| {
+        m.content.len()
+            + m.tool_calls
+                .iter()
+                .map(|c| c.name.len() + c.arguments.len())
+                .sum::<usize>()
+    };
+    let mut remaining = (budget as usize * 4).saturating_sub(fixed_chars);
+    let mut start = history.len();
+    while start > 0 && size(&history[start - 1]) <= remaining {
+        remaining -= size(&history[start - 1]);
+        start -= 1;
+    }
+    // Never open on an answer whose question was trimmed away.
+    while start < history.len() && history[start].role != Role::User {
+        start += 1;
+    }
+    &history[start..]
+}
+
+/// One short, tool-less question to the model; its text answer or `None`.
+fn ask(
+    provider: &dyn se_provider::ModelProvider,
+    model: &str,
+    prompt: &str,
+    sink: &TurnSink,
+) -> (Option<String>, Option<Usage>) {
+    let request = ChatRequest {
+        model: model.to_string(),
+        messages: vec![
+            Message::text(Role::System, crate::router::ROUTER_SYSTEM),
+            Message::text(Role::User, prompt),
+        ],
+        max_tokens: 64,
+        tools: Vec::new(),
+    };
+    let mut text = String::new();
+    let mut usage = None;
+    let result = provider.stream(&request, &|| sink.is_cancelled(), &mut |event| {
+        match event {
+            StreamEvent::TextDelta(t) => text.push_str(&t),
+            StreamEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+            } => {
+                usage = Some(Usage {
+                    input_tokens,
+                    output_tokens,
+                    cached_input_tokens,
+                    source: UsageSource::ProviderReported,
+                })
+            }
+            _ => {}
+        }
+        true
+    });
+    (result.ok().map(|()| text), usage)
+}
+
+/// Total tokens a call reported, or `None` when it reported neither
+/// figure (never treated as zero).
+fn reported_tokens(u: Option<&Usage>) -> Option<u64> {
+    let u = u?;
+    if u.input_tokens.is_none() && u.output_tokens.is_none() {
+        return None;
+    }
+    Some(u.input_tokens.unwrap_or(0) + u.output_tokens.unwrap_or(0))
+}
+
 impl Runner for ProviderRunner {
     fn describe(&self) -> (String, String) {
         (self.provider_id.clone(), self.model.clone())
     }
 
+    fn attach_team(&mut self, team: crate::team::TeamContext) {
+        self.team = Some(team);
+    }
+
     fn run(&self, turn: &UserTurn, history: &[Message], sink: &mut TurnSink) -> Outcome {
-        let Some(provider) = self.registry.get(&self.provider_id) else {
+        // Charter §6.6 precedence. The runner's own provider is the
+        // global default; the catalogue has no per-agent model field
+        // yet, and teams/departments have no config, so those are None.
+        let default = se_protocol::ModelRef {
+            provider: self.provider_id.clone(),
+            model: self.model.clone(),
+        };
+        let chosen =
+            match crate::routing::resolve(turn.model.as_ref(), None, None, None, Some(&default)) {
+                Ok(m) => m,
+                Err(detail) => return Outcome::Failed { detail },
+            };
+        let Some(provider) = self.registry.get(&chosen.provider) else {
             return Outcome::Failed {
-                detail: format!("`{}` is no longer registered", self.provider_id),
+                detail: format!("`{}` is not a known provider", chosen.provider),
             };
         };
+        // The default was checked at construction; an override was not.
+        if chosen != default {
+            let status = provider.detect();
+            if !status.configured {
+                return Outcome::Failed {
+                    detail: format!("`{}` is not configured: {}", chosen.provider, status.detail),
+                };
+            }
+        }
 
         // Resolved before `start_turn` fires, not after: a failed
         // lookup must never leave a `TurnStarted` with no matching
@@ -225,26 +371,81 @@ impl Runner for ProviderRunner {
         // None`. The resolution that can fail happens here, though,
         // before `start_turn` opens anything -- a failed lookup must
         // never leave a `TurnStarted` with nothing to close it.
-        let (system_prompt, invoked, allowed_tools): (
-            String,
-            Option<(String, u64)>,
-            Option<Vec<String>>,
-        ) = match &turn.specialist_id {
-            None => (SYSTEM_PROMPT.to_string(), None, None),
-            Some(id) => {
-                let Some(root) = &self.catalogue_root else {
+        // The catalogue is read once per turn, shared by automatic routing
+        // and the specialist lookup. Only a specialist the user *named*
+        // makes a missing or unreadable catalogue fatal; automatic
+        // routing just falls back to a plain turn.
+        let node = turn.team_node.as_deref();
+        let team_kind = match (&self.team, node) {
+            (Some(t), Some(n)) => t.kind(n),
+            _ => crate::team::NodeKind::Work,
+        };
+        let evaluator = team_kind == crate::team::NodeKind::Evaluate;
+        // An evaluator speaks only as the evaluator. An ensemble member
+        // with no named agent is not routed: routing on each member's own
+        // model could pick different specialists, and then the members
+        // would not have received the same packet (row 4.3).
+        let unrouted = evaluator
+            || match (&self.team, node) {
+                (Some(t), Some(n)) => t.is_ensemble_member(n),
+                _ => false,
+            };
+        let catalogue = match (&turn.specialist_id, &self.catalogue_root) {
+            _ if evaluator => None,
+            (Some(_), None) => {
+                return Outcome::Failed {
+                    detail: "no catalogue root configured for specialist dispatch".to_string(),
+                };
+            }
+            (Some(_), Some(root)) => match se_catalogue::load(root) {
+                Ok(r) => Some(r),
+                Err(e) => {
                     return Outcome::Failed {
-                        detail: "no catalogue root configured for specialist dispatch".to_string(),
+                        detail: format!("could not read the agent catalogue: {e}"),
                     };
-                };
-                let report = match se_catalogue::load(root) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        return Outcome::Failed {
-                            detail: format!("could not read the agent catalogue: {e}"),
-                        };
-                    }
-                };
+                }
+            },
+            (None, Some(root)) if self.auto_route && !unrouted => se_catalogue::load(root).ok(),
+            (None, _) => None,
+        };
+        // Scheduled work with no named agent spends the chosen vendor's
+        // credential on routing calls, so it is authorized first, under
+        // the router's own identity.
+        let pre_authorized = turn.specialist_id.is_none() && node.is_some();
+        if pre_authorized {
+            let router_id = (
+                AUTO_ROUTE_AGENT_ID.to_string(),
+                NATIVE_LOOP_AGENT_DEFINITION_HASH.to_string(),
+            );
+            if let Err(detail) = self.authorize_provider(sink, turn, &chosen, &default, &router_id)
+            {
+                return Outcome::Failed { detail };
+            }
+        }
+        let mut total_usage: Option<Usage> = None;
+        let specialist_id: Option<String> = match &turn.specialist_id {
+            Some(id) => Some(id.clone()),
+            None => catalogue.as_ref().and_then(|c| {
+                let (picked, usage) =
+                    self.route(provider, &chosen.model, &turn.text, &c.agents, sink, node);
+                total_usage = usage;
+                picked
+            }),
+        };
+
+        let specialist_id = specialist_id.filter(|_| !evaluator);
+        let (system_prompt, invoked, allowed_tools, max_calls, budget_tokens) = match &specialist_id
+        {
+            None if evaluator => (
+                crate::team::evaluate::EVALUATOR_SYSTEM.to_string(),
+                None,
+                None,
+                None,
+                None,
+            ),
+            None => (SYSTEM_PROMPT.to_string(), None, None, None, None),
+            Some(id) => {
+                let report = catalogue.expect("loaded whenever a specialist id exists");
                 let Some(agent) = report.agents.into_iter().find(|a| &a.frontmatter.id == id)
                 else {
                     return Outcome::Failed {
@@ -267,11 +468,29 @@ impl Runner for ProviderRunner {
                     agent.body,
                     Some((agent.frontmatter.id, agent.content_hash)),
                     allowed,
+                    agent.frontmatter.max_calls,
+                    agent.frontmatter.context_budget_tokens,
                 )
             }
         };
 
-        if sink.start_turn(&self.provider_id, &self.model).is_err() {
+        // Who this turn acts as, for every gateway decision it causes:
+        // the specialist (pinned to its definition's hash) or the plain
+        // native loop. Rules can then target a specialist by id.
+        let agent: (String, String) = match &invoked {
+            Some((id, hash)) => (id.clone(), format!("{hash:016x}")),
+            None => (
+                NATIVE_LOOP_AGENT_ID.to_string(),
+                NATIVE_LOOP_AGENT_DEFINITION_HASH.to_string(),
+            ),
+        };
+        if !pre_authorized {
+            if let Err(detail) = self.authorize_provider(sink, turn, &chosen, &default, &agent) {
+                return Outcome::Failed { detail };
+            }
+        }
+
+        if sink.start_turn(&chosen.provider, &chosen.model).is_err() {
             return Outcome::Failed {
                 detail: "the interface disconnected".to_string(),
             };
@@ -295,7 +514,8 @@ impl Runner for ProviderRunner {
         let mut messages: Vec<Message> = sink.timed(Stage::ContextBuild, || {
             let mut messages = Vec::with_capacity(history.len() + 2);
             messages.push(Message::text(Role::System, &system_prompt));
-            messages.extend_from_slice(history);
+            let fixed = system_prompt.len() + turn.text.len();
+            messages.extend_from_slice(fit_history(history, budget_tokens, fixed));
             messages.push(Message::text(Role::User, turn.text.clone()));
             messages
         });
@@ -306,7 +526,6 @@ impl Runner for ProviderRunner {
         // reset on a later round trip -- the brief's requirement that
         // time-to-first-token is not re-measured per round trip.
         let request_started = Instant::now();
-        let mut total_usage: Option<Usage> = None;
         // One deadline for the whole turn, computed once; every round
         // trip below shares the same `turn_started` and `turn_deadline`,
         // so the bound is on the loop, not reset per model call.
@@ -315,6 +534,7 @@ impl Runner for ProviderRunner {
         let deadline_fired = Arc::new(AtomicBool::new(false));
 
         let mut round = 0usize;
+        let mut calls_run: u32 = 0;
         let outcome = loop {
             round += 1;
             if sink.is_cancelled() {
@@ -327,11 +547,27 @@ impl Runner for ProviderRunner {
                 };
             }
 
+            // Row 4.16: at the cap the call is not made at all.
+            if let Err(detail) = self.admit(node) {
+                break if answer.is_empty() {
+                    Outcome::Failed { detail }
+                } else {
+                    Outcome::Incomplete {
+                        partial_text: answer,
+                        reason: detail,
+                    }
+                };
+            }
             let request = ChatRequest {
-                model: self.model.clone(),
+                model: chosen.model.clone(),
                 messages: messages.clone(),
                 max_tokens: MAX_TOKENS,
-                tools: self.tool_definitions(),
+                // An evaluator is offered no tools at all (item 4).
+                tools: if evaluator {
+                    Vec::new()
+                } else {
+                    self.tool_definitions()
+                },
             };
 
             let mut round_answer = String::new();
@@ -420,6 +656,7 @@ impl Runner for ProviderRunner {
             });
 
             answer.push_str(&round_answer);
+            self.charge(node, round_usage.as_ref());
             if let Some(usage) = round_usage {
                 total_usage = Some(match total_usage {
                     None => usage,
@@ -482,8 +719,33 @@ impl Runner for ProviderRunner {
                             interrupted = true;
                             break;
                         }
-                        let result_text =
-                            self.handle_tool_call(sink, call, allowed_tools.as_deref());
+                        // The specialist's own `max_calls` (row 3.9):
+                        // past it a call is not run, and the model is
+                        // told why so it can finish with what it has.
+                        let result_text = match max_calls {
+                            _ if evaluator => self.reject_unparsed(
+                                sink,
+                                call,
+                                &agent,
+                                "an evaluator has no tools",
+                            ),
+                            Some(max) if calls_run >= max => self.reject_unparsed(
+                                sink,
+                                call,
+                                &agent,
+                                &format!("this specialist's budget of {max} tool calls is spent"),
+                            ),
+                            _ => {
+                                calls_run += 1;
+                                self.handle_tool_call(
+                                    sink,
+                                    call,
+                                    allowed_tools.as_deref(),
+                                    &agent,
+                                    node,
+                                )
+                            }
+                        };
                         messages.push(Message::tool_result(call.id.clone(), result_text));
                     }
                     if interrupted {
@@ -575,6 +837,154 @@ fn merge_usage(a: Usage, b: Usage) -> Usage {
 }
 
 impl ProviderRunner {
+    /// A call refused before it could reach the gateway (bad arguments,
+    /// a path outside the workspace, a spent `max_calls`) is still shown
+    /// on the tool lifecycle and audited as a `Deny`, so an escape
+    /// attempt is never invisible.
+    fn reject_unparsed(
+        &self,
+        sink: &mut TurnSink,
+        call: &ToolCallRecord,
+        agent: &(String, String),
+        reason: &str,
+    ) -> String {
+        let text = format!("tool call rejected before it ran: {reason}");
+        let id = se_protocol::ToolCallId::next();
+        let _ = sink.tool_requested(id, &call.name, &call.name);
+        let _ = sink.tool_completed(id, &call.name, false, &text);
+        self.audit.record(se_permission::AuditRecord {
+            agent_id: agent.0.clone(),
+            session: sink.session(),
+            task: sink.task(),
+            tool_name: call.name.clone(),
+            // The reason, never the raw arguments: a `write`'s arguments
+            // carry file content, which has no place in the audit trail.
+            resource_scope: reason.to_string(),
+            effect: se_permission::Effect::Deny,
+        });
+        text
+    }
+
+    /// Picks a specialist for a turn that named none (see `crate::router`):
+    /// two short multiple-choice questions to the turn's own model, each
+    /// answer checked against the catalogue, then keyword scoring, then
+    /// `None` (a plain turn). A failed routing call never fails the turn.
+    ///
+    /// shortcut: the two routing calls' token usage is not reported.
+    /// Fold it into the turn's usage when cost attribution needs it.
+    fn route(
+        &self,
+        provider: &dyn se_provider::ModelProvider,
+        model: &str,
+        task: &str,
+        agents: &[se_catalogue::AgentDefinition],
+        sink: &TurnSink,
+        node: Option<&str>,
+    ) -> (Option<String>, Option<Usage>) {
+        use crate::router;
+        let mut usage: Option<Usage> = None;
+        // Each routing call is budgeted and charged like any other; a
+        // spent budget skips straight to the free keyword fallback.
+        let mut ask_once = |prompt: &str| -> Option<String> {
+            self.admit(node).ok()?;
+            let (text, u) = ask(provider, model, prompt, sink);
+            self.charge(node, u.as_ref());
+            if let Some(u) = u {
+                usage = Some(match usage {
+                    None => u,
+                    Some(prev) => merge_usage(prev, u),
+                });
+            }
+            text
+        };
+        let depts = router::departments(agents);
+        let names: Vec<&str> = depts.iter().map(|(d, _)| d.as_str()).collect();
+        let dept = ask_once(&router::department_prompt(task, &depts))
+            .and_then(|r| router::pick(&r, &names).map(str::to_string));
+        if let Some(dept) = dept {
+            let roles: Vec<&se_catalogue::AgentDefinition> = agents
+                .iter()
+                .filter(|a| a.frontmatter.department == dept && a.frontmatter.enabled)
+                .collect();
+            let ids: Vec<&str> = roles.iter().map(|a| a.frontmatter.id.as_str()).collect();
+            let role = ask_once(&router::role_prompt(task, &roles))
+                .and_then(|r| router::pick(&r, &ids).map(str::to_string));
+            if role.is_some() {
+                return (role, usage);
+            }
+        }
+        (
+            router::lexical(task, agents).map(|a| a.frontmatter.id.clone()),
+            usage,
+        )
+    }
+
+    fn admit(&self, node: Option<&str>) -> Result<(), String> {
+        match (&self.team, node) {
+            (Some(t), Some(n)) => t.admit(n),
+            _ => Ok(()),
+        }
+    }
+
+    fn charge(&self, node: Option<&str>, usage: Option<&Usage>) {
+        if let (Some(t), Some(n)) = (&self.team, node) {
+            t.charge(n, reported_tokens(usage));
+        }
+    }
+
+    /// Per-agent credential scoping (Phase 4 item 2). Using a provider
+    /// spends its stored credential, so a specialist turn may only use a
+    /// provider other than the operator's configured default through the
+    /// gateway (`use_provider` on `provider:<id>`): a ruleset `Deny`
+    /// blocks it, `Ask` asks the human once, and every outcome is
+    /// audited. The default provider, and a direct user turn (the user
+    /// picked the model themselves with `/models`), need no check.
+    fn authorize_provider(
+        &self,
+        sink: &mut TurnSink,
+        turn: &UserTurn,
+        chosen: &se_protocol::ModelRef,
+        default: &se_protocol::ModelRef,
+        agent: &(String, String),
+    ) -> Result<(), String> {
+        if chosen.provider == default.provider
+            || (turn.specialist_id.is_none() && turn.team_node.is_none())
+        {
+            return Ok(());
+        }
+        let shown = format!(
+            "{} wants to use {}/{} with its stored credential",
+            agent.0, chosen.provider, chosen.model
+        );
+        let req = PermRequest {
+            agent_id: agent.0.clone(),
+            agent_definition_hash: agent.1.clone(),
+            session: sink.session(),
+            task: sink.task(),
+            tool_name: "use_provider".to_string(),
+            tool_schema_version: 1,
+            resource: se_permission::ResourceIdentity(format!("provider:{}", chosen.provider)),
+            resource_scope: chosen.provider.clone(),
+            cwd: self.workspace_root.to_string_lossy().into_owned(),
+            env_subset: Vec::new(),
+            shown_to_human: shown.clone(),
+        };
+        let gateway = Gateway::new(&self.ruleset, &self.ledger, self.audit.as_ref());
+        match gateway.decide(&req) {
+            se_permission::Decision::Allow(_) => Ok(()),
+            se_permission::Decision::Deny { reason } => Err(reason),
+            se_permission::Decision::Ask => {
+                if sink.request_approval("use_provider", &shown).is_some() {
+                    gateway.approve(&req);
+                    Ok(())
+                } else {
+                    gateway.refuse(&req);
+                    Err(format!("not approved: {shown}"))
+                }
+            }
+        }
+    }
+
     /// Runs one tool call end to end: ruleset check, human approval if
     /// the ruleset defers, execution, and the sink events that make it
     /// visible. Returns the text to feed back to the model as that
@@ -603,23 +1013,37 @@ impl ProviderRunner {
         sink: &mut TurnSink,
         call: &ToolCallRecord,
         allowed_tools: Option<&[String]>,
+        agent: &(String, String),
+        node: Option<&str>,
     ) -> String {
-        let parsed = match tool_loop::parse_tool_call(&call.name, &call.arguments) {
-            Ok(p) => p,
-            Err(reason) => {
-                return format!("tool call rejected before it ran: {reason}");
-            }
+        let parsed =
+            match tool_loop::parse_tool_call(&self.workspace_root, &call.name, &call.arguments) {
+                Ok(p) => p,
+                Err(reason) => return self.reject_unparsed(sink, call, agent, &reason),
+            };
+        // Rows 4.13/4.14: in a team run, a file another task wrote is
+        // refused before anyone is asked to approve the write.
+        let claim = match (&self.team, node, &parsed.action) {
+            (
+                Some(team),
+                Some(node),
+                ToolAction::Write { path, .. } | ToolAction::Edit { path, .. },
+            ) => Some((team, node, path.clone())),
+            _ => None,
         };
+        if let Some((team, node, path)) = &claim {
+            if let Err(conflict) = team.check(node, path) {
+                return self.reject_unparsed(sink, call, agent, &conflict.to_string());
+            }
+        }
         let resource = match tool_loop::resolve_identity(&parsed) {
             Ok(r) => r,
-            Err(e) => {
-                return format!("tool call rejected before it ran: {e}");
-            }
+            Err(e) => return self.reject_unparsed(sink, call, agent, &e.to_string()),
         };
 
         let req = PermRequest {
-            agent_id: NATIVE_LOOP_AGENT_ID.to_string(),
-            agent_definition_hash: NATIVE_LOOP_AGENT_DEFINITION_HASH.to_string(),
+            agent_id: agent.0.clone(),
+            agent_definition_hash: agent.1.clone(),
             session: sink.session(),
             task: sink.task(),
             tool_name: call.name.clone(),
@@ -630,7 +1054,7 @@ impl ProviderRunner {
             env_subset: Vec::new(),
             shown_to_human: parsed.display.clone(),
         };
-        let gateway = Gateway::new(&self.ruleset, &self.ledger, &NullAuditSink);
+        let gateway = Gateway::new(&self.ruleset, &self.ledger, self.audit.as_ref());
 
         let (id, approved): (se_protocol::ToolCallId, Box<Approved>) =
             match gateway.decide_scoped(&req, allowed_tools) {
@@ -657,15 +1081,18 @@ impl ProviderRunner {
                 }
                 se_permission::Decision::Ask => {
                     let Some(id) = sink.request_approval(&call.name, &parsed.display) else {
+                        gateway.refuse(&req);
                         return "denied: not approved".to_string();
                     };
                     if sink
                         .tool_requested(id, &call.name, &parsed.display)
                         .is_err()
                     {
+                        gateway.refuse(&req);
                         return "the interface disconnected before this call could run".to_string();
                     }
                     if sink.is_cancelled() {
+                        gateway.refuse(&req);
                         let _ = sink.tool_completed(id, &call.name, false, "cancelled");
                         return "cancelled before this call ran".to_string();
                     }
@@ -693,6 +1120,15 @@ impl ProviderRunner {
             }
         };
 
+        // Claimed under the same lock as the final check, right before
+        // the write: of two racing writers exactly one gets the file.
+        if let Some((team, node, path)) = &claim {
+            if let Err(conflict) = team.claim(node, path) {
+                let text = conflict.to_string();
+                let _ = sink.tool_completed(id, &call.name, false, &text);
+                return text;
+            }
+        }
         let outcome = tool_loop::execute(&granted, parsed.action);
         match outcome {
             Ok(preview) => {
@@ -838,6 +1274,7 @@ mod tests {
         default_base_url: "http://127.0.0.1:1",
         base_url_var: "SE_TEST_SCRIPTED_BASE_URL",
         key_required: true,
+        wire: se_provider::openai_compatible::Wire::OpenAi,
     };
 
     fn runner_with(
@@ -890,6 +1327,10 @@ mod tests {
                 ruleset: Ruleset::default(),
                 ledger: NonceLedger::new(),
                 catalogue_root: None,
+                workspace_root: std::env::temp_dir(),
+                audit: std::sync::Arc::new(NullAuditSink),
+                auto_route: false,
+                team: None,
             },
             requests,
         )
@@ -931,7 +1372,11 @@ mod tests {
         while std::time::Instant::now() < deadline {
             for event in core.drain_blocking(Duration::from_millis(20)) {
                 if let Payload::ApprovalRequired { call, .. } = &event.payload {
-                    core.approve(se_protocol::ApprovalDecision { call: *call, allow });
+                    core.approve(se_protocol::ApprovalDecision {
+                        task: event.task,
+                        call: *call,
+                        allow,
+                    });
                 }
                 let terminal = event.is_terminal();
                 payloads.push(event.payload.clone());
@@ -1025,6 +1470,10 @@ mod tests {
             ruleset,
             ledger: NonceLedger::new(),
             catalogue_root: None,
+            workspace_root: std::env::temp_dir(),
+            audit: std::sync::Arc::new(NullAuditSink),
+            auto_route: false,
+            team: None,
         };
         (runner, requests_seen)
     }
@@ -1458,6 +1907,10 @@ mod tests {
             ruleset: Ruleset::default(),
             ledger: NonceLedger::new(),
             catalogue_root: None,
+            workspace_root: std::env::temp_dir(),
+            audit: std::sync::Arc::new(NullAuditSink),
+            auto_route: false,
+            team: None,
         };
 
         let core = crate::start(runner);
@@ -1781,6 +2234,10 @@ mod tests {
             ruleset: Ruleset::default(),
             ledger: NonceLedger::new(),
             catalogue_root: Some(root.clone()),
+            workspace_root: std::env::temp_dir(),
+            audit: std::sync::Arc::new(NullAuditSink),
+            auto_route: false,
+            team: None,
         };
 
         let (outcome, _p) = run_specialist(runner, "recorder-specialist", "do the thing");
@@ -1936,4 +2393,645 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Row 2.5: every tool call leaves exactly one final gateway
+    /// decision (Allow or Deny) in the durable audit file, asserted by
+    /// count across all four paths: ruleset allow, human approve, human
+    /// deny, ruleset deny. A human "no" used to leave no record at all.
+    #[test]
+    fn every_tool_call_has_exactly_one_final_decision_in_the_audit_file() {
+        let dir = std::env::temp_dir().join(format!("se-core-audit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit_path = dir.join("audit.jsonl");
+        let sink: Arc<dyn se_permission::AuditSink + Send + Sync> =
+            Arc::new(crate::audit_log::FileAuditSink::open(&audit_path).unwrap());
+
+        let cases = [
+            (
+                "ruleset-allow",
+                Ruleset::from_rules(vec![se_permission::Rule::allow_all()]),
+                true,
+            ),
+            ("human-approve", Ruleset::default(), true),
+            ("human-deny", Ruleset::default(), false),
+            (
+                "ruleset-deny",
+                Ruleset::from_rules(vec![se_permission::Rule::deny_tool("write")]),
+                true,
+            ),
+        ];
+        for (name, ruleset, human_says) in cases {
+            let file = dir.join(format!("{name}.txt"));
+            let args =
+                serde_json::json!({"path": file.to_string_lossy(), "content": name}).to_string();
+            let (runner, _) = tool_calling_runner("write", args, ruleset);
+            let runner = runner.with_audit_sink(sink.clone());
+            run_auto_approving(runner, name, human_says);
+            let ran = file.exists();
+            assert_eq!(
+                ran,
+                name == "ruleset-allow" || name == "human-approve",
+                "{name}"
+            );
+        }
+
+        let records = crate::audit_log::read(&audit_path).unwrap();
+        let finals: Vec<&str> = records
+            .iter()
+            .map(|r| r["effect"].as_str().unwrap())
+            .filter(|e| *e != "Ask")
+            .collect();
+        assert_eq!(finals, ["Allow", "Allow", "Deny", "Deny"], "{records:?}");
+        let asks = records.iter().filter(|r| r["effect"] == "Ask").count();
+        assert_eq!(asks, 2, "only the two human paths ask");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Answers "from <id>" and records the model each request named.
+    struct NamedProvider {
+        id: &'static str,
+        configured: bool,
+        models_seen: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ModelProvider for NamedProvider {
+        fn id(&self) -> &str {
+            self.id
+        }
+        fn display_name(&self) -> &str {
+            self.id
+        }
+        fn env_var(&self) -> &str {
+            "SE_TEST_NAMED_KEY"
+        }
+        fn detect(&self) -> Status {
+            Status {
+                configured: self.configured,
+                detail: "named".into(),
+                source: se_provider::Source::Environment,
+            }
+        }
+        fn stream(
+            &self,
+            request: &ChatRequest,
+            _cancelled: &dyn Fn() -> bool,
+            on_event: &mut dyn FnMut(StreamEvent) -> bool,
+        ) -> Result<(), ProviderError> {
+            self.models_seen.lock().unwrap().push(request.model.clone());
+            on_event(StreamEvent::TextDelta(format!("from {}", self.id)));
+            on_event(StreamEvent::Done);
+            Ok(())
+        }
+        fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+            Ok(Vec::new())
+        }
+    }
+
+    type Seen = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// Default provider `alpha`; `beta` is configured, `gamma` is not.
+    fn two_provider_runner() -> (ProviderRunner, Seen, Seen, Seen) {
+        let (a, b, g) = (Seen::default(), Seen::default(), Seen::default());
+        let mut registry = Registry::empty();
+        for (id, configured, seen) in [
+            ("alpha", true, &a),
+            ("beta", true, &b),
+            ("gamma", false, &g),
+        ] {
+            registry.register(Box::new(NamedProvider {
+                id,
+                configured,
+                models_seen: seen.clone(),
+            }));
+        }
+        let (mut runner, _) = runner_with(Vec::new(), Duration::ZERO, None);
+        runner.registry = registry;
+        runner.provider_id = "alpha".into();
+        runner.model = "alpha-model".into();
+        (runner, a, b, g)
+    }
+
+    fn run_with_model(runner: ProviderRunner, model: Option<se_protocol::ModelRef>) -> Outcome {
+        let core = crate::start(runner);
+        core.submit_with_model("hi", vec![], model).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            for event in core.drain_blocking(Duration::from_millis(20)) {
+                if let Payload::TaskFinished { outcome, .. } = event.payload {
+                    core.shutdown();
+                    return outcome;
+                }
+            }
+        }
+        panic!("no terminal event");
+    }
+
+    fn model_ref(provider: &str, model: &str) -> se_protocol::ModelRef {
+        se_protocol::ModelRef {
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+
+    /// 2a item 6: a per-turn override actually changes which provider
+    /// and model execute, rather than being accepted and ignored.
+    #[test]
+    fn a_model_override_routes_the_turn_to_that_provider_and_model() {
+        let (runner, alpha, beta, _) = two_provider_runner();
+        let outcome = run_with_model(runner, Some(model_ref("beta", "beta-large")));
+        assert_eq!(
+            outcome,
+            Outcome::Completed {
+                final_text: "from beta".into()
+            }
+        );
+        assert_eq!(*beta.lock().unwrap(), ["beta-large"]);
+        assert!(
+            alpha.lock().unwrap().is_empty(),
+            "the default must not be called"
+        );
+    }
+
+    #[test]
+    fn no_override_uses_the_runners_default() {
+        let (runner, alpha, beta, _) = two_provider_runner();
+        let outcome = run_with_model(runner, None);
+        assert_eq!(
+            outcome,
+            Outcome::Completed {
+                final_text: "from alpha".into()
+            }
+        );
+        assert_eq!(*alpha.lock().unwrap(), ["alpha-model"]);
+        assert!(beta.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unknown_or_unconfigured_override_fails_without_calling_anything() {
+        for (provider, expect) in [
+            ("nope", "not a known provider"),
+            ("gamma", "not configured"),
+        ] {
+            let (runner, alpha, beta, gamma) = two_provider_runner();
+            let outcome = run_with_model(runner, Some(model_ref(provider, "m")));
+            match outcome {
+                Outcome::Failed { detail } => assert!(detail.contains(expect), "{detail}"),
+                other => panic!("{provider}: expected failure, got {other:?}"),
+            }
+            for seen in [alpha, beta, gamma] {
+                assert!(
+                    seen.lock().unwrap().is_empty(),
+                    "{provider}: nothing may be called"
+                );
+            }
+        }
+    }
+
+    /// Round 1 asks for two writes; round 2 answers with text.
+    struct TwoWritesProvider {
+        dir: std::path::PathBuf,
+        rounds: AtomicUsize,
+    }
+
+    impl ModelProvider for TwoWritesProvider {
+        fn id(&self) -> &str {
+            "twowrites"
+        }
+        fn display_name(&self) -> &str {
+            "twowrites"
+        }
+        fn env_var(&self) -> &str {
+            "SE_TEST_TWOWRITES_KEY"
+        }
+        fn detect(&self) -> Status {
+            Status {
+                configured: true,
+                detail: "t".into(),
+                source: se_provider::Source::Environment,
+            }
+        }
+        fn stream(
+            &self,
+            _request: &ChatRequest,
+            _cancelled: &dyn Fn() -> bool,
+            on_event: &mut dyn FnMut(StreamEvent) -> bool,
+        ) -> Result<(), ProviderError> {
+            if self.rounds.fetch_add(1, Ordering::SeqCst) == 0 {
+                for n in 1..=2 {
+                    let path = self.dir.join(format!("{n}.txt"));
+                    on_event(StreamEvent::ToolCallRequested {
+                        id: format!("call_{n}"),
+                        name: "write".into(),
+                        arguments:
+                            serde_json::json!({"path": path.to_string_lossy(), "content": "x"})
+                                .to_string(),
+                    });
+                }
+                on_event(StreamEvent::FinishReason("tool_calls".into()));
+            } else {
+                on_event(StreamEvent::TextDelta("done".into()));
+            }
+            on_event(StreamEvent::Done);
+            Ok(())
+        }
+        fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Row 3.9: the specialist's own `max_calls` from the catalogue
+    /// bounds how many tool calls its turn runs.
+    #[test]
+    fn a_specialists_max_calls_stops_tool_calls_past_the_cap() {
+        let root = std::env::temp_dir().join(format!("se-core-maxcalls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("dept")).unwrap();
+        std::fs::write(
+            root.join("dept/capped.md"),
+            "---\nschema_version: 1\nid: capped\nname: Capped\ndepartment: dept\nmax_calls: 1\n---\n\nbody\n",
+        )
+        .unwrap();
+        let out = root.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let (mut runner, _) = runner_with(Vec::new(), Duration::ZERO, None);
+        let mut registry = Registry::empty();
+        registry.register(Box::new(TwoWritesProvider {
+            dir: out.clone(),
+            rounds: AtomicUsize::new(0),
+        }));
+        runner.registry = registry;
+        runner.provider_id = "twowrites".into();
+        runner.ruleset = Ruleset::from_rules(vec![se_permission::Rule::allow_all()]);
+        let runner = runner.with_catalogue_root(root.clone());
+
+        let (outcome, _) = run_specialist(runner, "capped", "write two");
+        assert_eq!(
+            outcome,
+            Outcome::Completed {
+                final_text: "done".into()
+            }
+        );
+        assert!(
+            out.join("1.txt").exists(),
+            "the first call is within budget"
+        );
+        assert!(
+            !out.join("2.txt").exists(),
+            "the second call exceeds max_calls: 1"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fit_history_keeps_the_newest_whole_exchanges_that_fit() {
+        let h = |role, n: usize| Message::text(role, "x".repeat(n));
+        let history = vec![
+            h(Role::User, 400),
+            h(Role::Assistant, 400),
+            h(Role::User, 40),
+            h(Role::Assistant, 40),
+        ];
+        assert_eq!(
+            fit_history(&history, None, 0).len(),
+            4,
+            "no budget, no trim"
+        );
+        // 100 tokens ~ 400 chars: only the newest exchange (80 chars) fits.
+        assert_eq!(fit_history(&history, Some(100), 0), &history[2..]);
+        // Room for the last answer alone must not keep it without its question.
+        assert!(fit_history(&history, Some(15), 0).is_empty());
+        // Fixed system prompt + request is charged against the budget.
+        assert!(fit_history(&history, Some(100), 400).is_empty());
+    }
+
+    /// Runs a specialist turn with a model override, answering every
+    /// approval with `allow`. Returns the outcome and approvals asked.
+    fn run_specialist_with_model(
+        runner: ProviderRunner,
+        model: se_protocol::ModelRef,
+        allow: bool,
+    ) -> (Outcome, usize) {
+        let core = crate::start(runner);
+        core.submit_specialist_with_model("spec", "hi", vec![], Some(model))
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut asked = 0;
+        while std::time::Instant::now() < deadline {
+            for event in core.drain_blocking(Duration::from_millis(20)) {
+                match event.payload {
+                    Payload::ApprovalRequired { call, .. } => {
+                        asked += 1;
+                        core.approve(se_protocol::ApprovalDecision {
+                            task: event.task,
+                            call,
+                            allow,
+                        });
+                    }
+                    Payload::TaskFinished { outcome, .. } => {
+                        core.shutdown();
+                        return (outcome, asked);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        panic!("no terminal event");
+    }
+
+    fn scoped_runner(ruleset: Ruleset) -> (ProviderRunner, Seen, Seen, std::path::PathBuf) {
+        let (runner, alpha, beta, _) = two_provider_runner();
+        let root = temp_catalogue("spec", "body");
+        let mut runner = runner.with_catalogue_root(root.clone());
+        runner.ruleset = ruleset;
+        (runner, alpha, beta, root)
+    }
+
+    /// Phase 4 item 2: a specialist cannot spend another provider's
+    /// credential without the gateway. Default ruleset asks the human.
+    #[test]
+    fn a_specialist_using_a_non_default_provider_needs_approval() {
+        for allow in [false, true] {
+            let (runner, alpha, beta, root) = scoped_runner(Ruleset::default());
+            let (outcome, asked) =
+                run_specialist_with_model(runner, model_ref("beta", "beta-large"), allow);
+            assert_eq!(asked, 1, "allow={allow}: asked exactly once");
+            assert!(alpha.lock().unwrap().is_empty());
+            if allow {
+                assert_eq!(
+                    outcome,
+                    Outcome::Completed {
+                        final_text: "from beta".into()
+                    }
+                );
+                assert_eq!(*beta.lock().unwrap(), ["beta-large"]);
+            } else {
+                assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
+                assert!(
+                    beta.lock().unwrap().is_empty(),
+                    "a refused key is never used"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn a_ruleset_deny_blocks_a_specialists_provider_without_asking() {
+        let (runner, _alpha, beta, root) =
+            scoped_runner(Ruleset::from_rules(vec![se_permission::Rule::deny_tool(
+                "use_provider",
+            )]));
+        let (outcome, asked) = run_specialist_with_model(runner, model_ref("beta", "m"), true);
+        assert_eq!(asked, 0, "a denial never reaches a human");
+        assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
+        assert!(beta.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Tool calls made during a specialist turn are decided and audited
+    /// under that specialist's id, not a shared native-loop identity.
+    #[test]
+    fn a_specialists_tool_calls_are_audited_under_its_own_id() {
+        let root = temp_catalogue("spec", "body");
+        let dir = std::env::temp_dir().join(format!("se-core-agent-audit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit_path = dir.join("audit.jsonl");
+        let args = serde_json::json!({"path": dir.join("f.txt").to_string_lossy(), "content": "c"})
+            .to_string();
+        let (runner, _) = tool_calling_runner(
+            "write",
+            args,
+            Ruleset::from_rules(vec![se_permission::Rule::allow_all()]),
+        );
+        let runner = runner
+            .with_catalogue_root(root.clone())
+            .with_audit_sink(Arc::new(
+                crate::audit_log::FileAuditSink::open(&audit_path).unwrap(),
+            ));
+        run_specialist(runner, "spec", "write it");
+        let records = crate::audit_log::read(&audit_path).unwrap();
+        assert!(!records.is_empty());
+        assert!(records.iter().all(|r| r["agent"] == "spec"), "{records:?}");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A call refused before the gateway (here: a path escaping the
+    /// workspace) still shows on the tool lifecycle and is audited.
+    #[test]
+    fn a_rejected_escape_attempt_is_visible_and_audited() {
+        let dir = std::env::temp_dir().join(format!("se-core-escape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("ws")).unwrap();
+        let audit_path = dir.join("audit.jsonl");
+        let args = serde_json::json!({"path": "../escaped.txt", "content": "x"}).to_string();
+        let (runner, _) = tool_calling_runner(
+            "write",
+            args,
+            Ruleset::from_rules(vec![se_permission::Rule::allow_all()]),
+        );
+        let runner = runner
+            .with_workspace_root(dir.join("ws"))
+            .with_audit_sink(Arc::new(
+                crate::audit_log::FileAuditSink::open(&audit_path).unwrap(),
+            ));
+        let (_, payloads) = run_auto_approving(runner, "escape", true);
+
+        assert!(!dir.join("escaped.txt").exists());
+        assert!(payloads.iter().any(|p| matches!(
+            p,
+            Payload::ToolCompleted { ok: false, preview, .. } if preview.contains("outside the workspace")
+        )), "{payloads:?}");
+        let records = crate::audit_log::read(&audit_path).unwrap();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0]["effect"], "Deny");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Answers the two routing questions with fixed replies, and any
+    /// other request with "answered", recording each request's system
+    /// prompt.
+    struct RoutingProvider {
+        dept_reply: &'static str,
+        role_reply: &'static str,
+        systems: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ModelProvider for RoutingProvider {
+        fn id(&self) -> &str {
+            "routing"
+        }
+        fn display_name(&self) -> &str {
+            "routing"
+        }
+        fn env_var(&self) -> &str {
+            "SE_TEST_ROUTING_KEY"
+        }
+        fn detect(&self) -> Status {
+            Status {
+                configured: true,
+                detail: "r".into(),
+                source: se_provider::Source::Environment,
+            }
+        }
+        fn stream(
+            &self,
+            request: &ChatRequest,
+            _cancelled: &dyn Fn() -> bool,
+            on_event: &mut dyn FnMut(StreamEvent) -> bool,
+        ) -> Result<(), ProviderError> {
+            let user = &request.messages.last().unwrap().content;
+            let reply = if user.contains("Which department") {
+                self.dept_reply
+            } else if user.contains("Which specialist") {
+                self.role_reply
+            } else {
+                self.systems
+                    .lock()
+                    .unwrap()
+                    .push(request.messages[0].content.clone());
+                "answered"
+            };
+            on_event(StreamEvent::TextDelta(reply.into()));
+            on_event(StreamEvent::Done);
+            Ok(())
+        }
+        fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn routing_catalogue() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "se-core-router-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for (dept, id, activation, body) in [
+            (
+                "backend-and-data",
+                "database-engineer",
+                "database schema migration",
+                "DB BODY",
+            ),
+            (
+                "backend-and-data",
+                "backend-lead",
+                "service endpoint",
+                "BACKEND BODY",
+            ),
+            (
+                "frontend",
+                "frontend-lead",
+                "react component screen",
+                "FRONTEND BODY",
+            ),
+        ] {
+            std::fs::create_dir_all(root.join(dept)).unwrap();
+            std::fs::write(
+                root.join(dept).join(format!("{id}.md")),
+                format!(
+                    "---\nschema_version: 1\nid: {id}\nname: {id}\ndepartment: {dept}\nenabled: true\nmission: works on {activation}\nactivation:\n  - {activation}\n---\n\n{body}\n"
+                ),
+            )
+            .unwrap();
+        }
+        root
+    }
+
+    fn run_routed(
+        dept_reply: &'static str,
+        role_reply: &'static str,
+        task: &str,
+        auto: bool,
+    ) -> (Vec<String>, Vec<Payload>) {
+        let systems = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut runner, _) = runner_with(Vec::new(), Duration::ZERO, None);
+        let mut registry = Registry::empty();
+        registry.register(Box::new(RoutingProvider {
+            dept_reply,
+            role_reply,
+            systems: systems.clone(),
+        }));
+        runner.registry = registry;
+        runner.provider_id = "routing".into();
+        let root = routing_catalogue();
+        let runner = runner
+            .with_catalogue_root(root.clone())
+            .with_auto_route(auto);
+        let (outcome, payloads) = run(runner, task);
+        assert_eq!(
+            outcome,
+            Outcome::Completed {
+                final_text: "answered".into()
+            }
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let seen = systems.lock().unwrap().clone();
+        (seen, payloads)
+    }
+
+    fn invoked(payloads: &[Payload]) -> Option<String> {
+        payloads.iter().find_map(|p| match p {
+            Payload::SpecialistInvoked { agent_id, .. } => Some(agent_id.clone()),
+            _ => None,
+        })
+    }
+
+    /// A turn naming no specialist is routed to one automatically, and
+    /// that specialist's own definition is the system prompt.
+    #[test]
+    fn an_unnamed_turn_is_routed_to_a_specialist() {
+        let (systems, payloads) = run_routed(
+            "backend-and-data",
+            "I'd pick database-engineer.",
+            "add an orders table",
+            true,
+        );
+        assert_eq!(invoked(&payloads).as_deref(), Some("database-engineer"));
+        assert_eq!(systems[0].trim(), "DB BODY");
+    }
+
+    /// A small model's useless answers fall back to keyword scoring.
+    #[test]
+    fn bad_routing_answers_fall_back_to_keywords() {
+        let (systems, payloads) = run_routed(
+            "no idea",
+            "",
+            "build a react component for the settings screen",
+            true,
+        );
+        assert_eq!(invoked(&payloads).as_deref(), Some("frontend-lead"));
+        assert_eq!(systems[0].trim(), "FRONTEND BODY");
+    }
+
+    /// Nothing matches anywhere: the turn still runs, as a plain turn.
+    #[test]
+    fn an_unroutable_turn_still_runs_without_a_specialist() {
+        let (systems, payloads) = run_routed("??", "??", "hello there", true);
+        assert_eq!(invoked(&payloads), None);
+        assert_eq!(systems[0], SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn with_auto_route_off_nothing_is_routed() {
+        let (systems, payloads) = run_routed(
+            "backend-and-data",
+            "database-engineer",
+            "add an orders table",
+            false,
+        );
+        assert_eq!(invoked(&payloads), None);
+        assert_eq!(systems.len(), 1, "no routing questions were asked");
+    }
 }
+
+#[cfg(test)]
+#[path = "team_run_tests.rs"]
+mod team_run_tests;

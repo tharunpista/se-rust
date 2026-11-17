@@ -844,6 +844,7 @@ dependencies = [
  "se-catalogue",
  "se-command",
  "se-core",
+ "se-permission",
  "se-protocol",
  "se-provider",
  "se-tui",
@@ -869,7 +870,9 @@ dependencies = [
  "se-permission",
  "se-protocol",
  "se-provider",
+ "serde",
  "serde_json",
+ "serde_yaml_ng",
  "windows-sys 0.59.0",
 ]
 

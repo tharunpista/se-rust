@@ -23,10 +23,32 @@ pub fn search_text(
     Ok(matches)
 }
 
+/// A symlink, or on Windows any reparse point (junctions included),
+/// judged without following it.
+fn is_link(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return true; // unreadable: treat as unsafe to follow
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    meta.file_type().is_symlink()
+}
+
 fn walk(dir: &Path, needle: &str, out: &mut Vec<SearchMatch>) -> Result<(), ToolError> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
+        // Never follow a link while walking: a symlink or junction inside
+        // the root can point outside it, or at an ancestor and loop.
+        if is_link(&path) {
+            continue;
+        }
         if path.is_dir() {
             walk(&path, needle, out)?;
         } else if let Ok(content) = std::fs::read_to_string(&path) {
@@ -72,5 +94,35 @@ mod tests {
         assert!(results.iter().any(|m| m.text == "another needle line"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A junction (or symlink) inside the searched root is not followed,
+    /// so search cannot read outside the workspace or loop on a cycle.
+    #[test]
+    fn search_does_not_follow_a_link_out_of_the_root() {
+        let base = std::env::temp_dir().join(format!("se-core-search-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let (root, outside) = (base.join("root"), base.join("outside"));
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "needle outside").unwrap();
+        fs::write(root.join("in.txt"), "needle inside").unwrap();
+        #[cfg(windows)]
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(root.join("link"))
+            .arg(&outside)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&outside, root.join("link")).is_ok();
+        assert!(made, "could not create the link this test needs");
+
+        let ledger = NonceLedger::new();
+        let granted = granted_for("search", &root, &root, vec![], &ledger);
+        let found = search_text(&granted, &root, "needle").unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].path.ends_with("in.txt"));
+        let _ = fs::remove_dir_all(&base);
     }
 }

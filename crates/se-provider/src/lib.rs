@@ -11,6 +11,7 @@
 //! safe because the only caller is a task worker (see `se-core`), never
 //! an interface.
 
+pub mod anthropic;
 pub mod credentials;
 pub mod openai_compatible;
 

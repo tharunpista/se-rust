@@ -231,17 +231,26 @@ impl TurnSink {
     /// waiting, or if the interface disappeared: a withheld decision is
     /// never treated as permission.
     pub fn request_approval(&mut self, name: &str, summary: &str) -> Option<ToolCallId> {
+        let call = self.announce_approval(name, summary)?;
+        self.await_decision(call, name)
+    }
+
+    /// First half of [`request_approval`](Self::request_approval): mints
+    /// the call id and tells the interface. Split out so a test can
+    /// deliver replies *before* the worker parks (row 4.9).
+    pub(crate) fn announce_approval(&mut self, name: &str, summary: &str) -> Option<ToolCallId> {
         let call = ToolCallId::next();
-        if self
-            .emit(Payload::ApprovalRequired {
-                call,
-                name: name.to_string(),
-                summary: summary.to_string(),
-            })
-            .is_err()
-        {
-            return None;
-        }
+        self.emit(Payload::ApprovalRequired {
+            call,
+            name: name.to_string(),
+            summary: summary.to_string(),
+        })
+        .ok()?;
+        Some(call)
+    }
+
+    /// Second half: waits for the decision naming `call`.
+    pub(crate) fn await_decision(&mut self, call: ToolCallId, name: &str) -> Option<ToolCallId> {
         let waiting = se_protocol::Running::start(Stage::ApprovalWait);
         // A decision must name the call it answers. Anything else is
         // discarded and the wait continues.

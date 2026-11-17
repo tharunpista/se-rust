@@ -20,16 +20,19 @@
 //! }
 //! ```
 
+pub mod audit_log;
 pub mod engine;
 pub mod provider_runner;
+pub mod router;
 pub mod routing;
 pub mod runner;
 pub mod session_store;
 pub mod sink;
+pub mod team;
 pub mod tool_loop;
 pub mod tools;
 
-pub use engine::{start, CoreHandle, SubmitError};
+pub use engine::{start, start_isolated_pool, start_pool, CoreHandle, SubmitError};
 pub use provider_runner::ProviderRunner;
 pub use runner::{ApprovalRunner, EchoRunner, Runner};
 pub use sink::{Disconnected, TurnSink};

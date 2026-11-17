@@ -180,10 +180,10 @@ pub fn builtins() -> Vec<Builtin> {
             path: "team",
             aliases: &[],
             category: "Team",
-            description: "Multi-agent, multi-model run configuration and monitoring",
+            description: "Run a team file: many agents and models at once, with a live monitor",
             handler: HandlerKind::UiAction,
             security_critical: false,
-            availability: Availability::NotImplemented("team orchestration lands in Phase 4"),
+            availability: Availability::Ready,
         },
         // ---- Tools & connectors --------------------------------------
         Builtin {

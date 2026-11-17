@@ -40,6 +40,11 @@ pub trait Runner: Send + Sync + 'static {
     /// [`TurnSink::is_cancelled`] wherever it would otherwise keep the
     /// user waiting.
     fn run(&self, turn: &UserTurn, history: &[Message], sink: &mut TurnSink) -> Outcome;
+
+    /// Called once by a team run before any node starts, so the runner
+    /// can enforce file claims and the token budget. Runners with no
+    /// files or model calls to govern ignore it.
+    fn attach_team(&mut self, _team: crate::team::TeamContext) {}
 }
 
 /// A runner with no dependencies, used to exercise the pipeline.
@@ -377,6 +382,7 @@ mod tests {
                         saw_request = true;
                         // Say no, the way an interface would.
                         handle.approve(se_protocol::ApprovalDecision {
+                            task: event.task,
                             call: *call,
                             allow: false,
                         });
@@ -411,6 +417,7 @@ mod tests {
                 match &event.payload {
                     Payload::ApprovalRequired { call, .. } => {
                         handle.approve(se_protocol::ApprovalDecision {
+                            task: event.task,
                             call: *call,
                             allow: true,
                         });

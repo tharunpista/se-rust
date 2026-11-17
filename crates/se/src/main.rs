@@ -7,6 +7,8 @@
 //! crate grew to 15,000 lines precisely because it kept acquiring
 //! "just one more" responsibility.
 
+mod team_cmd;
+
 use std::io::{self, IsTerminal, Stdout, Write};
 use std::time::Duration;
 
@@ -24,7 +26,7 @@ use se_core::{EchoRunner, ProviderRunner};
 use se_protocol::{timings::format_duration, Outcome, Payload, Stage};
 use se_provider::{credentials, Registry};
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(name = "se", version, about = "SE — a standalone engineering agent")]
 struct Cli {
     /// Provider to use, e.g. `nvidia`. With exactly one provider
@@ -40,8 +42,14 @@ struct Cli {
     command: Option<Command>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum Command {
+    /// Run a team of specialists, each on any vendor's model, from a
+    /// YAML team file (see `se_core::team::file` for the format).
+    Team {
+        #[command(subcommand)]
+        command: TeamCommand,
+    },
     /// Run one request without the interface, streaming to stdout.
     Exec {
         /// What to ask for.
@@ -90,6 +98,13 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::SUCCESS
         }
         Some(Command::Exec { request }) => exec(&cli, request),
+        Some(Command::Team { command }) => match command {
+            TeamCommand::Run { file } => team_cmd::run_file(&cli, file),
+            TeamCommand::Resume {
+                journal,
+                max_concurrent,
+            } => team_cmd::resume(&cli, journal, *max_concurrent),
+        },
         Some(Command::Connect { provider, from_env }) => {
             connect(provider.as_deref(), from_env.as_deref())
         }
@@ -190,9 +205,12 @@ fn interactive(cli: &Cli, startup: se_protocol::Running) -> io::Result<()> {
         Ok((provider_id, model)) => match ProviderRunner::new(provider_id, model) {
             Ok(mut runner) => {
                 if let Some(root) = catalogue_root.clone() {
-                    runner = runner.with_catalogue_root(root);
+                    // A turn that names no specialist gets one picked
+                    // from the catalogue automatically.
+                    runner = runner.with_catalogue_root(root).with_auto_route(true);
                 }
-                (se_core::start(runner), None)
+                let (runner, audit_warning) = with_audit_log(runner);
+                (se_core::start(runner), audit_warning)
             }
             Err(e) => {
                 let _ = restore();
@@ -262,7 +280,11 @@ fn interactive(cli: &Cli, startup: se_protocol::Running) -> io::Result<()> {
     }
 
     let first_frame = startup.finish();
-    let result = se_tui::run(&mut terminal, &core, banner, specialists);
+    // `/team run <file>` builds its runner the same way `se team run`
+    // does, at the moment it is asked for.
+    let team_cli = cli.clone();
+    let launcher: se_tui::team::Launcher = Box::new(move |path| team_cmd::start(&team_cli, path));
+    let result = se_tui::run(&mut terminal, &core, banner, specialists, Some(launcher));
     core.shutdown();
     restore()?;
 
@@ -306,6 +328,46 @@ fn restore() -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Subcommand, Clone)]
+enum TeamCommand {
+    /// Start a run from a team file.
+    Run { file: std::path::PathBuf },
+    /// Continue a run from its journal after SE stopped.
+    Resume {
+        journal: std::path::PathBuf,
+        /// How many tasks may run at once. Default: what the run was
+        /// started with.
+        #[arg(long)]
+        max_concurrent: Option<usize>,
+    },
+}
+
+/// Asks a question on the terminal and returns the trimmed, lowercased
+/// answer. `None` when no terminal is attached or reading fails: a
+/// question nobody can answer is never answered on their behalf.
+fn ask_terminal(question: &str) -> Option<String> {
+    if !io::stdin().is_terminal() {
+        return None;
+    }
+    eprint!("{question}");
+    let _ = io::stderr().flush();
+    let mut line = String::new();
+    io::stdin().read_line(&mut line).ok()?;
+    Some(line.trim().to_ascii_lowercase())
+}
+
+/// A tool approval asked on the terminal. Only an explicit yes allows;
+/// no terminal, an empty line or anything else denies.
+fn ask_approval(prefix: &str, name: &str, summary: &str) -> bool {
+    match ask_terminal(&format!("{prefix}allow {name}: {summary}? [y/N] ")) {
+        Some(a) => a == "y" || a == "yes",
+        None => {
+            eprintln!("{prefix}denied {name}: no terminal to ask for approval");
+            false
+        }
+    }
+}
+
 fn exec(cli: &Cli, request: &str) -> std::process::ExitCode {
     let (provider_id, model) = match resolve(cli) {
         Ok(pair) => pair,
@@ -321,6 +383,14 @@ fn exec(cli: &Cli, request: &str) -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     };
+    let runner = match catalogue_root().filter(|root| root.exists()) {
+        Some(root) => runner.with_catalogue_root(root).with_auto_route(true),
+        None => runner,
+    };
+    let (runner, audit_warning) = with_audit_log(runner);
+    if let Some(warning) = audit_warning {
+        eprintln!("se: {warning}");
+    }
 
     let core = se_core::start(runner);
     if let Err(e) = core.submit(request, Vec::new()) {
@@ -334,6 +404,20 @@ fn exec(cli: &Cli, request: &str) -> std::process::ExitCode {
                 Payload::Delta { text, .. } => {
                     print!("{text}");
                     let _ = io::stdout().flush();
+                }
+                // Without this, a call needing approval waited forever:
+                // nothing in a headless run ever answered it.
+                Payload::ApprovalRequired {
+                    call,
+                    name,
+                    summary,
+                } => {
+                    let allow = ask_approval("se: ", &name, &summary);
+                    core.approve(se_protocol::ApprovalDecision {
+                        task: event.task,
+                        call,
+                        allow,
+                    });
                 }
                 Payload::UsageUpdated(usage) => {
                     // stderr, so stdout stays the answer alone and
@@ -488,6 +572,19 @@ fn providers() -> std::process::ExitCode {
 /// `~/SE/se/agents` (`%USERPROFILE%` on Windows, `$HOME` elsewhere),
 /// the same real catalogue tree `se-catalogue`'s own tests load --
 /// overridable by `SE_CATALOGUE_ROOT` for a different install layout.
+/// Attaches `.se/audit.jsonl` (every gateway decision, row 2.5). A file
+/// that cannot be opened is reported, not fatal, matching session logs.
+fn with_audit_log(runner: ProviderRunner) -> (ProviderRunner, Option<String>) {
+    let path = match std::env::current_dir() {
+        Ok(cwd) => cwd.join(".se").join("audit.jsonl"),
+        Err(e) => return (runner, Some(format!("⚠ tool decisions not audited ({e})"))),
+    };
+    match se_core::audit_log::FileAuditSink::open(&path) {
+        Ok(sink) => (runner.with_audit_sink(std::sync::Arc::new(sink)), None),
+        Err(e) => (runner, Some(format!("⚠ tool decisions not audited ({e})"))),
+    }
+}
+
 fn catalogue_root() -> Option<std::path::PathBuf> {
     if let Ok(root) = std::env::var("SE_CATALOGUE_ROOT") {
         return Some(std::path::PathBuf::from(root));

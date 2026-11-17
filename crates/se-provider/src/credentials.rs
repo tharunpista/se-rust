@@ -214,6 +214,12 @@ impl HeaderSafeKey {
     pub fn as_bearer(&self) -> String {
         format!("Bearer {}", self.0)
     }
+
+    /// The bare key, for services that take it in their own header
+    /// (Anthropic's `x-api-key`). Same header-safety guarantee.
+    pub fn as_header_value(&self) -> &str {
+        &self.0
+    }
 }
 
 pub fn source(id: &str, env_var: &str) -> Source {
