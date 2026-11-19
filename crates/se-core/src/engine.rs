@@ -57,6 +57,8 @@ pub enum SubmitError {
     Busy { running: TaskId },
     /// The core has shut down.
     Stopped,
+    /// The text carries something shaped like an API key; it was not sent or recorded.
+    LooksLikeSecret,
 }
 
 impl std::fmt::Display for SubmitError {
@@ -66,6 +68,10 @@ impl std::fmt::Display for SubmitError {
                 write!(f, "task {running} is still running — interrupt it first")
             }
             SubmitError::Stopped => write!(f, "the core has stopped"),
+            SubmitError::LooksLikeSecret => write!(
+                f,
+                "that looks like an API key, so it was not sent or saved. To connect a provider use /connect <provider>"
+            ),
         }
     }
 }
@@ -206,6 +212,11 @@ impl CoreHandle {
         specialist_id: Option<String>,
         team_node: Option<String>,
     ) -> Result<TaskId, SubmitError> {
+        // A user's text never carries a key to a model or a session file. Team nodes are
+        // authored prompts, not pastes, so a false positive must not fail a run.
+        if team_node.is_none() && se_provider::credentials::looks_like_secret(text) {
+            return Err(SubmitError::LooksLikeSecret);
+        }
         // Allocated here and carried in the operation, so the id the
         // caller receives is the id every event about this task uses.
         let task = TaskId::next();
@@ -251,6 +262,16 @@ impl CoreHandle {
 
     pub fn shutdown(&self) {
         let _ = self.ops.send(CoreOp::Shutdown);
+    }
+
+    /// Sets, or with `None` clears, the conversation's specialist.
+    pub fn set_specialist(&self, id: Option<&str>) {
+        let _ = self.ops.send(CoreOp::SetSpecialist(id.map(str::to_string)));
+    }
+
+    /// Sets how tool calls are handled: manual, auto or plan.
+    pub fn set_mode(&self, mode: se_protocol::WorkMode) {
+        let _ = self.ops.send(CoreOp::SetMode(mode));
     }
 
     /// Takes whatever the core has produced since the last call.
@@ -312,7 +333,47 @@ impl CoreHandle {
 /// concurrent tasks can never interleave half an exchange.
 /// `None` for an isolated pool: each task starts from nothing and
 /// leaves nothing behind (see [`start_isolated_pool`]).
-type History = Option<Arc<std::sync::Mutex<Vec<Message>>>>;
+type History = Option<Arc<Conversation>>;
+
+/// The shared transcript, plus where it is saved when the session is a
+/// resumable conversation (see [`start_conversation`]).
+struct Conversation {
+    messages: std::sync::Mutex<Vec<Message>>,
+    path: Option<std::path::PathBuf>,
+}
+
+impl Conversation {
+    /// Saves the transcript whole: written to a sibling temp file, then
+    /// renamed over the old one, so a crash mid-write never leaves a
+    /// half-written conversation behind.
+    fn save(&self, messages: &[Message]) {
+        let Some(path) = &self.path else { return };
+        let Ok(json) = serde_json::to_string(messages) else {
+            return;
+        };
+        let json = se_provider::credentials::redact_secrets(&json);
+        let tmp = path.with_extension("json.tmp");
+        // shortcut: a failed save is dropped (the turn already happened and
+        // the in-memory transcript is intact); surface it if users hit it.
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+}
+
+/// Reads a saved conversation; a missing file is a new, empty one.
+pub fn load_conversation(path: &std::path::Path) -> std::io::Result<Vec<Message>> {
+    match std::fs::read(path) {
+        // Redacted on the way in too: a file saved before the guard existed (or edited by
+        // hand) must never resend a key as `prior` history.
+        Ok(bytes) => serde_json::from_str(&se_provider::credentials::redact_secrets(
+            &String::from_utf8_lossy(&bytes),
+        ))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
 
 /// A task the supervisor is tracking.
 struct ActiveTask {
@@ -349,17 +410,43 @@ pub fn start<R: Runner>(runner: R) -> CoreHandle {
 /// a core has exactly one provider, so a per-provider cap would equal
 /// this one. Add them when the runner is registry-backed.
 pub fn start_pool<R: Runner>(runner: R, max_concurrent: usize) -> CoreHandle {
-    start_with(runner, max_concurrent, true)
+    start_with(runner, max_concurrent, Some(conversation(Vec::new(), None)))
+}
+
+/// Like [`start`], but the conversation is loaded from `path` (if it
+/// exists) and saved back to it after every completed turn, so a later
+/// `se --resume` continues it -- on any provider -- without the user
+/// re-explaining anything.
+pub fn start_conversation<R: Runner>(
+    runner: R,
+    path: &std::path::Path,
+) -> std::io::Result<CoreHandle> {
+    let prior = load_conversation(path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(start_with(
+        runner,
+        1,
+        Some(conversation(prior, Some(path.to_path_buf()))),
+    ))
+}
+
+fn conversation(messages: Vec<Message>, path: Option<std::path::PathBuf>) -> Arc<Conversation> {
+    Arc::new(Conversation {
+        messages: std::sync::Mutex::new(messages),
+        path,
+    })
 }
 
 /// Like [`start_pool`], but no task sees or extends a shared transcript.
 /// For scheduled team work: one task's finished output must never reach
 /// another task as conversation it appears to have had (Phase 4 item 1).
 pub fn start_isolated_pool<R: Runner>(runner: R, max_concurrent: usize) -> CoreHandle {
-    start_with(runner, max_concurrent, false)
+    start_with(runner, max_concurrent, None)
 }
 
-fn start_with<R: Runner>(runner: R, max_concurrent: usize, shared_history: bool) -> CoreHandle {
+fn start_with<R: Runner>(runner: R, max_concurrent: usize, history: History) -> CoreHandle {
     assert!(max_concurrent > 0, "a worker pool needs at least one slot");
     let (op_tx, op_rx) = sync_channel(OP_QUEUE);
     let (event_tx, event_rx) = sync_channel(EVENT_QUEUE);
@@ -369,7 +456,6 @@ fn start_with<R: Runner>(runner: R, max_concurrent: usize, shared_history: bool)
     let runner = Arc::new(runner);
     let seq = Arc::new(SeqCounter::new());
     let supervisor_events = event_tx.clone();
-    let history: History = shared_history.then(|| Arc::new(std::sync::Mutex::new(Vec::new())));
 
     std::thread::Builder::new()
         .name("se-supervisor".to_string())
@@ -554,6 +640,8 @@ fn supervise<R: Runner>(
                     let _ = task.approvals.send((call, allow));
                 }
             }
+            CoreOp::SetSpecialist(id) => runner.set_specialist(id),
+            CoreOp::SetMode(mode) => runner.set_mode(mode),
             CoreOp::Shutdown => {
                 // Signal every task before joining any, so they unwind
                 // in parallel rather than one after another.
@@ -605,7 +693,7 @@ fn spawn_worker<R: Runner>(
             // the lock is never held across it.
             let prior: Vec<Message> = history
                 .as_ref()
-                .map(|h| h.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .map(|h| h.messages.lock().unwrap_or_else(|e| e.into_inner()).clone())
                 .unwrap_or_default();
 
             let outcome = runner.run(&turn, &prior, &mut sink);
@@ -623,9 +711,17 @@ fn spawn_worker<R: Runner>(
             // or failed turn leaves no half-exchange behind to confuse
             // the next one.
             if let (Outcome::Completed { final_text }, Some(history)) = (&outcome, &history) {
-                let mut conversation = history.lock().unwrap_or_else(|e| e.into_inner());
+                let mut conversation = history.messages.lock().unwrap_or_else(|e| e.into_inner());
+                // A compaction is applied only if the transcript still
+                // starts with exactly what this turn summarized.
+                if let Some((covers, with)) = sink.compaction.take() {
+                    if conversation.get(..covers) == prior.get(..covers) {
+                        conversation.splice(..covers, with);
+                    }
+                }
                 conversation.push(Message::text(Role::User, turn.text.clone()));
                 conversation.push(Message::text(Role::Assistant, final_text.clone()));
+                history.save(&conversation);
             }
 
             let _ = sink.finish_turn();
@@ -887,6 +983,38 @@ mod tests {
             seqs.windows(2).all(|w| w[1] > w[0]),
             "sequence must be monotonic: {seqs:?}"
         );
+        handle.shutdown();
+    }
+
+    /// A conversation saved before the guard (the incident's file) loads redacted.
+    #[test]
+    fn a_saved_conversation_holding_a_key_loads_redacted() {
+        let path = std::env::temp_dir().join(format!("se-redact-{}.json", std::process::id()));
+        let _cleanup = scopeguard(path.clone());
+        std::fs::write(
+            &path,
+            r#"[{"role":"User","content":"key:\nsk-abcdefghij0123456789ABCDEFGHIJ"}]"#,
+        )
+        .unwrap();
+        let loaded = load_conversation(&path).unwrap();
+        assert_eq!(loaded[0].content, "key:\n[REDACTED]");
+    }
+
+    /// The incident: a pasted key went to a model and into the session file.
+    #[test]
+    fn a_pasted_api_key_is_refused_and_never_reaches_the_runner() {
+        let handle = start(EchoRunner::instant());
+        let key = "sk-abcdefghij0123456789ABCDEFGHIJ0123456789abcdefghij0";
+        assert!(matches!(
+            handle.submit(key, vec![]),
+            Err(SubmitError::LooksLikeSecret)
+        ));
+        assert!(matches!(
+            handle.submit_with_model(&format!("connect this {key}"), vec![], None),
+            Err(SubmitError::LooksLikeSecret)
+        ));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(handle.drain().is_empty(), "nothing started, nothing recorded");
         handle.shutdown();
     }
 

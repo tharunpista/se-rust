@@ -32,6 +32,10 @@ pub enum PickerScope {
     #[default]
     Commands,
     Agents,
+    /// `/models`: every model the configured providers reported.
+    Models,
+    /// `/connect`: every provider with its real state.
+    Providers,
 }
 
 /// Whether the picker is open, and if so where its trigger sits.

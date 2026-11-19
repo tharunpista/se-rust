@@ -17,7 +17,8 @@ use crate::state::{AppState, Entry};
 /// Builds a run from a team file. Supplied by the binary, which owns
 /// provider, credential and catalogue construction.
 /// Returns the run and lines to show the operator (journal path, warnings).
-pub type Launcher = Box<dyn Fn(&Path) -> Result<(TeamRun, Vec<String>), String>>;
+/// Starts a team file in the interface's current work mode.
+pub type Launcher = Box<dyn Fn(&Path, se_protocol::WorkMode) -> Result<(TeamRun, Vec<String>), String>>;
 
 #[derive(Default)]
 pub struct Panel {
@@ -48,7 +49,7 @@ impl Panel {
                 Some(run) => table(run),
                 None => format!("no team run. {USAGE}"),
             },
-            (Some("run"), Some(file)) => self.start(Path::new(file)),
+            (Some("run"), Some(file)) => self.start(state, Path::new(file)),
             (Some("allow"), _) => self.answer(true),
             (Some("deny"), _) => self.answer(false),
             (Some("cancel"), _) => match self.run.as_mut() {
@@ -71,15 +72,18 @@ impl Panel {
         state.push(Entry::Notice(msg));
     }
 
-    fn start(&mut self, file: &Path) -> String {
+    fn start(&mut self, state: &mut AppState, file: &Path) -> String {
         if self.run.is_some() && !self.finished {
             return "a team run is already in progress (`/team cancel` first)".into();
         }
         let Some(launch) = &self.launcher else {
             return "team runs need a configured provider; none is available here".into();
         };
-        match launch(file) {
+        match launch(file, state.mode) {
             Ok((run, notes)) => {
+                // The strip shows this run's agents only.
+                crate::agents::set_focus(state, crate::agents::Focus::Composer);
+                state.agents.agents.clear();
                 self.run = Some(run);
                 self.last.clear();
                 self.approvals.clear();
@@ -142,6 +146,12 @@ impl Panel {
             state.push(Entry::Notice(notice));
             changed = true;
         }
+        // After this tick's events and before the `is_done` check below, so
+        // the final Done/Failed arrive in the same call that finishes the run.
+        for e in run.take_agent_events() {
+            state.agents.apply(&e);
+            changed = true;
+        }
         for n in run.graph().nodes() {
             let s = run.graph().state(&n.id).expect("own node");
             if self.last.insert(n.id.clone(), s) != Some(s) {
@@ -198,7 +208,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn launcher() -> Launcher {
-        Box::new(|_: &Path| {
+        Box::new(|_: &Path, _| {
             let graph = TaskGraph::new(vec![NodeSpec {
                 id: "a".into(),
                 agent: String::new(),
@@ -248,6 +258,16 @@ mod tests {
         let all = notices(&state);
         assert!(all.contains("team [a] Completed"), "{all}");
         assert!(all.contains("tokens"), "monitor table shown: {all}");
+        // The strip got the same run as agent events, activity included.
+        let a = &state.agents.agents;
+        assert_eq!(a.len(), 1);
+        assert_eq!((a[0].id.as_str(), a[0].state), ("a", se_protocol::AgentState::Done));
+        assert!(a[0].ended.is_some());
+        assert!(
+            a[0].transcript.iter().any(|e| matches!(e, Entry::Approval { .. })),
+            "{:?}",
+            a[0].transcript
+        );
     }
 
     #[test]

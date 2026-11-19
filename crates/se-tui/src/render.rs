@@ -47,8 +47,13 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         area,
     );
 
-    let banner_height = if state.banner.is_some() { 1 } else { 0 };
+    // A long banner wraps (up to 3 rows) rather than running off-screen.
+    let banner_height = state.banner.as_ref().map_or(0, |b| {
+        let width = usize::from(area.width.max(2)) - 1;
+        (b.chars().count() + 1).div_ceil(width).clamp(1, 3) as u16
+    });
     let composer_height = composer_height(state, area.width.saturating_sub(2));
+    let strip_height = strip_height(&state.agents);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -56,6 +61,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
             Constraint::Length(banner_height),   // optional warning banner
             Constraint::Min(3),                  // transcript
             Constraint::Length(composer_height), // composer
+            Constraint::Length(strip_height),    // agent strip (0 rows: none)
             Constraint::Length(1),               // help bar
         ])
         .split(area);
@@ -64,15 +70,99 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     if let Some(banner) = &state.banner {
         draw_banner(f, chunks[1], banner);
     }
-    draw_transcript(f, chunks[2], state);
+    match state.agents.viewing() {
+        // The agent's own transcript in the transcript area, with the same
+        // wrapping and scroll handling, by lending it the slot.
+        Some(i) => {
+            std::mem::swap(&mut state.transcript, &mut state.agents.agents[i].transcript);
+            draw_transcript(f, chunks[2], state);
+            std::mem::swap(&mut state.transcript, &mut state.agents.agents[i].transcript);
+        }
+        None => draw_transcript(f, chunks[2], state),
+    }
     draw_composer(f, chunks[3], state);
-    draw_help_bar(f, chunks[4], state);
+    draw_strip(f, chunks[4], state);
+    draw_help_bar(f, chunks[5], state);
     // Drawn last, over the transcript, so opening the picker never
     // reflows the conversation or moves the composer under the user's
     // cursor.
     if state.picker.is_open() {
         draw_picker(f, chunks[2], state);
     }
+    if let Some(ov) = &state.sessions {
+        draw_sessions(f, chunks[2], ov, state.session_id.as_deref());
+    }
+}
+
+/// The `/resume` picker, over the whole transcript area.
+fn draw_sessions(f: &mut Frame, area: Rect, ov: &crate::sessions::Overlay, open: Option<&str>) {
+    if area.height < 4 {
+        return;
+    }
+    let scope = if ov.all { "all recent projects" } else { "this project" };
+    let title = format!(" conversations · {scope} · {} ", ov.items.len());
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::LAVENDER).bg(theme::CHARCOAL))
+            .title(Span::styled(title, theme::accent()))
+            .style(Style::default().bg(theme::CHARCOAL)),
+        area,
+    );
+    let inner = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    // The last inner row is the prompt / message line.
+    let room = usize::from(inner.height.saturating_sub(1)).max(1);
+    let width = usize::from(inner.width);
+    let mut lines: Vec<Line> = Vec::new();
+    if ov.items.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no saved conversations yet (one is saved after its first reply)",
+            theme::muted(),
+        )));
+    }
+    let first = ov.selected.saturating_sub(room - 1);
+    for (i, it) in ov.items.iter().enumerate().skip(first).take(room) {
+        let selected = i == ov.selected;
+        let r = &it.row;
+        let mut meta = format!(
+            "  {} · {} · {} msgs",
+            crate::sessions::age(r.modified),
+            r.model.as_deref().unwrap_or("model ?"),
+            r.messages
+        );
+        if let Some(p) = &it.elsewhere {
+            meta.push_str(&format!(" · {}", p.display()));
+        }
+        if it.elsewhere.is_none() && open == Some(r.id.as_str()) {
+            meta.push_str(" · open");
+        }
+        let pin = if r.pinned { "* " } else { "  " };
+        let title_room = width.saturating_sub(meta.chars().count() + 4).max(10);
+        lines.push(Line::from(vec![
+            Span::styled(if selected { "▌" } else { " " }, Style::default().fg(theme::LAVENDER)),
+            Span::styled(pin, theme::accent()),
+            Span::styled(
+                truncate(&r.title, title_room),
+                if selected { theme::accent_bold() } else { theme::base() },
+            ),
+            Span::styled(meta, theme::muted()),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines).style(theme::base()), inner);
+    let prompt = match &ov.mode {
+        crate::sessions::Mode::Rename(buf) => format!("new title: {buf}▏  (Enter save · Esc cancel · empty = first message)"),
+        _ => ov.message.clone().unwrap_or_default(),
+    };
+    let last = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(truncate(&prompt, width), theme::accent()))).style(theme::base()),
+        last,
+    );
 }
 
 /// The `/` command picker, as an overlay anchored to the bottom of the
@@ -97,10 +187,28 @@ fn draw_picker(f: &mut Frame, transcript_area: Rect, state: &AppState) {
         width: transcript_area.width,
         height,
     };
+    // How many match and where the highlight is, so a long list (100+
+    // models) shows that there is more below and that typing filters it.
+    let what = match state.picker.scope() {
+        crate::picker::PickerScope::Commands => "commands",
+        crate::picker::PickerScope::Agents => "agents",
+        crate::picker::PickerScope::Models => "models",
+        crate::picker::PickerScope::Providers => "providers",
+    };
+    let title = if candidates.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " {what} {} of {} \u{b7} type to filter ",
+            state.picker.selected().min(candidates.len() - 1) + 1,
+            candidates.len()
+        )
+    };
     f.render_widget(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::LAVENDER).bg(theme::CHARCOAL))
+            .title(Span::styled(title, theme::accent()))
             .style(Style::default().bg(theme::CHARCOAL)),
         area,
     );
@@ -127,6 +235,14 @@ fn draw_picker(f: &mut Frame, transcript_area: Rect, state: &AppState) {
     // Scroll the window so the highlight is always inside it.
     let first = selected.saturating_sub(MAX_ROWS - 1);
     let mut lines: Vec<Line> = Vec::with_capacity(visible);
+    // One column width for the whole list, so names and descriptions
+    // line up and a long name never runs into its tag.
+    let name_width = candidates
+        .iter()
+        .map(|c| c.path.chars().count())
+        .max()
+        .unwrap_or(0)
+        .clamp(12, 40);
     for (offset, spec) in candidates.iter().skip(first).take(visible).enumerate() {
         let idx = first + offset;
         let is_selected = idx == selected;
@@ -143,9 +259,14 @@ fn draw_picker(f: &mut Frame, transcript_area: Rect, state: &AppState) {
         // row kinds the way a mixed list would.
         let mut spans = vec![
             Span::styled(marker, Style::default().fg(theme::LAVENDER)),
-            Span::styled(format!(" /{:<16}", spec.path), name_style),
+            Span::styled(format!(" /{:<name_width$}  ", spec.path), name_style),
         ];
-        if state.picker.scope() == crate::picker::PickerScope::Agents {
+        // Agents carry their department; a model's provider is already
+        // the first part of its name, so it gets no tag.
+        if matches!(
+            state.picker.scope(),
+            crate::picker::PickerScope::Agents | crate::picker::PickerScope::Providers
+        ) {
             spans.push(Span::styled(
                 format!("[{}] ", spec.category),
                 theme::accent(),
@@ -171,6 +292,85 @@ fn composer_height(state: &AppState, width: u16) -> u16 {
     state.composer.rows(width).clamp(1, 6) + 2
 }
 
+fn strip_height(strip: &crate::agents::Strip) -> u16 {
+    if strip.is_empty() {
+        0
+    } else if strip.collapsed() {
+        1
+    } else {
+        strip.agents.len().min(crate::agents::MAX_ROWS) as u16
+    }
+}
+
+/// One line per agent below the composer, or one summary line when there
+/// are many and the strip is not focused. Records rows for mouse clicks.
+fn draw_strip(f: &mut Frame, area: Rect, state: &mut AppState) {
+    use ratatui::style::Color;
+    use se_protocol::AgentState as S;
+    let strip = &state.agents;
+    let mut hit = Vec::new();
+    let mut lines = Vec::new();
+    let dot = |s: S| {
+        let c = match s {
+            S::Running => theme::LAVENDER,
+            S::Background => Color::Rgb(0x7a, 0xa8, 0xe0),
+            S::WaitingApproval => theme::WARN,
+            S::Done => theme::OK,
+            S::Failed => theme::ERROR,
+            S::Cancelled => theme::MUTED,
+        };
+        Span::styled(" \u{25cf} ", Style::default().fg(c).bg(theme::CHARCOAL))
+    };
+    if strip.collapsed() {
+        let active = strip.agents.iter().filter(|a| !a.state.is_terminal()).count();
+        let state_of_all = if active > 0 { S::Running } else { S::Done };
+        lines.push(Line::from(vec![
+            dot(state_of_all),
+            Span::styled(
+                format!(
+                    "{} agents · {active} running · {} finished  (↓ to expand)",
+                    strip.agents.len(),
+                    strip.agents.len() - active
+                ),
+                theme::base(),
+            ),
+        ]));
+        hit.push((area.y, None));
+    } else if !strip.is_empty() {
+        let now = std::time::Instant::now();
+        let selected = strip.selected();
+        let rows = usize::from(area.height);
+        // Keep the selection in the window.
+        let first = selected.map_or(0, |s| s.saturating_sub(rows.saturating_sub(1)));
+        for (i, a) in strip.agents.iter().enumerate().skip(first).take(rows) {
+            let name = if a.role == a.id {
+                a.id.clone()
+            } else {
+                format!("{} [{}]", a.role, a.id)
+            };
+            let tokens = a.tokens.map_or(String::new(), |t| format!(" · {t} tok"));
+            let text = format!(
+                "{name} · {} · {}{tokens}",
+                a.state.label(),
+                crate::agents::elapsed_label(a.elapsed(now))
+            );
+            let style = if selected == Some(i) {
+                theme::accent_bold().add_modifier(Modifier::REVERSED)
+            } else {
+                theme::base()
+            };
+            hit.push((area.y + (i - first) as u16, Some(i)));
+            lines.push(Line::from(vec![
+                dot(a.state),
+                Span::styled(text, style),
+                Span::styled(format!("  {}", truncate(&a.task, 60)), theme::muted()),
+            ]));
+        }
+    }
+    f.render_widget(Paragraph::new(lines).style(theme::base()), area);
+    state.agents.hit = hit;
+}
+
 fn draw_banner(f: &mut Frame, area: Rect, text: &str) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -180,7 +380,8 @@ fn draw_banner(f: &mut Frame, area: Rect, text: &str) {
                 .bg(theme::CHARCOAL)
                 .add_modifier(Modifier::BOLD),
         )))
-        .style(theme::base()),
+        .style(theme::base())
+        .wrap(Wrap { trim: false }),
         area,
     );
 }
@@ -202,11 +403,112 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState) {
             ));
         }
     }
-    if !state.status.is_empty() {
-        spans.push(Span::styled("  ·  ", theme::muted()));
-        spans.push(Span::styled(state.status.clone(), theme::muted()));
+    let sep = || Span::styled("  \u{b7}  ", theme::muted());
+    spans.push(sep());
+    match state.current_model() {
+        Some(m) => spans.push(Span::styled(m, theme::accent())),
+        None => spans.push(Span::styled(
+            "no model chosen",
+            Style::default().fg(theme::WARN).bg(theme::CHARCOAL),
+        )),
+    }
+    spans.push(sep());
+    spans.push(Span::styled(
+        format!("{} mode", state.mode.name()),
+        if state.mode == se_protocol::WorkMode::Auto { Style::default().fg(theme::WARN).bg(theme::CHARCOAL) } else { theme::muted() },
+    ));
+    if let Some(agent) = &state.agent {
+        spans.push(sep());
+        spans.push(Span::styled(agent.clone(), theme::base()));
+    }
+    if !state.folder.is_empty() {
+        spans.push(sep());
+        spans.push(Span::styled(state.folder.clone(), theme::muted()));
     }
     f.render_widget(Paragraph::new(Line::from(spans)).style(theme::base()), area);
+}
+
+/// Light Markdown for answers, with no new dependency: fenced code as a
+/// marked block (fence lines hidden, language shown), headings and
+/// `**bold**` emphasised, `inline code` highlighted, list bullets as dots.
+fn markdown_lines(text: &str) -> Vec<Line<'static>> {
+    let code = Style::default().fg(theme::LAVENDER).bg(theme::CHARCOAL);
+    let mut out = Vec::new();
+    let mut in_code = false;
+    for raw in text.lines() {
+        let trimmed = raw.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("```") {
+            in_code = !in_code;
+            let lang = rest.trim();
+            if in_code && !lang.is_empty() {
+                out.push(Line::from(Span::styled(
+                    format!("  {lang}"),
+                    theme::muted(),
+                )));
+            }
+            continue;
+        }
+        if in_code {
+            out.push(Line::from(vec![
+                Span::styled("  \u{2502} ", theme::muted()),
+                Span::styled(raw.to_string(), code),
+            ]));
+            continue;
+        }
+        let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+        if (1..=6).contains(&hashes) && trimmed[hashes..].starts_with(' ') {
+            out.push(Line::from(Span::styled(
+                trimmed[hashes..].trim().to_string(),
+                theme::accent_bold(),
+            )));
+            continue;
+        }
+        let indent = raw.len() - trimmed.len();
+        let (prefix, body) = match trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
+            Some(rest) => (format!("{}\u{2022} ", " ".repeat(indent)), rest),
+            None => (" ".repeat(indent), trimmed),
+        };
+        let mut spans = vec![Span::styled(prefix, theme::base())];
+        spans.extend(inline_spans(body, code));
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+/// `**bold**` and `` `code` `` within one line. An unclosed marker is
+/// shown as typed rather than swallowing the rest of the line.
+fn inline_spans(line: &str, code: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = line;
+    while !rest.is_empty() {
+        let next = [("**", rest.find("**")), ("`", rest.find('`'))]
+            .into_iter()
+            .filter_map(|(m, at)| at.map(|a| (a, m)))
+            .min();
+        let Some((at, marker)) = next else {
+            spans.push(Span::styled(rest.to_string(), theme::base()));
+            break;
+        };
+        let after = &rest[at + marker.len()..];
+        let Some(end) = after.find(marker) else {
+            spans.push(Span::styled(rest.to_string(), theme::base()));
+            break;
+        };
+        if at > 0 {
+            spans.push(Span::styled(rest[..at].to_string(), theme::base()));
+        }
+        let style = if marker == "`" {
+            code
+        } else {
+            theme::base().add_modifier(Modifier::BOLD)
+        };
+        spans.push(Span::styled(after[..end].to_string(), style));
+        rest = &after[end + marker.len()..];
+    }
+    spans
 }
 
 fn draw_transcript(f: &mut Frame, area: Rect, state: &mut AppState) {
@@ -222,10 +524,12 @@ fn draw_transcript(f: &mut Frame, area: Rect, state: &mut AppState) {
                     ]));
                 }
             }
-            Entry::Assistant(text) => {
-                for l in text.lines() {
-                    lines.push(Line::from(Span::styled(l.to_string(), theme::base())));
-                }
+            Entry::Assistant(text) => lines.extend(markdown_lines(text)),
+            Entry::Speaker(who) => {
+                lines.push(Line::from(Span::styled(
+                    format!("\u{25cf} {who}"),
+                    theme::accent(),
+                )));
             }
             Entry::Reasoning(text) => {
                 for l in text.lines() {
@@ -273,17 +577,20 @@ fn draw_transcript(f: &mut Frame, area: Rect, state: &mut AppState) {
                 };
                 lines.push(Line::from(Span::styled(text, style)));
             }
+            // Multi-line notices (`/help`, `/providers`, ...) keep their
+            // line breaks instead of collapsing into one paragraph.
             Entry::Notice(text) => {
-                lines.push(Line::from(Span::styled(
-                    format!("  {text}"),
-                    theme::muted(),
-                )));
+                for l in text.lines() {
+                    lines.push(Line::from(Span::styled(format!("  {l}"), theme::muted())));
+                }
             }
             Entry::Error(text) => {
-                lines.push(Line::from(Span::styled(
-                    format!("  {text}"),
-                    Style::default().fg(theme::ERROR).bg(theme::CHARCOAL),
-                )));
+                for l in text.lines() {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {l}"),
+                        Style::default().fg(theme::ERROR).bg(theme::CHARCOAL),
+                    )));
+                }
             }
         }
     }
@@ -456,7 +763,9 @@ fn chunk_chars(text: &str, width: usize) -> Vec<String> {
 fn draw_composer(f: &mut Frame, area: Rect, state: &AppState) {
     let inner_width = area.width.saturating_sub(2).max(1);
 
-    if state.awaiting_approval().is_some() {
+    // A draft typed before the prompt arrived is drawn as usual so it can be
+    // cleared; the help bar says why y/n do not answer yet.
+    if state.awaiting_approval().is_some() && state.composer.is_empty() {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(theme::accent_bold());
@@ -467,6 +776,47 @@ fn draw_composer(f: &mut Frame, area: Rect, state: &AppState) {
                 .block(block),
             area,
         );
+        return;
+    }
+
+    // /connect fields: each with its own title, so it is obvious the text goes to
+    // secure storage and not to the model. The key is drawn as dots only.
+    if let Some(step) = &state.connect {
+        let typed = state.composer.text();
+        let (shown, title) = match step {
+            crate::state::ConnectStep::Key { name, .. } => {
+                let dots = "\u{2022}".repeat(typed.chars().count().min(64));
+                (
+                    if dots.is_empty() {
+                        "paste the key, then Enter (Esc cancels)".to_string()
+                    } else {
+                        dots
+                    },
+                    format!(" API key for {name} \u{2014} hidden, saved to secure storage "),
+                )
+            }
+            crate::state::ConnectStep::Address { name, .. } => (
+                if typed.is_empty() {
+                    "paste the API address (https://\u{2026}/v1), then Enter (Esc cancels)"
+                        .to_string()
+                } else {
+                    typed.to_string()
+                },
+                format!(" API address for {name} \u{2014} the key comes next "),
+            ),
+        };
+        f.render_widget(
+            Paragraph::new(shown).style(theme::base()).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme::accent_bold())
+                    .title(title),
+            ),
+            area,
+        );
+        let col = (state.composer.text().chars().count().min(64) as u16)
+            .min(area.width.saturating_sub(3));
+        f.set_cursor_position(ratatui::layout::Position::new(area.x + 1 + col, area.y + 1));
         return;
     }
 
@@ -481,10 +831,15 @@ fn draw_composer(f: &mut Frame, area: Rect, state: &AppState) {
 
     if placeholder {
         f.render_widget(
-            Paragraph::new("describe the work  (Enter to send, Shift+Enter for a new line)")
-                .style(theme::muted())
-                .wrap(Wrap { trim: false })
-                .block(block),
+            // Names the newline chord this terminal is known to deliver,
+            // the same one the help bar shows -- never an unproven one.
+            Paragraph::new(format!(
+                "describe the work  (Enter to send, {} for a new line)",
+                state.keys.newline_hint()
+            ))
+            .style(theme::muted())
+            .wrap(Wrap { trim: false })
+            .block(block),
             area,
         );
         // The cursor still belongs at the start of an empty composer,
@@ -520,13 +875,25 @@ fn draw_help_bar(f: &mut Frame, area: Rect, state: &AppState) {
     // Owned rather than borrowed because the idle hint names the
     // newline chord this terminal was actually observed to deliver,
     // which is runtime state, not a literal (charter §4).
-    let hint: String = if state.awaiting_approval().is_some() {
+    let hint: String = if state.awaiting_approval().is_some() && !state.composer.is_empty() {
+        "a decision is waiting: clear the draft (Ctrl+U) to answer   Esc Interrupt".to_string()
+    } else if state.awaiting_approval().is_some() {
         "y Allow   n Deny   Ctrl+C Exit".to_string()
+    } else if state.sessions.is_some() {
+        "↑↓ Select   Enter Resume   Tab All projects   r Rename   p Pin   K/J Move   d Delete   u Undo   Esc Close"
+            .to_string()
     } else if state.picker.is_open() {
         // While the picker owns the keyboard, advertise its keys rather
         // than the composer's -- the keybinding hints and the actual
         // keymap must not disagree (charter §4).
         "↑↓ Select   Enter Run   Tab Complete   Esc Cancel".to_string()
+    } else if let Some(i) = state.agents.viewing() {
+        format!(
+            "agent {}   ↑↓ PgUp/PgDn Scroll   Esc Back to agents",
+            state.agents.agents[i].id
+        )
+    } else if matches!(state.agents.focus, crate::agents::Focus::Strip(_)) {
+        "↑↓ Select   Enter Open transcript   Esc Back to input".to_string()
     } else {
         match state.activity {
             Activity::Idle => format!(
@@ -539,13 +906,21 @@ fn draw_help_bar(f: &mut Frame, area: Rect, state: &AppState) {
             Activity::AwaitingApproval { .. } => unreachable!("handled above"),
         }
     };
-    let mut spans = vec![Span::styled(hint, theme::muted())];
+    let mouse = if state.mouse_capture { "   F2 mouse:on   Shift+Tab mode" } else { "   F2 mouse:off   Shift+Tab mode" };
+    let mut spans = vec![Span::styled(hint, theme::muted()), Span::styled(mouse, theme::muted())];
+    if state.agents.focus == crate::agents::Focus::Composer
+        && crate::agents::wants(state, &crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Down))
+    {
+        spans.insert(1, Span::styled("   ↓ Agents", theme::muted()));
+    }
     if !state.status.is_empty() {
         spans.push(Span::styled("   ", theme::muted()));
         spans.push(Span::styled(state.status.clone(), theme::accent()));
     }
-    spans.push(Span::styled("   ", theme::muted()));
-    spans.push(Span::styled(state.usage_line(), theme::muted()));
+    if state.last_timings.is_some() || state.is_busy() {
+        spans.push(Span::styled("   ", theme::muted()));
+        spans.push(Span::styled(state.usage_line(), theme::muted()));
+    }
     f.render_widget(Paragraph::new(Line::from(spans)).style(theme::base()), area);
 }
 
@@ -586,12 +961,190 @@ mod tests {
     /// connected, the fact that replies are a local echo must be on
     /// screen, not only in a line printed to a terminal the alternate
     /// screen has already covered.
+    fn strip_lines(out: &str) -> Vec<&str> {
+        out.lines().filter(|l| l.contains('\u{25cf}') && l.contains("task ")).collect()
+    }
+
+    #[test]
+    fn the_agent_strip_is_hidden_with_no_agents() {
+        let mut state = AppState::new();
+        let before = render(&mut state, 80, 20);
+        assert!(!before.contains('\u{25cf}'));
+        assert!(!before.contains("agents"));
+        assert!(state.agents.hit.is_empty());
+    }
+
+    #[test]
+    fn the_agent_strip_shows_one_line_per_agent_below_the_composer() {
+        let mut state = AppState::new();
+        crate::agents::tests::spawn(&mut state, &["a", "b", "c", "d"]);
+        state.agents.apply(&se_protocol::AgentEvent::Tokens {
+            agent_id: "b".into(),
+            used: 1234,
+        });
+        state.agents.apply(&se_protocol::AgentEvent::Failed {
+            agent_id: "c".into(),
+            error: "x".into(),
+        });
+        let out = render(&mut state, 100, 24);
+        let lines = strip_lines(&out);
+        assert_eq!(lines.len(), 4, "{out}");
+        assert!(lines[0].contains("auto [a] · running · 0s"), "{out}");
+        assert!(lines[1].contains("1234 tok"), "{out}");
+        assert!(lines[2].contains("failed"), "{out}");
+        // Below the composer's bottom border, above the help bar.
+        let rows: Vec<&str> = out.lines().collect();
+        let first = rows.iter().position(|l| l.contains("auto [a]")).unwrap();
+        assert!(rows[first - 1].contains('└'), "{out}");
+        assert_eq!(state.agents.hit.len(), 4);
+        assert_eq!(state.agents.hit[0], (first as u16, Some(0)));
+    }
+
+    #[test]
+    fn more_than_four_agents_collapse_to_a_summary_until_focused() {
+        let mut state = AppState::new();
+        crate::agents::tests::spawn(&mut state, &["a", "b", "c", "d", "e"]);
+        state.agents.apply(&se_protocol::AgentEvent::Done {
+            agent_id: "e".into(),
+            summary: "ok".into(),
+        });
+        let out = render(&mut state, 100, 24);
+        assert!(strip_lines(&out).is_empty(), "{out}");
+        assert!(
+            out.contains("5 agents · 4 running · 1 finished  (↓ to expand)"),
+            "{out}"
+        );
+        assert_eq!(state.agents.hit.len(), 1);
+        state.agents.focus = crate::agents::Focus::Strip(0);
+        let out = render(&mut state, 100, 24);
+        assert_eq!(strip_lines(&out).len(), 5, "{out}");
+        assert!(out.contains("Enter Open transcript"), "{out}");
+    }
+
+    #[test]
+    fn an_open_agent_view_shows_that_agents_transcript_not_the_chat() {
+        let mut state = AppState::new();
+        state.push(Entry::Assistant("main chat answer".into()));
+        crate::agents::tests::spawn(&mut state, &["a"]);
+        state.agents.apply(&se_protocol::AgentEvent::Activity {
+            agent_id: "a".into(),
+            payload: Box::new(se_protocol::Payload::Delta {
+                kind: se_protocol::DeltaKind::Text,
+                text: "agent says hi".into(),
+            }),
+        });
+        crate::agents::set_focus(&mut state, crate::agents::Focus::View(0));
+        let out = render(&mut state, 80, 20);
+        assert!(out.contains("agent says hi"), "{out}");
+        assert!(!out.contains("main chat answer"), "{out}");
+        assert!(out.contains("Esc Back to agents"), "{out}");
+        // Swapped back after drawing.
+        assert_eq!(state.transcript, vec![Entry::Assistant("main chat answer".into())]);
+        crate::agents::set_focus(&mut state, crate::agents::Focus::Composer);
+        assert!(render(&mut state, 80, 20).contains("main chat answer"));
+    }
+
+    #[test]
+    fn a_click_on_a_strip_row_opens_that_agent_only_when_reported() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let mut state = AppState::new();
+        crate::agents::tests::spawn(&mut state, &["a", "b"]);
+        render(&mut state, 80, 20);
+        let (y, _) = state.agents.hit[1];
+        let click = |row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(crate::input::action_for_mouse(&state, click(0)), crate::Action::Nothing);
+        let a = crate::input::action_for_mouse(&state, click(y));
+        crate::input::apply_local(&mut state, &a);
+        assert_eq!(state.agents.focus, crate::agents::Focus::View(1));
+    }
+
     #[test]
     fn a_banner_is_shown_when_there_is_no_real_model_connected() {
         let mut state = AppState::new();
         state.banner = Some("no model connected — replies below are a local echo".into());
         let out = render(&mut state, 80, 16);
         assert!(out.contains("local echo"), "{out}");
+    }
+
+    /// The screenshot bug: a long banner was cut off at the screen edge.
+    #[test]
+    fn a_long_banner_wraps_instead_of_running_off_screen() {
+        let mut state = AppState::new();
+        state.banner = Some(format!("{} END-OF-BANNER", "word ".repeat(20)));
+        let out = render(&mut state, 60, 16);
+        assert!(out.contains("END-OF-BANNER"), "{out}");
+    }
+
+    /// The screenshot bug: `/connect` and `/help` lost their line breaks.
+    #[test]
+    fn a_multi_line_notice_keeps_its_line_breaks() {
+        let mut state = AppState::new();
+        state.push(Entry::Notice("first line\nsecond line".into()));
+        let out = render(&mut state, 80, 16);
+        let rows: Vec<&str> = out.lines().collect();
+        let first = rows
+            .iter()
+            .position(|r| r.contains("first line"))
+            .expect("drawn");
+        assert!(rows[first + 1].contains("second line"), "{out}");
+        assert!(!rows[first].contains("second line"), "{out}");
+    }
+
+    /// The screenshot bug: the composer advertised Shift+Enter while the
+    /// help bar (correctly) said Alt+Enter.
+    #[test]
+    fn the_composer_hint_names_the_same_newline_key_as_the_help_bar() {
+        let mut state = AppState::new();
+        let out = render(&mut state, 100, 16);
+        let hint = state.keys.newline_hint();
+        assert!(out.contains(&format!("{hint} for a new line")), "{out}");
+        assert!(!out.contains("Shift+Enter for a new line") || hint == "Shift+Enter");
+    }
+
+    /// Answers are Markdown: fences, `**bold**` and inline code markers
+    /// must not reach the screen as raw characters.
+    #[test]
+    fn markdown_in_an_answer_is_rendered_not_shown_raw() {
+        let mut state = AppState::new();
+        state.push(Entry::Assistant(
+            "## Plan\n```sql\nCREATE TABLE orders (id bigint);\n```\n- **Note:** use `cents`"
+                .into(),
+        ));
+        let out = render(&mut state, 80, 16);
+        assert!(out.contains("CREATE TABLE orders"), "{out}");
+        assert!(out.contains("Note: use cents"), "{out}");
+        assert!(
+            !out.contains("```") && !out.contains("**") && !out.contains("## "),
+            "{out}"
+        );
+        assert!(out.contains("sql"), "the language label stays: {out}");
+    }
+
+    /// Every turn runs as an agent; the user must see which one, and on
+    /// which model.
+    #[test]
+    fn the_answering_agent_and_model_are_shown() {
+        let mut state = AppState::new();
+        state.default_model = Some(se_protocol::ModelRef {
+            provider: "claude-code".into(),
+            model: "sonnet".into(),
+        });
+        state.agent = Some("api-architect".into());
+        state.push(Entry::Speaker(
+            "api-architect \u{b7} claude-code/sonnet".into(),
+        ));
+        let out = render(&mut state, 100, 16);
+        let header = out.lines().next().unwrap();
+        assert!(
+            header.contains("claude-code/sonnet") && header.contains("api-architect"),
+            "{header}"
+        );
+        assert!(out.contains("\u{25cf} api-architect"), "{out}");
     }
 
     #[test]

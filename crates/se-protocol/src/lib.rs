@@ -100,8 +100,48 @@ pub enum CoreOp {
     Interrupt { task: TaskId },
     /// Answer a pending [`CoreEvent::ApprovalRequired`].
     Approve(ApprovalDecision),
+    /// Set or (`None`) clear the specialist unnamed turns stay with.
+    SetSpecialist(Option<String>),
+    /// Switch how tool calls are handled from the next call on.
+    SetMode(WorkMode),
     /// Stop accepting work and shut the core down.
     Shutdown,
+}
+
+/// How a turn's tool calls are handled. A policy `deny` rule and path
+/// confinement apply in every mode; the mode only changes what happens
+/// to a call the policy leaves to a human.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkMode {
+    /// Every tool call the policy leaves open (reads included) and every
+    /// agent spawn asks the user first.
+    #[default]
+    Manual,
+    /// Calls the policy would ask about run without asking.
+    Auto,
+    /// Read and search only, run without asking: nothing in the project is changed.
+    Plan,
+}
+
+impl WorkMode {
+    pub const ALL: [WorkMode; 3] = [WorkMode::Manual, WorkMode::Auto, WorkMode::Plan];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            WorkMode::Manual => "manual",
+            WorkMode::Auto => "auto",
+            WorkMode::Plan => "plan",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<WorkMode> {
+        WorkMode::ALL.into_iter().find(|m| m.name() == s.trim())
+    }
+
+    /// The tools a plan-mode turn may use; everything else changes the project.
+    pub fn allows(self, tool: &str) -> bool {
+        self != WorkMode::Plan || matches!(tool, "read" | "search" | "agent")
+    }
 }
 
 /// A chunk of model output, classified.
@@ -277,6 +317,66 @@ pub enum Payload {
         outcome: Outcome,
         timings: Timings,
     },
+    /// A deployed agent's lifecycle or activity. Wrapped, so a consumer
+    /// that ignores it can never mistake a child's text for its own.
+    Agent(AgentEvent),
+}
+
+/// Where a deployed agent (a team node today, a child agent later) is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentState {
+    Running,
+    Background,
+    WaitingApproval,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+impl AgentState {
+    pub fn label(self) -> &'static str {
+        match self {
+            AgentState::Running => "running",
+            AgentState::Background => "background",
+            AgentState::WaitingApproval => "waiting approval",
+            AgentState::Done => "done",
+            AgentState::Failed => "failed",
+            AgentState::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Failed | Self::Cancelled)
+    }
+}
+
+/// Agent lifecycle events. `agent_id` is unique within one run; `parent`
+/// is the spawning agent's id (`None`: the main agent or a team run).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentEvent {
+    Spawned {
+        agent_id: String,
+        role: String,
+        parent: Option<String>,
+        /// One-line summary of what it was asked to do.
+        task: String,
+    },
+    State {
+        agent_id: String,
+        state: AgentState,
+    },
+    /// Reported tokens so far (input + output), a running total.
+    Tokens { agent_id: String, used: u64 },
+    /// Terminal: implies state `Done`.
+    Done { agent_id: String, summary: String },
+    /// Terminal: implies state `Failed`.
+    Failed { agent_id: String, error: String },
+    /// One of the agent's own events (`Delta`, `Tool*`, `ApprovalRequired`)
+    /// for its transcript view.
+    Activity {
+        agent_id: String,
+        payload: Box<Payload>,
+    },
 }
 
 impl CoreEvent {
@@ -422,6 +522,47 @@ mod tests {
         let json = r#"{"session":1,"task":1,"text":"hi","attachments":[]}"#;
         let turn: UserTurn = serde_json::from_str(json).unwrap();
         assert_eq!(turn.model, None);
+    }
+
+    #[test]
+    fn agent_events_round_trip_and_old_logs_still_load() {
+        let id = || "review".to_string();
+        for p in [
+            AgentEvent::Spawned {
+                agent_id: id(),
+                role: "auto".into(),
+                parent: Some("main".into()),
+                task: "check it".into(),
+            },
+            AgentEvent::State {
+                agent_id: id(),
+                state: AgentState::WaitingApproval,
+            },
+            AgentEvent::Tokens { agent_id: id(), used: 42 },
+            AgentEvent::Done { agent_id: id(), summary: "ok".into() },
+            AgentEvent::Failed { agent_id: id(), error: "no".into() },
+            AgentEvent::Activity {
+                agent_id: id(),
+                payload: Box::new(Payload::Delta {
+                    kind: DeltaKind::Text,
+                    text: "hi".into(),
+                }),
+            },
+        ] {
+            let original = event(Payload::Agent(p));
+            let json = serde_json::to_string(&original).unwrap();
+            assert_eq!(original, serde_json::from_str::<CoreEvent>(&json).unwrap());
+        }
+        // A line written before agent events existed parses unchanged.
+        let old = r#"{"seq":4,"session":1,"task":1,"turn":null,"payload":{"Delta":{"kind":"Text","text":"hi"}}}"#;
+        let back: CoreEvent = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            back.payload,
+            Payload::Delta {
+                kind: DeltaKind::Text,
+                text: "hi".into()
+            }
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ use se_core::ProviderRunner;
 use se_permission::Ruleset;
 
 pub fn run_file(cli: &crate::Cli, path: &Path) -> ExitCode {
-    match start(cli, path) {
+    match start(cli, path, cli.mode) {
         Ok((run, notes)) => {
             for n in notes {
                 eprintln!("se: {n}");
@@ -34,11 +34,16 @@ pub fn run_file(cli: &crate::Cli, path: &Path) -> ExitCode {
 /// file gives, and starts a journaled run under `.se/runs/`. Shared by
 /// `se team run` and the interface's `/team run`; returns lines for the
 /// operator instead of printing them, so it is safe inside the TUI.
-pub fn start(cli: &crate::Cli, path: &Path) -> Result<(TeamRun, Vec<String>), String> {
+pub fn start(
+    cli: &crate::Cli,
+    path: &Path,
+    mode: se_core::protocol::WorkMode,
+) -> Result<(TeamRun, Vec<String>), String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let team = file::parse(&text)?;
-    let (runner, warning) = build_runner(cli, Ruleset::from_rules(team.provider_rules))?;
+    let (runner, warning) =
+        build_runner(cli, &team.graph, Ruleset::from_rules(team.provider_rules), mode)?;
     let journal = std::env::current_dir()
         .map_err(|e| format!("no working directory: {e}"))?
         .join(".se")
@@ -65,7 +70,7 @@ pub fn resume(cli: &crate::Cli, journal: &Path, max_concurrent: Option<usize>) -
         }
     };
     let rules = file::provider_rules(&graph);
-    let runner = match build_runner(cli, Ruleset::from_rules(rules)) {
+    let runner = match build_runner(cli, &graph, Ruleset::from_rules(rules), cli.mode) {
         Ok((runner, warning)) => {
             if let Some(w) = warning {
                 eprintln!("se: {w}");
@@ -117,17 +122,35 @@ pub fn resume(cli: &crate::Cli, journal: &Path, max_concurrent: Option<usize>) -
 
 fn build_runner(
     cli: &crate::Cli,
+    graph: &se_core::team::TaskGraph,
     ruleset: Ruleset,
+    mode: se_core::protocol::WorkMode,
 ) -> Result<(ProviderRunner, Option<String>), String> {
-    let (provider_id, model) = crate::resolve(cli)?;
+    let (provider_id, model) = default_model(cli, graph)?;
     let runner = ProviderRunner::new(&provider_id, &model)
         .map_err(|e| e.to_string())?
         .with_ruleset(ruleset);
-    let runner = match crate::catalogue_root().filter(|root| root.exists()) {
+    let runner = match crate::catalogue_root() {
         Some(root) => runner.with_catalogue_root(root).with_auto_route(true),
         None => runner,
     };
+    se_core::Runner::set_mode(&runner, mode);
     Ok(crate::with_audit_log(runner))
+}
+
+/// The runner's default model: `--provider`/`--model` when given, else the
+/// first model the team file names, so a file that names its models runs
+/// with no extra flags even when several providers are configured.
+fn default_model(
+    cli: &crate::Cli,
+    graph: &se_core::team::TaskGraph,
+) -> Result<(String, String), String> {
+    if cli.provider.is_none() && cli.model.is_none() {
+        if let Some(m) = graph.nodes().iter().find_map(|n| n.model.as_ref()) {
+            return Ok((m.provider.clone(), m.model.clone()));
+        }
+    }
+    crate::resolve(cli)
 }
 
 fn drive(mut run: TeamRun) -> ExitCode {
@@ -161,6 +184,8 @@ fn drive(mut run: TeamRun) -> ExitCode {
         for notice in run.take_notices() {
             eprintln!("se: {notice}");
         }
+        // No strip here (stderr lines below say the same); drained so they don't pile up.
+        run.take_agent_events();
         report_changes(&run, &mut last);
         if let Some(e) = run.journal_error() {
             eprintln!("se: the run journal failed ({e}); the run was stopped");
@@ -195,6 +220,8 @@ fn drive(mut run: TeamRun) -> ExitCode {
         println!("\n===== {} ({who}) — {state:?} =====", n.id);
         match run.outcome(&n.id) {
             Some(Outcome::Completed { final_text }) => println!("{final_text}"),
+            Some(Outcome::Failed { detail }) => println!("failed: {detail}"),
+            Some(Outcome::Incomplete { reason, .. }) => println!("incomplete: {reason}"),
             Some(other) => println!("{}", other.label()),
             None => println!("(did not run)"),
         }

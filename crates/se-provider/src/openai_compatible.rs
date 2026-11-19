@@ -185,6 +185,16 @@ pub const CATALOGUE: &[Service] = &[
         wire: Wire::OpenAi,
     },
     Service {
+        id: "apinex",
+        display_name: "Apinex",
+        key_var: "APINEX_API_KEY",
+        // From Apinex's own docs (`BASE_URL = "https://api.apinex.bond/v1"`), checked 2026-11-18.
+        default_base_url: "https://api.apinex.bond/v1",
+        base_url_var: "APINEX_BASE_URL",
+        key_required: true,
+        wire: Wire::OpenAi,
+    },
+    Service {
         id: "custom",
         display_name: "Custom OpenAI-compatible endpoint",
         key_var: "SE_CUSTOM_API_KEY",
@@ -214,6 +224,9 @@ pub struct OpenAiCompatible {
     /// made them connect to each other's (observed, not theorised --
     /// four tests failed this way).
     fixed_base_url: Option<String>,
+    /// Where model-access verdicts are cached. `None` (the test and
+    /// key-check constructors) probes without remembering anything.
+    access_file: Option<std::path::PathBuf>,
 }
 
 impl OpenAiCompatible {
@@ -222,7 +235,14 @@ impl OpenAiCompatible {
             service,
             fixed_key: None,
             fixed_base_url: None,
+            access_file: crate::model_access::default_path(),
         }
+    }
+
+    /// For tests: cache model-access verdicts in `path` instead of nowhere.
+    pub fn with_access_file(mut self, path: std::path::PathBuf) -> Self {
+        self.access_file = Some(path);
+        self
     }
 
     /// For tests: an explicit key, never consulting the credential store.
@@ -231,16 +251,18 @@ impl OpenAiCompatible {
             service,
             fixed_key: Some(key.to_string()),
             fixed_base_url: None,
+            access_file: None,
         }
     }
 
-    /// For tests: an explicit key and endpoint, touching neither the
-    /// credential store nor the environment.
+    /// An explicit key and endpoint, touching neither the credential store nor
+    /// the environment: for tests, and for checking a candidate key before saving it.
     pub fn with_fixed(service: Service, key: &str, base_url: &str) -> Self {
         OpenAiCompatible {
             service,
             fixed_key: Some(key.to_string()),
             fixed_base_url: Some(base_url.trim_end_matches('/').to_string()),
+            access_file: None,
         }
     }
 
@@ -263,9 +285,9 @@ impl OpenAiCompatible {
         }
     }
 
-    /// Read live, so pointing a service at a different endpoint does not
-    /// require restarting.
-    fn base_url(&self) -> Option<String> {
+    /// The API root requests go to. Read live, so pointing a service at a
+    /// different endpoint does not require restarting.
+    pub fn base_url(&self) -> Option<String> {
         if let Some(url) = &self.fixed_base_url {
             return Some(url.clone());
         }
@@ -273,6 +295,9 @@ impl OpenAiCompatible {
             if !url.is_empty() {
                 return Some(url.trim_end_matches('/').to_string());
             }
+        }
+        if let Some(url) = credentials::stored_base_url(self.service.id) {
+            return Some(url);
         }
         if self.service.default_base_url.is_empty() {
             return None;
@@ -283,8 +308,8 @@ impl OpenAiCompatible {
     fn endpoint(&self, path: &str) -> Result<String, ProviderError> {
         let base = self.base_url().ok_or_else(|| {
             ProviderError::NotConfigured(format!(
-                "{} has no endpoint — set {}",
-                self.service.id, self.service.base_url_var
+                "{0} has no endpoint — run `se connect {0} <api-url>` (or /connect {0} <api-url>)",
+                self.service.id
             ))
         })?;
         // Every service, keyed or not, must resolve to TLS or a
@@ -350,6 +375,87 @@ impl OpenAiCompatible {
             (Wire::OpenAi, Some(key)) => request.set("Authorization", &key.as_bearer()),
             (Wire::OpenAi, None) => request,
         }
+    }
+
+    /// Whether listed models are probed: keyed OpenAI-wire services only. A keyless
+    /// local server (Ollama) would load every model just to answer.
+    fn probes_models(&self) -> bool {
+        self.service.wire == Wire::OpenAi && self.service.key_required
+    }
+
+    /// The cache file and this credential's entry in it, if verdicts are remembered.
+    fn access_entry(
+        &self,
+        key: Option<&credentials::HeaderSafeKey>,
+    ) -> Option<(std::path::PathBuf, String)> {
+        let path = self.access_file.clone()?;
+        let entry = crate::model_access::entry_key(
+            self.service.id,
+            key?.as_header_value(),
+            &self.base_url()?,
+        );
+        Some((path, entry))
+    }
+
+    /// One minimal call: the model, one tiny message, `max_tokens: 1`, no stream.
+    /// The flag is true when the answer was a 429 (the account, not the model, is limited).
+    fn probe(
+        &self,
+        url: &str,
+        key: Option<&credentials::HeaderSafeKey>,
+        model: &str,
+    ) -> (crate::model_access::Verdict, bool) {
+        use crate::model_access::Verdict;
+        let request = agent()
+            .post(url)
+            .timeout(PROBE_TIMEOUT)
+            .set("Content-Type", "application/json");
+        let body = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1,
+            "stream": false,
+        });
+        match self.authorize(request, key).send_json(body) {
+            Ok(_) => (Verdict::Ok, false),
+            Err(ureq::Error::Status(code, r)) => (
+                probe_verdict(self.service.id, code, &r.into_string().unwrap_or_default()),
+                code == 429,
+            ),
+            Err(ureq::Error::Transport(t)) => {
+                (Verdict::Unchecked(first_line(&t.to_string(), 160)), false)
+            }
+        }
+    }
+
+    /// After a real chat turn failed: if the failure says this credential cannot use
+    /// `model`, remember that and say so on one extra line. Otherwise `err` unchanged.
+    fn learn_from_failure(
+        &self,
+        model: &str,
+        code: u16,
+        body: &str,
+        key: Option<&credentials::HeaderSafeKey>,
+        err: ProviderError,
+    ) -> ProviderError {
+        // 400/422 in a real turn usually mean a bad parameter, and 403 a blocked request,
+        // not a model this key cannot use -- unless the body says it is a billing refusal.
+        let ambiguous = matches!(code, 400 | 403 | 422) && !body.contains("billing_error");
+        if !self.probes_models() || ambiguous {
+            return err;
+        }
+        let verdict = probe_verdict(self.service.id, code, body);
+        if !verdict.hides() {
+            return err;
+        }
+        if let Some((path, entry)) = self.access_entry(key) {
+            crate::model_access::mark(&path, &entry, model, verdict.clone());
+        }
+        ProviderError::Protocol(format!(
+            "{err}\n{}/{model} is now hidden from /models: {}",
+            self.service.id,
+            verdict.why()
+        ))
     }
 
     fn check_pinned_origin(&self, url: &str) -> Result<(), ProviderError> {
@@ -621,8 +727,8 @@ impl ModelProvider for OpenAiCompatible {
             return Status {
                 configured: false,
                 detail: format!(
-                    "no endpoint — set {} to the service's OpenAI-compatible base URL",
-                    self.service.base_url_var
+                    "no endpoint — run `se connect {} <api-url>` with its OpenAI-compatible base URL",
+                    self.service.id
                 ),
                 source,
             };
@@ -753,6 +859,7 @@ impl ModelProvider for OpenAiCompatible {
             return Err(ProviderError::Cancelled);
         }
 
+        let model = request.model.clone();
         let request = agent()
             .post(&url)
             .set("Content-Type", "application/json")
@@ -763,7 +870,10 @@ impl ModelProvider for OpenAiCompatible {
         let response = match response {
             Ok(r) => r,
             Err(ureq::Error::Status(code, r)) => {
-                return Err(classify_http_error(self.service.id, code, r, ""));
+                let retry_after = r.header("Retry-After").and_then(parse_retry_after);
+                let body = r.into_string().unwrap_or_default();
+                let err = classify_http_body(self.service.id, code, retry_after, &body, "");
+                return Err(self.learn_from_failure(&model, code, &body, key.as_ref(), err));
             }
             Err(ureq::Error::Transport(t)) if is_timeout(&t) => {
                 return Err(ProviderError::Timeout(TimeoutKind::Idle));
@@ -912,6 +1022,122 @@ impl ModelProvider for OpenAiCompatible {
         };
         Ok(parse_model_list(&body))
     }
+
+    fn usable_models(&self, refresh: bool) -> Result<crate::UsableModels, ProviderError> {
+        use crate::model_access::{self, Verdict};
+        let listed = self.list_models()?;
+        if !self.probes_models() {
+            return Ok(crate::UsableModels {
+                models: listed,
+                ..Default::default()
+            });
+        }
+        let key = self.key_or_error()?;
+        let url = self.endpoint("/chat/completions")?;
+        self.check_pinned_origin(&url)?;
+        let cached = self.access_entry(key.as_ref());
+        let mut entry = cached
+            .as_ref()
+            .and_then(|(path, k)| model_access::load(path, k, model_access::TTL))
+            .unwrap_or_else(model_access::Entry::fresh);
+        if refresh {
+            entry.checked_at = model_access::Entry::fresh().checked_at;
+        }
+
+        let todo: Vec<&str> = listed
+            .iter()
+            .map(|m| m.id.as_str())
+            .filter(|id| refresh || entry.needs_probe(id))
+            .collect();
+        // Bounded pool: `PROBE_CONCURRENCY` workers pull the next model off a shared index.
+        // A 429 limits the whole account (Apinex: 15 requests a minute), so once one arrives
+        // the rest are left unprobed -- shown as unchecked and tried on the next listing.
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let limited = std::sync::atomic::AtomicBool::new(false);
+        let results = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..PROBE_CONCURRENCY.min(todo.len()) {
+                scope.spawn(|| loop {
+                    if limited.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let Some(id) = todo.get(i) else { break };
+                    let (v, rate_limited) = self.probe(&url, key.as_ref(), id);
+                    if rate_limited {
+                        limited.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    results
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((id.to_string(), v));
+                });
+            }
+        });
+        for (id, v) in results.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            if let Verdict::BadKey(detail) = v {
+                return Err(ProviderError::Auth(detail));
+            }
+            // An inconclusive re-check (429, 5xx) keeps the verdict already known.
+            if v.settled() || entry.needs_probe(&id) {
+                entry.models.insert(id, v);
+            }
+        }
+        if let Some((path, k)) = &cached {
+            if !todo.is_empty() {
+                model_access::store(path, k, &entry);
+            }
+        }
+
+        let mut out = crate::UsableModels::default();
+        for m in listed {
+            match entry.models.get(&m.id) {
+                Some(v) if v.hides() => out.hidden.push((m.id, v.clone())),
+                Some(Verdict::Unchecked(_)) | None => {
+                    out.unchecked.push(m.id.clone());
+                    out.models.push(m);
+                }
+                Some(_) => out.models.push(m),
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// How many probes run at once, and how long one may take.
+const PROBE_CONCURRENCY: usize = 8;
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Classifies one failed probe (or failed chat call) into a verdict.
+/// Reuses [`classify_http_body`] so the reason is redacted and trimmed the same way.
+fn probe_verdict(service_id: &str, code: u16, body: &str) -> crate::model_access::Verdict {
+    use crate::model_access::Verdict;
+    let err = classify_http_body(service_id, code, None, body, "for a test call");
+    // A firewall or proxy page is not the API's verdict on this model.
+    if body.trim_start().starts_with('<') {
+        return Verdict::Unchecked(err.to_string());
+    }
+    // The provider's own words, when its error body has them.
+    let reason = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/error/message")
+                .or_else(|| v.get("message"))
+                .or_else(|| v.get("detail"))
+                .and_then(|m| m.as_str())
+                .map(|m| first_line(m, 160))
+        })
+        .unwrap_or_else(|| format!("HTTP {code}"));
+    match code {
+        401 => Verdict::BadKey(err.to_string()),
+        402 | 403 => Verdict::Paid(reason),
+        _ if body.contains("billing_error") => Verdict::Paid(reason),
+        // Spec said "available", but a 429 limits the account, not the model: Apinex rate-limits
+        // before it checks billing, so a 429 there said nothing about a paid-only model.
+        429 => Verdict::Unchecked(format!("rate limited: {reason}")),
+        400 | 404 | 410 | 422 => Verdict::NotChat(reason),
+        _ => Verdict::Unchecked(err.to_string()),
+    }
 }
 
 /// Trims a provider's error body to something displayable, on one line.
@@ -934,7 +1160,29 @@ impl ModelProvider for OpenAiCompatible {
 /// or echoed in an error message -- this function runs before
 /// `check_pinned_origin`, in [`OpenAiCompatible::endpoint`], so a
 /// userinfo URL never reaches that code at all.
-fn is_safe_origin(url: &str) -> bool {
+/// The API root from whatever address the user pasted: people copy a full endpoint from
+/// docs (`…/v1/models`, `…/v1/chat/completions`), and SE appends those paths itself, which
+/// produced `…/v1/models/models` (a real 404 seen from Apinex).
+pub fn api_root(url: &str) -> String {
+    const ENDPOINTS: [&str; 6] = [
+        "/chat/completions",
+        "/completions",
+        "/models",
+        "/messages",
+        "/responses",
+        "/embeddings",
+    ];
+    let mut root = url.trim().trim_end_matches('/');
+    for e in ENDPOINTS {
+        if let Some(r) = root.strip_suffix(e) {
+            root = r.trim_end_matches('/');
+            break;
+        }
+    }
+    root.to_string()
+}
+
+pub fn is_safe_origin(url: &str) -> bool {
     let Some((scheme, rest)) = url.split_once("://") else {
         return false;
     };
@@ -990,9 +1238,36 @@ fn classify_http_error(
 ) -> ProviderError {
     let retry_after = response.header("Retry-After").and_then(parse_retry_after);
     let body = response.into_string().unwrap_or_default();
+    classify_http_body(service_id, code, retry_after, &body, context)
+}
+
+/// [`classify_http_error`] once the body has been read.
+fn classify_http_body(
+    service_id: &str,
+    code: u16,
+    retry_after: Option<Duration>,
+    body: &str,
+    context: &str,
+) -> ProviderError {
+    // A web page instead of an API error is a firewall or the wrong address (e.g. Cloudflare's
+    // "Sorry, you have been blocked" is a 403), never a verdict on the key. Only for 4xx other
+    // than 429: an HTML 429/5xx page is still a rate limit or outage and must stay retriable.
+    let page_title = body.trim_start().starts_with('<').then(|| {
+        body.split_once("<title>")
+            .and_then(|(_, t)| t.split_once("</title>"))
+            .map(|(t, _)| first_line(t.trim(), 120))
+            .unwrap_or_else(|| "a web page".to_string())
+    });
+    if let Some(title) = &page_title {
+        if (400..500).contains(&code) && code != 429 {
+            return ProviderError::Protocol(format!(
+                "{service_id} returned HTTP {code} {context} as a web page, not an API answer: {title}"
+            ));
+        }
+    }
     let detail = format!(
         "{service_id} returned HTTP {code} {context}: {}",
-        first_line(&body, 300)
+        page_title.unwrap_or_else(|| first_line(body, 300))
     );
     match code {
         401 | 403 => ProviderError::Auth(detail),
@@ -1000,7 +1275,7 @@ fn classify_http_error(
             retry_after,
             detail,
         },
-        400 if looks_like_a_policy_refusal(&body) => ProviderError::Policy(detail),
+        400 if looks_like_a_policy_refusal(body) => ProviderError::Policy(detail),
         400 | 404 | 422 => ProviderError::BadRequest(detail),
         500..=599 => ProviderError::Server {
             status: code,
@@ -1103,6 +1378,27 @@ fn first_line(text: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::{ToolCallRecord, ToolDefinition};
+
+    #[test]
+    fn a_pasted_endpoint_is_cut_back_to_the_api_root() {
+        let root = "https://api.apinex.bond/v1";
+        for pasted in [
+            "https://api.apinex.bond/v1",
+            " https://api.apinex.bond/v1/ ",
+            "https://api.apinex.bond/v1/models",
+            "https://api.apinex.bond/v1/models/",
+            "https://api.apinex.bond/v1/chat/completions",
+            "https://api.apinex.bond/v1/messages",
+        ] {
+            assert_eq!(api_root(pasted), root, "{pasted}");
+        }
+        // Roots with their own path are kept as they are.
+        assert_eq!(
+            api_root("https://generativelanguage.googleapis.com/v1beta/openai"),
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        );
+    }
+
     #[test]
     fn a_credential_echoed_back_by_a_provider_is_redacted_before_it_is_displayed() {
         let body =
@@ -1179,6 +1475,13 @@ mod tests {
         content_type: &'static str,
         body: &'static str,
     ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        serve_by(move |_| (status_line, content_type, body))
+    }
+
+    /// Like [`serve`], but answers each request with `route(request text)`.
+    fn serve_by(
+        route: impl Fn(&str) -> (&'static str, &'static str, &'static str) + Send + 'static,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = requests.clone();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1204,9 +1507,9 @@ mod tests {
                 let mut payload = vec![0u8; length];
                 use std::io::Read;
                 let _ = reader.read_exact(&mut payload);
-                sink.lock()
-                    .unwrap()
-                    .push(format!("{head}{}", String::from_utf8_lossy(&payload)));
+                let seen = format!("{head}{}", String::from_utf8_lossy(&payload));
+                let (status_line, content_type, body) = route(&seen);
+                sink.lock().unwrap().push(seen);
 
                 let response = format!(
                     "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1255,7 +1558,7 @@ mod tests {
         assert!(lower.contains("x-api-key: sk-ant-test"), "{sent}");
         assert!(lower.contains("anthropic-version: 2023-06-01"), "{sent}");
         assert!(!lower.contains("authorization:"), "no bearer token: {sent}");
-        assert!(sent.contains("\"system\":\"sys\""), "{sent}");
+        assert!(sent.contains("\"text\":\"sys\""), "{sent}");
     }
 
     fn provider(base_url: &str) -> OpenAiCompatible {
@@ -1270,6 +1573,180 @@ mod tests {
         })
         .unwrap();
         events
+    }
+
+    const BILLING_402: &str = r#"{"type":"error","error":{"type":"billing_error","message":"Insufficient balance"}}"#;
+    const SUBSCRIPTION_400: &str = r#"{"error":{"type":"billing_error","message":"This model is currently available only with a subscription"}}"#;
+    const FIREWALL_PAGE: &str = "<!DOCTYPE html><html><head><title>Attention Required! | Cloudflare</title></head></html>";
+
+    #[test]
+    fn probe_verdicts_follow_the_classification_table() {
+        use crate::model_access::Verdict;
+        let v = |code, body| probe_verdict("mock", code, body);
+        assert_eq!(v(402, BILLING_402), Verdict::Paid("Insufficient balance".into()));
+        // billing_error decides even when the status is not 402.
+        assert!(matches!(v(400, SUBSCRIPTION_400), Verdict::Paid(r) if r.contains("subscription")));
+        assert!(matches!(v(403, r#"{"error":{"message":"no access"}}"#), Verdict::Paid(r) if r == "no access"));
+        assert!(matches!(v(404, r#"{"error":{"message":"model not found"}}"#), Verdict::NotChat(_)));
+        assert!(matches!(v(410, "{}"), Verdict::NotChat(r) if r == "HTTP 410"));
+        assert!(matches!(v(422, "{}"), Verdict::NotChat(_)));
+        assert_eq!(
+            v(429, r#"{"error":{"message":"slow down"}}"#),
+            Verdict::Unchecked("rate limited: slow down".into())
+        );
+        assert!(matches!(v(401, r#"{"error":{"message":"bad key"}}"#), Verdict::BadKey(_)));
+        assert!(matches!(v(500, "oops"), Verdict::Unchecked(_)));
+        assert!(matches!(v(503, "{}"), Verdict::Unchecked(_)));
+        // A firewall page is never a verdict, even on a 403.
+        assert!(matches!(v(403, FIREWALL_PAGE), Verdict::Unchecked(r) if r.contains("web page")));
+        // A key echoed back in an error body never reaches the reason.
+        assert!(!v(402, r#"{"error":{"message":"key sk-abc123secret has no balance"}}"#)
+            .why()
+            .contains("abc123secret"));
+    }
+
+    fn access_file(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("se-access-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("model-access.json")
+    }
+
+    fn catalogue_server() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        serve_by(|req| {
+            const JSON: &str = "application/json";
+            if req.starts_with("GET") {
+                return (
+                    "HTTP/1.1 200 OK",
+                    JSON,
+                    r#"{"data":[{"id":"ok"},{"id":"paid"},{"id":"sub"},{"id":"gone"},{"id":"embed"},{"id":"flaky"},{"id":"walled"}]}"#,
+                );
+            }
+            let model = |m: &str| req.contains(&format!("\"model\":\"{m}\""));
+            if model("ok") {
+                ("HTTP/1.1 200 OK", JSON, r#"{"choices":[{"message":{"content":"h"}}]}"#)
+            } else if model("paid") {
+                ("HTTP/1.1 402 Payment Required", JSON, BILLING_402)
+            } else if model("sub") {
+                ("HTTP/1.1 400 Bad Request", JSON, SUBSCRIPTION_400)
+            } else if model("gone") {
+                ("HTTP/1.1 410 Gone", JSON, "{}")
+            } else if model("embed") {
+                ("HTTP/1.1 404 Not Found", JSON, r#"{"error":{"message":"not a chat model"}}"#)
+            } else if model("flaky") {
+                ("HTTP/1.1 503 Service Unavailable", JSON, "{}")
+            } else {
+                ("HTTP/1.1 403 Forbidden", "text/html", FIREWALL_PAGE)
+            }
+        })
+    }
+
+    #[test]
+    fn usable_models_probes_each_listed_model_and_hides_what_the_key_cannot_use() {
+        let (base, requests) = catalogue_server();
+        let file = access_file("probe");
+        let p = OpenAiCompatible::with_fixed(TEST_SERVICE, "sk-test-key", &base)
+            .with_access_file(file.clone());
+        let got = p.usable_models(false).unwrap();
+        let shown: Vec<&str> = got.models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(shown, ["ok", "flaky", "walled"]);
+        assert_eq!(got.unchecked, ["flaky", "walled"]);
+        let hidden: Vec<&str> = got.hidden.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(hidden, ["paid", "sub", "gone", "embed"]);
+        assert_eq!(
+            got.hidden_summary("/models refresh").as_deref(),
+            Some("4 hidden: 2 need a subscription or balance, 2 not chat models — /models refresh to re-check")
+        );
+        {
+            let seen = requests.lock().unwrap();
+            assert_eq!(seen.len(), 8, "one list + one probe per model");
+            let probe = seen.iter().find(|r| r.contains("\"model\":\"ok\"")).unwrap();
+            assert!(probe.starts_with("POST /chat/completions"), "{probe}");
+            assert!(probe.contains("\"max_tokens\":1") && probe.contains("\"stream\":false"), "{probe}");
+        }
+        let stored = std::fs::read_to_string(&file).unwrap();
+        assert!(!stored.contains("sk-test-key"));
+
+        // From cache: only the unsettled two are probed again.
+        let again = p.usable_models(false).unwrap();
+        assert_eq!(again.hidden.len(), 4);
+        assert_eq!(requests.lock().unwrap().len(), 8 + 1 + 2);
+
+        // Refresh ignores the cache and probes everything.
+        p.usable_models(true).unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 11 + 1 + 7);
+
+        // A different key never reuses these verdicts.
+        let other = OpenAiCompatible::with_fixed(TEST_SERVICE, "sk-other-key", &base)
+            .with_access_file(file);
+        other.usable_models(false).unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 19 + 1 + 7);
+    }
+
+    /// A 429 limits the account, not the model: probing stops, nothing is hidden or cached
+    /// as usable, and a refresh that only meets 429s keeps the verdicts already known.
+    #[test]
+    fn an_account_rate_limit_stops_probing_and_decides_nothing() {
+        let (base, requests) = serve_by(|req| {
+            if req.starts_with("GET") {
+                let list = r#"{"data":[{"id":"m0"},{"id":"m1"},{"id":"m2"},{"id":"m3"},{"id":"m4"},{"id":"m5"},{"id":"m6"},{"id":"m7"},{"id":"m8"},{"id":"m9"},{"id":"m10"},{"id":"m11"},{"id":"m12"},{"id":"m13"},{"id":"m14"},{"id":"m15"},{"id":"m16"},{"id":"m17"},{"id":"m18"},{"id":"m19"}]}"#;
+                return ("HTTP/1.1 200 OK", "application/json", list);
+            }
+            ("HTTP/1.1 429 Too Many Requests", "application/json", r#"{"error":{"type":"rate_limit_error","message":"Max 15 requests per minute"}}"#)
+        });
+        let file = access_file("limited");
+        let key = crate::model_access::entry_key("mock", "k", &base);
+        let mut known = crate::model_access::Entry::fresh();
+        known.models.insert("m0".into(), crate::model_access::Verdict::Paid("Insufficient balance".into()));
+        crate::model_access::store(&file, &key, &known);
+
+        let p = OpenAiCompatible::with_fixed(TEST_SERVICE, "k", &base).with_access_file(file.clone());
+        let got = p.usable_models(true).unwrap();
+        assert_eq!(got.hidden.len(), 1, "m0 stays hidden: {:?}", got.hidden);
+        assert_eq!(got.models.len(), 19);
+        assert_eq!(got.unchecked.len(), 19);
+        let probes = requests.lock().unwrap().len() - 1;
+        assert!(probes < 19, "probing should stop after the first 429s, made {probes}");
+        let entry = crate::model_access::load(&file, &key, crate::model_access::TTL).unwrap();
+        assert_eq!(entry.models.len(), 1, "a 429 is never cached");
+    }
+
+    #[test]
+    fn a_probe_refusing_the_key_fails_the_whole_listing() {
+        let (base, _) = serve_by(|req| {
+            if req.starts_with("GET") {
+                ("HTTP/1.1 200 OK", "application/json", r#"{"data":[{"id":"a"}]}"#)
+            } else {
+                ("HTTP/1.1 401 Unauthorized", "application/json", r#"{"error":{"message":"invalid key"}}"#)
+            }
+        });
+        let p = OpenAiCompatible::with_fixed(TEST_SERVICE, "k", &base);
+        assert!(matches!(p.usable_models(false), Err(ProviderError::Auth(_))));
+    }
+
+    #[test]
+    fn a_chat_turn_failing_with_402_hides_that_model_at_once() {
+        let (base, _) = serve("HTTP/1.1 402 Payment Required", "application/json", BILLING_402);
+        let file = access_file("learn");
+        let p = OpenAiCompatible::with_fixed(TEST_SERVICE, "k", &base).with_access_file(file.clone());
+        let err = p.stream(&request(), &|| false, &mut |_| true).unwrap_err().to_string();
+        let last = err.lines().last().unwrap();
+        assert_eq!(
+            last,
+            "mock/mock-model is now hidden from /models: needs a subscription or balance (Insufficient balance)"
+        );
+        let key = crate::model_access::entry_key("mock", "k", &base);
+        let entry = crate::model_access::load(&file, &key, crate::model_access::TTL).unwrap();
+        assert!(entry.models["mock-model"].hides());
+    }
+
+    #[test]
+    fn a_chat_turn_failing_with_a_plain_400_hides_nothing() {
+        let (base, _) = serve("HTTP/1.1 400 Bad Request", "application/json", r#"{"error":{"message":"bad tools"}}"#);
+        let file = access_file("nolearn");
+        let p = OpenAiCompatible::with_fixed(TEST_SERVICE, "k", &base).with_access_file(file.clone());
+        let err = p.stream(&request(), &|| false, &mut |_| true).unwrap_err();
+        assert!(matches!(err, ProviderError::BadRequest(_)));
+        assert!(!file.exists());
     }
 
     fn request() -> ChatRequest {
@@ -1577,6 +2054,30 @@ mod tests {
         }
     }
 
+    /// A firewall page (Cloudflare's block is a 403 HTML page) is not a key verdict.
+    #[test]
+    fn an_html_outage_or_rate_limit_page_stays_retriable() {
+        let page = "<html><head><title>502 Bad Gateway</title></head></html>";
+        let e = classify_http_body("x", 503, None, page, "");
+        assert!(matches!(e, ProviderError::Server { status: 503, .. }) && e.is_retriable(), "{e:?}");
+        let e = classify_http_body("x", 429, Some(Duration::from_secs(7)), page, "");
+        assert!(
+            matches!(e, ProviderError::RateLimited { retry_after: Some(_), .. }),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn a_403_web_page_is_not_reported_as_a_refused_key() {
+        const PAGE: &str = "<!DOCTYPE html><html><head><title>Attention Required! | Cloudflare</title></head></html>";
+        let (base, _r) = serve("HTTP/1.1 403 Forbidden", "text/html", PAGE);
+        let err = provider(&base).list_models().unwrap_err();
+        match err {
+            ProviderError::Protocol(d) => assert!(d.contains("Cloudflare") && d.contains("web page"), "{d}"),
+            other => panic!("expected Protocol, got {other:?}"),
+        }
+    }
+
     /// 403, 429 (with and without Retry-After), and 5xx each classify
     /// distinctly -- the test matrix the next phase's review asked for.
     #[test]
@@ -1664,6 +2165,7 @@ mod tests {
             service: TEST_SERVICE,
             fixed_key: None,
             fixed_base_url: Some("http://127.0.0.1:1".to_string()),
+            access_file: None,
         };
         let err = p.stream(&request(), &|| false, &mut |_| true).unwrap_err();
         match err {
@@ -1680,7 +2182,7 @@ mod tests {
         let status = p.detect();
         assert!(!status.configured);
         assert!(
-            status.detail.contains(TEST_SERVICE.base_url_var),
+            status.detail.contains(&format!("se connect {} <api-url>", TEST_SERVICE.id)),
             "{}",
             status.detail
         );
@@ -1923,6 +2425,7 @@ mod tests {
             service: KEYLESS,
             fixed_key: None,
             fixed_base_url: Some(base),
+            access_file: None,
         };
 
         let status = p.detect();
@@ -1972,6 +2475,7 @@ mod tests {
             service: KEYLESS,
             fixed_key: None,
             fixed_base_url: Some(base),
+            access_file: None,
         };
         p.stream(&request(), &|| false, &mut |_| true).unwrap();
         let seen = requests.lock().unwrap().join("\n");
@@ -2113,6 +2617,7 @@ mod tests {
             service: KEYLESS,
             fixed_key: None,
             fixed_base_url: Some("http://attacker.example.com:11434".to_string()),
+            access_file: None,
         };
         let err = p.stream(&request(), &|| false, &mut |_| true).unwrap_err();
         match err {

@@ -47,6 +47,10 @@ const NATIVE_LOOP_AGENT_ID: &str = "native-tool-loop";
 const NATIVE_LOOP_AGENT_DEFINITION_HASH: &str = "native-tool-loop-v1";
 /// Who a scheduled turn acts as while its specialist is being picked.
 const AUTO_ROUTE_AGENT_ID: &str = "auto-router";
+/// With auto-routing on, every turn runs as a catalogue specialist: this
+/// one takes any turn the router cannot place (its own `activation` is
+/// `always`), so no turn ever runs as a bare model with no SE role.
+pub const FALLBACK_AGENT_ID: &str = "chief-orchestrator";
 
 /// Hard ceiling on how many model/tool round trips one turn may make,
 /// independent of the turn deadline: the deadline bounds wall time, but
@@ -114,6 +118,44 @@ pub struct ProviderRunner {
     /// Set by a team run: file claims and the token budget, keyed by the
     /// node a turn executes (`UserTurn::team_node`).
     team: Option<crate::team::TeamContext>,
+    /// Summarize older history once it passes this many (estimated)
+    /// tokens; `None` never compacts. See [`compaction_split`].
+    compact_at_tokens: Option<u32>,
+    /// The specialist the conversation is with. Follow-up turns keep it
+    /// instead of being re-routed on their own words alone (which picked
+    /// odd roles for "what's the codename?" and cost two calls a turn);
+    /// naming another with `/<id>` switches it. Interactive turns only.
+    sticky_specialist: Sticky,
+    /// Manual, auto or plan; read at every tool call so a switch takes effect mid-turn.
+    mode: std::sync::Mutex<se_protocol::WorkMode>,
+}
+
+/// The conversation's specialist, saved beside the conversation (when a
+/// file is given) so `se --resume` comes back to the same one.
+#[derive(Default)]
+struct Sticky {
+    id: std::sync::Mutex<Option<String>>,
+    file: Option<std::path::PathBuf>,
+}
+
+impl Sticky {
+    fn get(&self) -> Option<String> {
+        self.id.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Every change goes through here, so the saved copy never lags.
+    /// The cleared state is saved as an empty file, not a deletion.
+    fn set(&self, id: Option<String>) {
+        let mut guard = self.id.lock().unwrap_or_else(|e| e.into_inner());
+        if *guard == id {
+            return;
+        }
+        *guard = id;
+        if let Some(path) = &self.file {
+            // shortcut: a failed save only loses the choice on resume.
+            let _ = std::fs::write(path, guard.as_deref().unwrap_or(""));
+        }
+    }
 }
 
 impl ProviderRunner {
@@ -131,6 +173,22 @@ impl ProviderRunner {
                 status.detail
             )));
         }
+        Self::with_default(registry, provider_id, model)
+    }
+
+    /// A runner with no default model yet: every turn needs one chosen in
+    /// the interface (`/models`), and a turn without one fails saying so.
+    /// Used when several providers are configured and none was named, so
+    /// SE talks to a real model instead of falling back to the local echo.
+    pub fn unselected() -> Result<Self, ProviderError> {
+        Self::with_default(Registry::new(), "", "")
+    }
+
+    fn with_default(
+        registry: Registry,
+        provider_id: &str,
+        model: &str,
+    ) -> Result<Self, ProviderError> {
         Ok(ProviderRunner {
             registry,
             provider_id: provider_id.to_string(),
@@ -143,12 +201,37 @@ impl ProviderRunner {
                 .map_err(|e| ProviderError::NotConfigured(format!("no working directory: {e}")))?,
             audit: std::sync::Arc::new(NullAuditSink),
             auto_route: false,
+            compact_at_tokens: None,
+            sticky_specialist: Default::default(),
+            mode: Default::default(),
             team: None,
         })
     }
 
     /// Automatically picks one of the catalogue's specialists for any
     /// turn that names none. Needs a catalogue root to have any effect.
+    /// Compacts the conversation once its history passes `tokens`
+    /// (estimated as chars/4): older exchanges are summarized once by the
+    /// turn's own model and the summary replaces them in the shared,
+    /// saved transcript. Later turns, a resumed session and a switched
+    /// provider then send the summary, not the whole history.
+    pub fn with_compaction(mut self, tokens: Option<u32>) -> Self {
+        self.compact_at_tokens = tokens.filter(|t| *t > 0);
+        self
+    }
+
+    /// Saves the conversation's specialist to `path` and starts from
+    /// whatever it holds (missing or empty: no specialist).
+    pub fn with_specialist_file(mut self, path: std::path::PathBuf) -> Self {
+        let saved = std::fs::read_to_string(&path).unwrap_or_default();
+        let saved = saved.trim();
+        self.sticky_specialist = Sticky {
+            id: std::sync::Mutex::new((!saved.is_empty()).then(|| saved.to_string())),
+            file: Some(path),
+        };
+        self
+    }
+
     pub fn with_auto_route(mut self, on: bool) -> Self {
         self.auto_route = on;
         self
@@ -269,6 +352,114 @@ fn fit_history(history: &[Message], budget_tokens: Option<u32>, fixed_chars: usi
     &history[start..]
 }
 
+/// Retries of one model call after a temporary provider failure.
+const MAX_RETRIES: u32 = 2;
+
+/// How long to wait before retry `attempt` (1-based): the provider's own
+/// `retry_after` when it gave one (capped at 30s), else 1s then 3s.
+fn retry_wait(error: &ProviderError, attempt: u32) -> Duration {
+    match error {
+        ProviderError::RateLimited {
+            retry_after: Some(d),
+            ..
+        } => (*d).min(Duration::from_secs(30)),
+        _ => Duration::from_secs(3u64.pow(attempt.saturating_sub(1))),
+    }
+}
+
+/// Messages kept verbatim after a compaction: the last two exchanges.
+const COMPACT_KEEP: usize = 4;
+
+/// Opens the summary message, so it reads as memory, not as a request.
+pub const MEMORY_PREFIX: &str = "[SE memory] Summary of our conversation so far:
+";
+
+const COMPACT_SYSTEM: &str = "You compress a conversation into a memory note that another model will continue from. Keep the user's goals, decisions made and why, facts, names, file paths, code identifiers, open questions and next steps. Drop pleasantries and repetition. Plain text, at most 300 words.";
+
+/// Where to cut `history` for a compaction: everything before the
+/// returned index is summarized. `None` while the history is under
+/// `at_tokens` (chars/4), or when the older part is too small to be worth
+/// a model call (so oversized recent turns cannot cause a summary on
+/// every turn). The cut always lands on a user message.
+fn compaction_split(history: &[Message], at_tokens: u32) -> Option<usize> {
+    let tokens = |ms: &[Message]| ms.iter().map(|m| m.content.len()).sum::<usize>() / 4;
+    if tokens(history) <= at_tokens as usize || history.len() <= COMPACT_KEEP {
+        return None;
+    }
+    let mut split = history.len() - COMPACT_KEEP;
+    while split > 0 && history[split].role != Role::User {
+        split -= 1;
+    }
+    (split > 0 && tokens(&history[..split]) * 4 > at_tokens as usize).then_some(split)
+}
+
+/// Catalogue `tools:` names (`read-files`, `run-shell`, ...) as the SE
+/// tool names the gateway checks (`read`, `shell`, ...). The one place
+/// that translation lives. Catalogue capabilities SE has no tool for are
+/// dropped; `run-tests` is deliberately among them -- mapping it to
+/// `shell` would hand arbitrary shell to roles that declare only tests.
+/// SE's own names pass through so a definition may use either.
+pub(crate) fn se_tools_for(declared: &[String]) -> Vec<String> {
+    const KNOWN_UNMAPPED: &[&str] = &[
+        "escalate",
+        "memory-read",
+        "memory-write",
+        "task-graph",
+        "invoke-skill",
+        "web-fetch",
+        "web-search",
+        "run-tests",
+        "edit-notebook",
+    ];
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    let mut out: Vec<String> = Vec::new();
+    for name in declared {
+        let mapped: &[&str] = match name.as_str() {
+            "read-files" | "read" => &["read"],
+            "search" => &["search"],
+            "write-files" => &["write", "edit"],
+            "write" => &["write"],
+            "edit" => &["edit"],
+            "run-shell" | "shell" => &["shell"],
+            "invoke-agent" | "agent" => &["agent"],
+            n if KNOWN_UNMAPPED.contains(&n) => &[],
+            n => {
+                WARNED.call_once(|| {
+                    eprintln!("se: agent definition declares unknown tool `{n}`; it grants nothing")
+                });
+                &[]
+            }
+        };
+        for m in mapped {
+            if !out.iter().any(|o| o == m) {
+                out.push((*m).to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The older part of a conversation as one plain-text transcript.
+fn render_transcript(messages: &[Message]) -> String {
+    let mut out = String::new();
+    for m in messages {
+        let who = match m.role {
+            Role::User => "USER",
+            Role::Assistant => "ASSISTANT",
+            _ => continue,
+        };
+        out.push_str(who);
+        out.push_str(": ");
+        out.push_str(&m.content);
+        out.push_str(
+            "
+
+",
+        );
+    }
+    out
+}
+
 /// One short, tool-less question to the model; its text answer or `None`.
 fn ask(
     provider: &dyn se_provider::ModelProvider,
@@ -276,13 +467,31 @@ fn ask(
     prompt: &str,
     sink: &TurnSink,
 ) -> (Option<String>, Option<Usage>) {
+    ask_with(
+        provider,
+        model,
+        crate::router::ROUTER_SYSTEM,
+        prompt,
+        64,
+        sink,
+    )
+}
+
+fn ask_with(
+    provider: &dyn se_provider::ModelProvider,
+    model: &str,
+    system: &str,
+    prompt: &str,
+    max_tokens: u32,
+    sink: &TurnSink,
+) -> (Option<String>, Option<Usage>) {
     let request = ChatRequest {
         model: model.to_string(),
         messages: vec![
-            Message::text(Role::System, crate::router::ROUTER_SYSTEM),
+            Message::text(Role::System, system),
             Message::text(Role::User, prompt),
         ],
-        max_tokens: 64,
+        max_tokens,
         tools: Vec::new(),
     };
     let mut text = String::new();
@@ -328,7 +537,35 @@ impl Runner for ProviderRunner {
         self.team = Some(team);
     }
 
+    fn set_specialist(&self, id: Option<String>) {
+        self.sticky_specialist.set(id);
+    }
+
+    fn set_mode(&self, mode: se_protocol::WorkMode) {
+        *self.mode.lock().unwrap_or_else(|p| p.into_inner()) = mode;
+    }
+
     fn run(&self, turn: &UserTurn, history: &[Message], sink: &mut TurnSink) -> Outcome {
+        self.run_inner(turn, history, sink, None)
+    }
+}
+
+impl ProviderRunner {
+    pub(crate) fn work_mode(&self) -> se_protocol::WorkMode {
+        *self.mode.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+impl ProviderRunner {
+    /// One turn. `child` is set when the turn is a sub-agent's, deployed
+    /// by a parent turn's `agent` tool (see `agent_tool`).
+    fn run_inner(
+        &self,
+        turn: &UserTurn,
+        history: &[Message],
+        sink: &mut TurnSink,
+        child: Option<&agent_tool::Child>,
+    ) -> Outcome {
         // Charter §6.6 precedence. The runner's own provider is the
         // global default; the catalogue has no per-agent model field
         // yet, and teams/departments have no config, so those are None.
@@ -336,6 +573,12 @@ impl Runner for ProviderRunner {
             provider: self.provider_id.clone(),
             model: self.model.clone(),
         };
+        if turn.model.is_none() && self.provider_id.is_empty() {
+            return Outcome::Failed {
+                detail: "no model selected: pick one with /models (SE remembers it for next time)"
+                    .to_string(),
+            };
+        }
         let chosen =
             match crate::routing::resolve(turn.model.as_ref(), None, None, None, Some(&default)) {
                 Ok(m) => m,
@@ -405,7 +648,19 @@ impl Runner for ProviderRunner {
                     };
                 }
             },
-            (None, Some(root)) if self.auto_route && !unrouted => se_catalogue::load(root).ok(),
+            // Forced routing: a catalogue that will not load fails the
+            // turn rather than silently running it with no specialist.
+            (None, Some(root)) if self.auto_route => match se_catalogue::load(root) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    return Outcome::Failed {
+                        detail: format!(
+                            "every turn runs as an SE specialist, but the agent catalogue at {} could not be read: {e}",
+                            root.display()
+                        ),
+                    };
+                }
+            },
             (None, _) => None,
         };
         // Scheduled work with no named agent spends the chosen vendor's
@@ -425,15 +680,41 @@ impl Runner for ProviderRunner {
         let mut total_usage: Option<Usage> = None;
         let specialist_id: Option<String> = match &turn.specialist_id {
             Some(id) => Some(id.clone()),
-            None => catalogue.as_ref().and_then(|c| {
+            // An unnamed ensemble member is routed by the free, deterministic
+            // keyword match, never by its own model, so every member still
+            // receives a byte-identical packet (row 4.3).
+            None if unrouted => catalogue.as_ref().map(|c| {
+                crate::router::lexical(&turn.text, &c.agents)
+                    .map_or(FALLBACK_AGENT_ID.to_string(), |a| a.frontmatter.id.clone())
+            }),
+            None => catalogue.as_ref().map(|c| {
+                let kept = node
+                    .is_none()
+                    .then(|| self.sticky_specialist.get())
+                    .flatten()
+                    .filter(|id| c.agents.iter().any(|a| &a.frontmatter.id == id));
+                if let Some(id) = kept {
+                    return id;
+                }
                 let (picked, usage) =
                     self.route(provider, &chosen.model, &turn.text, &c.agents, sink, node);
                 total_usage = usage;
-                picked
+                picked.unwrap_or_else(|| FALLBACK_AGENT_ID.to_string())
             }),
         };
 
         let specialist_id = specialist_id.filter(|_| !evaluator);
+        // The fallback only stands in for a turn nothing matched; it is
+        // kept only when the user named it.
+        let keep = |id: &String| id != FALLBACK_AGENT_ID || turn.specialist_id.is_some();
+        // A sub-agent's role is never the conversation's specialist.
+        if let (None, None, Some(id)) = (
+            node,
+            child,
+            specialist_id.as_ref().filter(|id| keep(id)),
+        ) {
+            self.sticky_specialist.set(Some(id.clone()));
+        }
         let (system_prompt, invoked, allowed_tools, max_calls, budget_tokens) = match &specialist_id
         {
             None if evaluator => (
@@ -459,10 +740,12 @@ impl Runner for ProviderRunner {
                 // whether they set it, and an unset allowlist must not
                 // silently deny every call a specialist with no
                 // opinion on tools makes.
+                // Declared but mapping to nothing (e.g. only memory-*)
+                // stays `Some(empty)`: deny-all, never widened to `None`.
                 let allowed = if agent.frontmatter.tools.is_empty() {
                     None
                 } else {
-                    Some(agent.frontmatter.tools.clone())
+                    Some(se_tools_for(&agent.frontmatter.tools))
                 };
                 (
                     agent.body,
@@ -511,6 +794,47 @@ impl Runner for ProviderRunner {
         // back as the final answer never includes those intermediate
         // turns in cross-turn `history` -- only `engine.rs` deciding to
         // persist `Outcome::Completed`'s `final_text` does that.
+        // Compaction: summarize older history once, hand the summary back
+        // to the core to replace it, and send summary + recent turns. A
+        // failed summary never fails the turn; it just sends the history.
+        let compacted: Vec<Message>;
+        let mut history = history;
+        if let Some(split) = self
+            .compact_at_tokens
+            .and_then(|at| compaction_split(history, at))
+        {
+            let (summary, usage) = ask_with(
+                provider,
+                &chosen.model,
+                COMPACT_SYSTEM,
+                &render_transcript(&history[..split]),
+                1024,
+                sink,
+            );
+            self.charge(node, usage.as_ref());
+            if let Some(u) = usage {
+                total_usage = Some(match total_usage {
+                    None => u,
+                    Some(prev) => merge_usage(prev, u),
+                });
+            }
+            if let Some(summary) = summary.filter(|t| !t.trim().is_empty()) {
+                let with = vec![
+                    Message::text(Role::User, format!("{MEMORY_PREFIX}{}", summary.trim())),
+                    Message::text(
+                        Role::Assistant,
+                        "Understood. I'll continue from that summary.",
+                    ),
+                ];
+                sink.compact_history(split, with.clone());
+                compacted = with
+                    .into_iter()
+                    .chain(history[split..].iter().cloned())
+                    .collect();
+                history = &compacted;
+            }
+        }
+
         let mut messages: Vec<Message> = sink.timed(Stage::ContextBuild, || {
             let mut messages = Vec::with_capacity(history.len() + 2);
             messages.push(Message::text(Role::System, &system_prompt));
@@ -530,8 +854,33 @@ impl Runner for ProviderRunner {
         // trip below shares the same `turn_started` and `turn_deadline`,
         // so the bound is on the loop, not reset per model call.
         let turn_started = Instant::now();
-        let turn_deadline = self.turn_deadline;
+        let turn_deadline = child.map_or(self.turn_deadline, |c| c.deadline);
         let deadline_fired = Arc::new(AtomicBool::new(false));
+        // Depth 1, enforced here: a sub-agent is never offered `agent`,
+        // and neither is a role that did not declare it, an evaluator,
+        // or a team node (its claims and budget would not reach the child).
+        // Agent CLIs get it too, through the text tool bridge in se-provider.
+        let may_spawn = child.is_none()
+            && !evaluator
+            && node.is_none()
+            && allowed_tools
+                .as_ref()
+                .is_none_or(|a| a.iter().any(|t| t == agent_tool::AGENT_TOOL));
+        let mut tools = if evaluator {
+            Vec::new()
+        } else {
+            self.tool_definitions()
+        };
+        if let (Some(_), Some(allowed)) = (child, &allowed_tools) {
+            tools.retain(|t| allowed.contains(&t.name));
+        }
+        if may_spawn {
+            tools.push(agent_tool::definition());
+        }
+        // Plan mode offers no tool that changes the project; handle_tool_call re-checks.
+        let mode = self.work_mode();
+        tools.retain(|t| mode.allows(&t.name));
+        let mut child_used: u64 = 0;
 
         let mut round = 0usize;
         let mut calls_run: u32 = 0;
@@ -563,11 +912,7 @@ impl Runner for ProviderRunner {
                 messages: messages.clone(),
                 max_tokens: MAX_TOKENS,
                 // An evaluator is offered no tools at all (item 4).
-                tools: if evaluator {
-                    Vec::new()
-                } else {
-                    self.tool_definitions()
-                },
+                tools: tools.clone(),
             };
 
             let mut round_answer = String::new();
@@ -595,68 +940,110 @@ impl Runner for ProviderRunner {
                 }
                 false
             };
-            let result = provider.stream(&request, &should_stop, &mut |event| match event {
-                StreamEvent::TextDelta(text) => {
-                    if first_token_at.is_none() {
-                        first_token_at = Some(Instant::now());
+            let mut attempt = 0u32;
+            let result = loop {
+                let result = provider.stream(&request, &should_stop, &mut |event| match event {
+                    StreamEvent::TextDelta(text) => {
+                        if first_token_at.is_none() {
+                            first_token_at = Some(Instant::now());
+                        }
+                        round_answer.push_str(&text);
+                        if sink.text_delta(&text).is_err() {
+                            disconnected = true;
+                            return false;
+                        }
+                        true
                     }
-                    round_answer.push_str(&text);
-                    if sink.text_delta(&text).is_err() {
-                        disconnected = true;
-                        return false;
+                    StreamEvent::ReasoningDelta(text) => {
+                        if first_token_at.is_none() {
+                            first_token_at = Some(Instant::now());
+                        }
+                        if sink.reasoning_delta(&text).is_err() {
+                            disconnected = true;
+                            return false;
+                        }
+                        true
                     }
-                    true
-                }
-                StreamEvent::ReasoningDelta(text) => {
-                    if first_token_at.is_none() {
-                        first_token_at = Some(Instant::now());
-                    }
-                    if sink.reasoning_delta(&text).is_err() {
-                        disconnected = true;
-                        return false;
-                    }
-                    true
-                }
-                StreamEvent::Usage {
-                    input_tokens,
-                    output_tokens,
-                    cached_input_tokens,
-                } => {
-                    round_usage = Some(Usage {
+                    StreamEvent::Usage {
                         input_tokens,
                         output_tokens,
                         cached_input_tokens,
-                        source: UsageSource::ProviderReported,
-                    });
-                    true
-                }
-                // A mid-stream provider error becomes a transport-level
-                // failure via the `Err` the provider returns; nothing is
-                // appended to `answer`, so a failed turn cannot present
-                // a partial reply as the answer.
-                StreamEvent::Error(_) => false,
-                // Recorded for the outcome, not shown as content.
-                StreamEvent::FinishReason(reason) => {
-                    finish_reason = Some(reason);
-                    true
-                }
-                StreamEvent::ToolCallRequested {
-                    id,
-                    name,
-                    arguments,
-                } => {
-                    tool_calls.push(ToolCallRecord {
+                    } => {
+                        round_usage = Some(Usage {
+                            input_tokens,
+                            output_tokens,
+                            cached_input_tokens,
+                            source: UsageSource::ProviderReported,
+                        });
+                        true
+                    }
+                    // A mid-stream provider error becomes a transport-level
+                    // failure via the `Err` the provider returns; nothing is
+                    // appended to `answer`, so a failed turn cannot present
+                    // a partial reply as the answer.
+                    StreamEvent::Error(_) => false,
+                    // Recorded for the outcome, not shown as content.
+                    StreamEvent::FinishReason(reason) => {
+                        finish_reason = Some(reason);
+                        true
+                    }
+                    StreamEvent::ToolCallRequested {
                         id,
                         name,
                         arguments,
-                    });
-                    true
+                    } => {
+                        tool_calls.push(ToolCallRecord {
+                            id,
+                            name,
+                            arguments,
+                        });
+                        true
+                    }
+                    StreamEvent::Done => true,
+                });
+                // A temporary failure (429, 5xx, network) before anything has
+                // streamed is retried a bounded number of times. Once text or a
+                // tool call has arrived, a retry could duplicate it, so it is not.
+                match &result {
+                    Err(e)
+                        if e.is_retriable()
+                            && attempt < MAX_RETRIES
+                            && round_answer.is_empty()
+                            && tool_calls.is_empty()
+                            && !should_stop() =>
+                    {
+                        attempt += 1;
+                        let until = Instant::now() + retry_wait(e, attempt);
+                        while Instant::now() < until && !should_stop() {
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                        if should_stop() {
+                            break result;
+                        }
+                        round_usage = None;
+                        finish_reason = None;
+                    }
+                    _ => break result,
                 }
-                StreamEvent::Done => true,
-            });
+            };
 
             answer.push_str(&round_answer);
             self.charge(node, round_usage.as_ref());
+            if let (Some(c), Some(used)) = (child, reported_tokens(round_usage.as_ref())) {
+                child_used += used;
+                let _ = sink.emit(se_protocol::Payload::Agent(se_protocol::AgentEvent::Tokens {
+                    agent_id: c.id.clone(),
+                    used: child_used,
+                }));
+                if child_used > c.budget {
+                    break Outcome::Failed {
+                        detail: format!(
+                            "token budget exceeded: used {child_used} of {} tokens",
+                            c.budget
+                        ),
+                    };
+                }
+            }
             if let Some(usage) = round_usage {
                 total_usage = Some(match total_usage {
                     None => usage,
@@ -713,8 +1100,15 @@ impl Runner for ProviderRunner {
                     // silently stop), then loop back with a fresh
                     // request rather than returning.
                     messages.push(Message::assistant_tool_calls(tool_calls.clone()));
+                    // A round's `agent` calls run first, side by side; the
+                    // results are fed back below in the model's order.
+                    let mut spawned = if may_spawn {
+                        self.run_agents(sink, &tool_calls, &agent, &chosen)
+                    } else {
+                        vec![None; tool_calls.len()]
+                    };
                     let mut interrupted = false;
-                    for call in &tool_calls {
+                    for (i, call) in tool_calls.iter().enumerate() {
                         if sink.is_cancelled() {
                             interrupted = true;
                             break;
@@ -723,6 +1117,14 @@ impl Runner for ProviderRunner {
                         // past it a call is not run, and the model is
                         // told why so it can finish with what it has.
                         let result_text = match max_calls {
+                            _ if spawned[i].is_some() => spawned[i].take().unwrap_or_default(),
+                            _ if child.is_some() && call.name == agent_tool::AGENT_TOOL => self
+                                .reject_unparsed(
+                                    sink,
+                                    call,
+                                    &agent,
+                                    "a sub-agent cannot deploy agents",
+                                ),
                             _ if evaluator => self.reject_unparsed(
                                 sink,
                                 call,
@@ -854,7 +1256,7 @@ impl ProviderRunner {
         let _ = sink.tool_completed(id, &call.name, false, &text);
         // Already a refusal, so a failed record cannot make it unsafe.
         let _ = self.audit.record(se_permission::AuditRecord {
-            agent_id: agent.0.clone(),
+            agent_id: sink.agent_tag().unwrap_or_else(|| agent.0.clone()),
             session: sink.session(),
             task: sink.task(),
             tool_name: call.name.clone(),
@@ -883,6 +1285,14 @@ impl ProviderRunner {
         node: Option<&str>,
     ) -> (Option<String>, Option<Usage>) {
         use crate::router;
+        // An agent CLI costs a process start and its own large prompt per
+        // call, so it is routed by the free keyword match alone.
+        if provider.is_agent_cli() {
+            return (
+                router::lexical(task, agents).map(|a| a.frontmatter.id.clone()),
+                None,
+            );
+        }
         let mut usage: Option<Usage> = None;
         // Each routing call is budgeted and charged like any other; a
         // spent budget skips straight to the free keyword fallback.
@@ -953,6 +1363,12 @@ impl ProviderRunner {
         {
             return Ok(());
         }
+        // A model the user picked in the interface (`/models`) is their own
+        // choice: it still goes through the gateway (a deny rule wins, and
+        // it is audited), but it is never put back to them as a question.
+        // Every interactive turn runs as a specialist, so asking here would
+        // ask on every turn after a `/models` pick.
+        let users_pick = turn.team_node.is_none() && turn.model.as_ref() == Some(chosen);
         let shown = format!(
             "{} wants to use {}/{} with its stored credential",
             agent.0, chosen.provider, chosen.model
@@ -970,10 +1386,12 @@ impl ProviderRunner {
             env_subset: Vec::new(),
             shown_to_human: shown.clone(),
         };
-        let gateway = Gateway::new(&self.ruleset, &self.ledger, self.audit.as_ref());
+        let audit = agent_tool::Tagged(self.audit.as_ref(), sink.agent_tag());
+        let gateway = Gateway::new(&self.ruleset, &self.ledger, &audit);
         match gateway.decide(&req) {
             se_permission::Decision::Allow(_) => Ok(()),
             se_permission::Decision::Deny { reason } => Err(reason),
+            se_permission::Decision::Ask if users_pick => gateway.approve(&req).map(|_| ()),
             se_permission::Decision::Ask => {
                 if sink.request_approval("use_provider", &shown).is_some() {
                     gateway.approve(&req).map(|_| ())
@@ -1016,6 +1434,15 @@ impl ProviderRunner {
         agent: &(String, String),
         node: Option<&str>,
     ) -> String {
+        let mode = self.work_mode();
+        if !mode.allows(&call.name) {
+            return self.reject_unparsed(
+                sink,
+                call,
+                agent,
+                "plan mode: only read and search run; describe the change instead of making it",
+            );
+        }
         let parsed =
             match tool_loop::parse_tool_call(&self.workspace_root, &call.name, &call.arguments) {
                 Ok(p) => p,
@@ -1061,7 +1488,9 @@ impl ProviderRunner {
             env_subset: Vec::new(),
             shown_to_human: parsed.display.clone(),
         };
-        let gateway = Gateway::new(&self.ruleset, &self.ledger, self.audit.as_ref());
+        // A sub-agent is audited as `role#id`; rules still match its role.
+        let audit = agent_tool::Tagged(self.audit.as_ref(), sink.agent_tag());
+        let gateway = Gateway::new(&self.ruleset, &self.ledger, &audit);
 
         let (id, approved): (se_protocol::ToolCallId, Box<Approved>) =
             match gateway.decide_scoped(&req, allowed_tools) {
@@ -1085,6 +1514,25 @@ impl ProviderRunner {
                         return "the interface disconnected before this call could run".to_string();
                     }
                     (id, token)
+                }
+                // Auto: the user approved every call in advance. Plan: only read/search
+                // got this far, and they change nothing. A deny rule still wins above.
+                se_permission::Decision::Ask if mode != se_protocol::WorkMode::Manual => {
+                    let id = se_protocol::ToolCallId::next();
+                    if sink
+                        .tool_requested(id, &call.name, &parsed.display)
+                        .is_err()
+                    {
+                        gateway.refuse(&req);
+                        return "the interface disconnected before this call could run".to_string();
+                    }
+                    match gateway.approve(&req) {
+                        Ok(token) => (id, token),
+                        Err(reason) => {
+                            let _ = sink.tool_completed(id, &call.name, false, &reason);
+                            return reason;
+                        }
+                    }
                 }
                 se_permission::Decision::Ask => {
                     let Some(id) = sink.request_approval(&call.name, &parsed.display) else {
@@ -1343,6 +1791,9 @@ mod tests {
                 workspace_root: std::env::temp_dir(),
                 audit: std::sync::Arc::new(NullAuditSink),
                 auto_route: false,
+                compact_at_tokens: None,
+                sticky_specialist: Default::default(),
+                mode: Default::default(),
                 team: None,
             },
             requests,
@@ -1486,6 +1937,9 @@ mod tests {
             workspace_root: std::env::temp_dir(),
             audit: std::sync::Arc::new(NullAuditSink),
             auto_route: false,
+            compact_at_tokens: None,
+            sticky_specialist: Default::default(),
+            mode: Default::default(),
             team: None,
         };
         (runner, requests_seen)
@@ -1923,6 +2377,9 @@ mod tests {
             workspace_root: std::env::temp_dir(),
             audit: std::sync::Arc::new(NullAuditSink),
             auto_route: false,
+            compact_at_tokens: None,
+            sticky_specialist: Default::default(),
+            mode: Default::default(),
             team: None,
         };
 
@@ -2250,6 +2707,9 @@ mod tests {
             workspace_root: std::env::temp_dir(),
             audit: std::sync::Arc::new(NullAuditSink),
             auto_route: false,
+            compact_at_tokens: None,
+            sticky_specialist: Default::default(),
+            mode: Default::default(),
             team: None,
         };
 
@@ -2761,33 +3221,25 @@ mod tests {
         (runner, alpha, beta, root)
     }
 
-    /// Phase 4 item 2: a specialist cannot spend another provider's
-    /// credential without the gateway. Default ruleset asks the human.
+    /// Phase 4 item 2, interactive case: a model the user picked
+    /// (`/models`) is their consent, so a specialist turn on it is not
+    /// put back to them as a question -- it still passes the gateway (see
+    /// the deny test below). Scheduled team work is covered separately.
     #[test]
-    fn a_specialist_using_a_non_default_provider_needs_approval() {
-        for allow in [false, true] {
-            let (runner, alpha, beta, root) = scoped_runner(Ruleset::default());
-            let (outcome, asked) =
-                run_specialist_with_model(runner, model_ref("beta", "beta-large"), allow);
-            assert_eq!(asked, 1, "allow={allow}: asked exactly once");
-            assert!(alpha.lock().unwrap().is_empty());
-            if allow {
-                assert_eq!(
-                    outcome,
-                    Outcome::Completed {
-                        final_text: "from beta".into()
-                    }
-                );
-                assert_eq!(*beta.lock().unwrap(), ["beta-large"]);
-            } else {
-                assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
-                assert!(
-                    beta.lock().unwrap().is_empty(),
-                    "a refused key is never used"
-                );
+    fn a_users_own_model_pick_is_not_asked_again() {
+        let (runner, alpha, beta, root) = scoped_runner(Ruleset::default());
+        let (outcome, asked) =
+            run_specialist_with_model(runner, model_ref("beta", "beta-large"), false);
+        assert_eq!(asked, 0, "the user already chose this model");
+        assert!(alpha.lock().unwrap().is_empty());
+        assert_eq!(
+            outcome,
+            Outcome::Completed {
+                final_text: "from beta".into()
             }
-            let _ = std::fs::remove_dir_all(&root);
-        }
+        );
+        assert_eq!(*beta.lock().unwrap(), ["beta-large"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2871,6 +3323,8 @@ mod tests {
         dept_reply: &'static str,
         role_reply: &'static str,
         systems: Arc<std::sync::Mutex<Vec<String>>>,
+        /// Routing questions asked so far.
+        asked: Arc<AtomicUsize>,
     }
 
     impl ModelProvider for RoutingProvider {
@@ -2897,6 +3351,9 @@ mod tests {
             on_event: &mut dyn FnMut(StreamEvent) -> bool,
         ) -> Result<(), ProviderError> {
             let user = &request.messages.last().unwrap().content;
+            if user.contains("Which department") || user.contains("Which specialist") {
+                self.asked.fetch_add(1, Ordering::SeqCst);
+            }
             let reply = if user.contains("Which department") {
                 self.dept_reply
             } else if user.contains("Which specialist") {
@@ -2945,6 +3402,7 @@ mod tests {
                 "react component screen",
                 "FRONTEND BODY",
             ),
+            ("orchestration", FALLBACK_AGENT_ID, "always", "ORCH BODY"),
         ] {
             std::fs::create_dir_all(root.join(dept)).unwrap();
             std::fs::write(
@@ -2971,6 +3429,7 @@ mod tests {
             dept_reply,
             role_reply,
             systems: systems.clone(),
+            asked: Arc::new(AtomicUsize::new(0)),
         }));
         runner.registry = registry;
         runner.provider_id = "routing".into();
@@ -3024,12 +3483,29 @@ mod tests {
         assert_eq!(systems[0].trim(), "FRONTEND BODY");
     }
 
-    /// Nothing matches anywhere: the turn still runs, as a plain turn.
+    /// Nothing matches anywhere: the turn still runs as an SE specialist
+    /// (the fallback), never as a bare model with no role.
     #[test]
-    fn an_unroutable_turn_still_runs_without_a_specialist() {
+    fn an_unroutable_turn_runs_as_the_fallback_specialist() {
         let (systems, payloads) = run_routed("??", "??", "hello there", true);
-        assert_eq!(invoked(&payloads), None);
-        assert_eq!(systems[0], SYSTEM_PROMPT);
+        assert_eq!(invoked(&payloads).as_deref(), Some(FALLBACK_AGENT_ID));
+        assert_eq!(systems.last().unwrap().trim(), "ORCH BODY");
+    }
+
+    /// Forced routing: an unreadable catalogue fails the turn before any
+    /// model call, rather than quietly running it with no specialist.
+    #[test]
+    fn an_unreadable_catalogue_fails_the_turn_instead_of_running_unrouted() {
+        let (runner, requests) = runner_with(Vec::new(), Duration::ZERO, None);
+        let runner = runner
+            .with_catalogue_root(std::env::temp_dir().join("se-no-such-catalogue-xyz"))
+            .with_auto_route(true);
+        let (outcome, _) = run(runner, "add an orders table");
+        match outcome {
+            Outcome::Failed { detail } => assert!(detail.contains("catalogue"), "{detail}"),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 0, "no model was called");
     }
 
     #[test]
@@ -3043,8 +3519,546 @@ mod tests {
         assert_eq!(invoked(&payloads), None);
         assert_eq!(systems.len(), 1, "no routing questions were asked");
     }
+
+    #[test]
+    fn compaction_waits_until_history_is_over_the_limit() {
+        let h = |role, n: usize| Message::text(role, "x".repeat(n));
+        let small = vec![h(Role::User, 40), h(Role::Assistant, 40)];
+        assert_eq!(compaction_split(&small, 100), None);
+        let big: Vec<Message> = (0..6)
+            .map(|i| {
+                h(
+                    if i % 2 == 0 {
+                        Role::User
+                    } else {
+                        Role::Assistant
+                    },
+                    400,
+                )
+            })
+            .collect();
+        // Keeps the last two exchanges verbatim and cuts on a user turn.
+        assert_eq!(compaction_split(&big, 100), Some(2));
+        assert_eq!(big[2].role, Role::User);
+        // Only huge recent turns: the older part is too small to summarize.
+        let recent_heavy = vec![
+            h(Role::User, 10),
+            h(Role::Assistant, 10),
+            h(Role::User, 4000),
+            h(Role::Assistant, 4000),
+            h(Role::User, 4000),
+            h(Role::Assistant, 4000),
+        ];
+        assert_eq!(compaction_split(&recent_heavy, 1000), None);
+    }
+
+    /// Records every request; answers the compaction prompt with a summary.
+    struct MemoryProvider {
+        requests: Arc<std::sync::Mutex<Vec<Vec<Message>>>>,
+    }
+
+    impl ModelProvider for MemoryProvider {
+        fn id(&self) -> &str {
+            "memory"
+        }
+        fn display_name(&self) -> &str {
+            "memory"
+        }
+        fn env_var(&self) -> &str {
+            "SE_TEST_MEMORY_KEY"
+        }
+        fn detect(&self) -> Status {
+            Status {
+                configured: true,
+                detail: "m".into(),
+                source: se_provider::Source::Environment,
+            }
+        }
+        fn stream(
+            &self,
+            request: &ChatRequest,
+            _cancelled: &dyn Fn() -> bool,
+            on_event: &mut dyn FnMut(StreamEvent) -> bool,
+        ) -> Result<(), ProviderError> {
+            self.requests.lock().unwrap().push(request.messages.clone());
+            let reply = if request.messages[0].content == COMPACT_SYSTEM {
+                "SUMMARY: user is building an orders table in PostgreSQL."
+            } else {
+                "answered"
+            };
+            on_event(StreamEvent::TextDelta(reply.into()));
+            on_event(StreamEvent::Done);
+            Ok(())
+        }
+        fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn memory_runner(
+        compact: Option<u32>,
+    ) -> (ProviderRunner, Arc<std::sync::Mutex<Vec<Vec<Message>>>>) {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut runner, _) = runner_with(Vec::new(), Duration::ZERO, None);
+        let mut registry = Registry::empty();
+        registry.register(Box::new(MemoryProvider {
+            requests: requests.clone(),
+        }));
+        runner.registry = registry;
+        runner.provider_id = "memory".into();
+        (runner.with_compaction(compact), requests)
+    }
+
+    fn finish(core: &crate::CoreHandle, text: &str) -> Outcome {
+        core.submit(text, vec![]).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            for event in core.drain_blocking(Duration::from_millis(20)) {
+                if let Payload::TaskFinished { outcome, .. } = event.payload {
+                    return outcome;
+                }
+            }
+        }
+        panic!("the turn never finished");
+    }
+
+    /// The memory the user asked for: a long conversation is summarized
+    /// once, the summary replaces the older turns in the saved file, and a
+    /// resumed session sends the summary instead of the whole history,
+    /// without summarizing again.
+    #[test]
+    fn a_long_conversation_is_compacted_once_and_resumes_from_the_summary() {
+        let dir = std::env::temp_dir().join(format!("se-memory-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.conversation.json");
+        let old: Vec<Message> = (0..6)
+            .map(|i| {
+                let role = if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                };
+                Message::text(role, format!("turn {i} {}", "x".repeat(400)))
+            })
+            .collect();
+        std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+
+        let (runner, requests) = memory_runner(Some(100));
+        let core = crate::start_conversation(runner, &path).unwrap();
+        assert!(matches!(
+            finish(&core, "next step?"),
+            Outcome::Completed { .. }
+        ));
+        core.shutdown();
+
+        let seen = requests.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "one summary call, then the turn itself");
+        assert_eq!(seen[0][0].content, COMPACT_SYSTEM);
+        assert!(seen[0][1].content.contains("turn 0") && !seen[0][1].content.contains("turn 2"));
+        let main = &seen[1];
+        assert!(
+            main[1].content.starts_with(MEMORY_PREFIX),
+            "{:?}",
+            main[1].content
+        );
+        assert!(!main.iter().any(|m| m.content.starts_with("turn 0")));
+        assert!(main.iter().any(|m| m.content.starts_with("turn 5")));
+
+        let saved = crate::load_conversation(&path).unwrap();
+        assert_eq!(
+            saved.len(),
+            2 + 4 + 2,
+            "summary pair + last 4 + this exchange"
+        );
+        assert!(saved[0].content.starts_with(MEMORY_PREFIX));
+        assert_eq!(saved.last().unwrap().content, "answered");
+
+        // A new process resumes the file: the summary is sent, never redone.
+        let (runner, requests) = memory_runner(Some(100_000));
+        let core = crate::start_conversation(runner, &path).unwrap();
+        assert!(matches!(
+            finish(&core, "and then?"),
+            Outcome::Completed { .. }
+        ));
+        core.shutdown();
+        let seen = requests.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "no second summary call");
+        assert!(seen[0][1].content.starts_with(MEMORY_PREFIX));
+        assert_eq!(crate::load_conversation(&path).unwrap().len(), 10);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A conversation keeps its specialist: a follow-up is not re-routed
+    /// on its own words (no routing calls), and naming another switches it.
+    #[test]
+    fn a_follow_up_keeps_the_conversations_specialist() {
+        let systems = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let (mut runner, _) = runner_with(Vec::new(), Duration::ZERO, None);
+        let mut registry = Registry::empty();
+        registry.register(Box::new(RoutingProvider {
+            dept_reply: "backend-and-data",
+            role_reply: "database-engineer",
+            systems: systems.clone(),
+            asked: asked.clone(),
+        }));
+        runner.registry = registry;
+        runner.provider_id = "routing".into();
+        let root = routing_catalogue();
+        let core = crate::start(
+            runner
+                .with_catalogue_root(root.clone())
+                .with_auto_route(true),
+        );
+        finish(&core, "add an orders table");
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+        finish(&core, "what is the codename again?");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            2,
+            "no routing calls for a follow-up"
+        );
+        core.submit_specialist("frontend-lead", "now the screen", vec![])
+            .unwrap();
+        wait_finished(&core);
+        finish(&core, "and the button?");
+        core.shutdown();
+        let seen: Vec<String> = systems
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.trim().to_string())
+            .collect();
+        assert_eq!(
+            seen,
+            ["DB BODY", "DB BODY", "FRONTEND BODY", "FRONTEND BODY"]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The fallback never sticks: the next turn is routed afresh.
+    #[test]
+    fn the_fallback_specialist_does_not_stick() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let (mut runner, _) = runner_with(Vec::new(), Duration::ZERO, None);
+        let mut registry = Registry::empty();
+        registry.register(Box::new(RoutingProvider {
+            dept_reply: "??",
+            role_reply: "??",
+            systems: Arc::new(std::sync::Mutex::new(Vec::new())),
+            asked: asked.clone(),
+        }));
+        runner.registry = registry;
+        runner.provider_id = "routing".into();
+        let root = routing_catalogue();
+        let core = crate::start(
+            runner
+                .with_catalogue_root(root.clone())
+                .with_auto_route(true),
+        );
+        finish(&core, "hello there");
+        let first = asked.load(Ordering::SeqCst);
+        finish(&core, "hello again");
+        core.shutdown();
+        assert_eq!(asked.load(Ordering::SeqCst), first * 2, "routed again");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn wait_finished(core: &crate::CoreHandle) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            for event in core.drain_blocking(Duration::from_millis(20)) {
+                if matches!(event.payload, Payload::TaskFinished { .. }) {
+                    return;
+                }
+            }
+        }
+        panic!("the turn never finished");
+    }
+
+    /// The screenshot bug: with several providers and none named, SE used
+    /// to start the local echo. Now a real runner starts with no default:
+    /// a turn without a model says how to pick one and calls nothing...
+    #[test]
+    fn with_no_model_chosen_a_turn_says_to_pick_one_and_calls_nothing() {
+        let (mut runner, requests) = memory_runner(None);
+        runner.provider_id = String::new();
+        runner.model = String::new();
+        let (outcome, _) = run(runner, "hi");
+        match outcome {
+            Outcome::Failed { detail } => assert!(detail.contains("/models"), "{detail}"),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    /// ...and once a model is picked, turns run on it -- as a specialist,
+    /// without asking permission for the user's own choice.
+    #[test]
+    fn a_picked_model_runs_specialist_turns_without_asking_permission_for_it() {
+        let (mut runner, requests) = memory_runner(None);
+        runner.provider_id = String::new();
+        runner.model = String::new();
+        let root = routing_catalogue();
+        let core = crate::start(
+            runner
+                .with_catalogue_root(root.clone())
+                .with_auto_route(true),
+        );
+        let pick = se_protocol::ModelRef {
+            provider: "memory".into(),
+            model: "m1".into(),
+        };
+        core.submit_with_model("hi", vec![], Some(pick)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut payloads = Vec::new();
+        'outer: while std::time::Instant::now() < deadline {
+            for event in core.drain_blocking(Duration::from_millis(20)) {
+                let done = matches!(event.payload, Payload::TaskFinished { .. });
+                payloads.push(event.payload);
+                if done {
+                    break 'outer;
+                }
+            }
+        }
+        core.shutdown();
+        assert!(
+            !payloads
+                .iter()
+                .any(|p| matches!(p, Payload::ApprovalRequired { .. })),
+            "{payloads:?}"
+        );
+        assert!(payloads
+            .iter()
+            .any(|p| matches!(p, Payload::SpecialistInvoked { .. })));
+        assert!(
+            matches!(
+                payloads.last(),
+                Some(Payload::TaskFinished {
+                    outcome: Outcome::Completed { .. },
+                    ..
+                })
+            ),
+            "{payloads:?}"
+        );
+        assert!(!requests.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Fails its first `fail` calls with `error`, then answers.
+    struct FlakyProvider {
+        fail: usize,
+        error: ProviderError,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ModelProvider for FlakyProvider {
+        fn id(&self) -> &str {
+            "flaky"
+        }
+        fn display_name(&self) -> &str {
+            "flaky"
+        }
+        fn env_var(&self) -> &str {
+            "SE_TEST_FLAKY_KEY"
+        }
+        fn detect(&self) -> Status {
+            Status {
+                configured: true,
+                detail: "f".into(),
+                source: se_provider::Source::Environment,
+            }
+        }
+        fn stream(
+            &self,
+            _request: &ChatRequest,
+            _cancelled: &dyn Fn() -> bool,
+            on_event: &mut dyn FnMut(StreamEvent) -> bool,
+        ) -> Result<(), ProviderError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) < self.fail {
+                return Err(self.error.clone());
+            }
+            on_event(StreamEvent::TextDelta("answered".into()));
+            on_event(StreamEvent::Done);
+            Ok(())
+        }
+        fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn flaky(fail: usize, error: ProviderError) -> (Outcome, usize) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut runner, _) = runner_with(Vec::new(), Duration::ZERO, None);
+        let mut registry = Registry::empty();
+        registry.register(Box::new(FlakyProvider {
+            fail,
+            error,
+            calls: calls.clone(),
+        }));
+        runner.registry = registry;
+        runner.provider_id = "flaky".into();
+        let (outcome, _) = run(runner, "hi");
+        (outcome, calls.load(Ordering::SeqCst))
+    }
+
+    fn throttled() -> ProviderError {
+        ProviderError::RateLimited {
+            retry_after: Some(Duration::from_millis(1)),
+            detail: "slow down".into(),
+        }
+    }
+
+    #[test]
+    fn a_temporary_provider_failure_is_retried() {
+        let (outcome, calls) = flaky(1, throttled());
+        assert!(matches!(outcome, Outcome::Completed { .. }), "{outcome:?}");
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn retries_are_bounded() {
+        let (outcome, calls) = flaky(10, throttled());
+        assert!(!matches!(outcome, Outcome::Completed { .. }), "{outcome:?}");
+        assert_eq!(calls, 1 + MAX_RETRIES as usize);
+    }
+
+    #[test]
+    fn a_refusal_is_never_retried() {
+        let (_, calls) = flaky(10, ProviderError::Policy("blocked".into()));
+        assert_eq!(calls, 1);
+    }
+
+    // --- catalogue tool names -> SE tool names ---
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn catalogue_tool_names_map_to_se_tools() {
+        assert_eq!(
+            se_tools_for(&names(&["read-files", "search", "write-files", "run-shell"])),
+            names(&["read", "search", "write", "edit", "shell"])
+        );
+        // SE's own names pass through (definitions may use either).
+        assert_eq!(se_tools_for(&names(&["read", "edit"])), names(&["read", "edit"]));
+        // run-tests never becomes shell.
+        assert!(se_tools_for(&names(&["read-files", "run-tests"])) == names(&["read"]));
+        // Declared, but nothing SE has: deny-all, not "unrestricted".
+        assert!(se_tools_for(&names(&["memory-read", "memory-write", "escalate"])).is_empty());
+        assert!(se_tools_for(&names(&["no-such-tool"])).is_empty());
+        // C2: deploying sub-agents.
+        assert_eq!(se_tools_for(&names(&["invoke-agent"])), names(&["agent"]));
+        assert_eq!(se_tools_for(&names(&["agent", "read"])), names(&["agent", "read"]));
+    }
+
+    /// The real catalogue's definition of `id`, or `None` (skipped) off
+    /// this machine.
+    fn real_allowlist(id: &str) -> Option<Vec<String>> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../se/agents");
+        if !root.exists() {
+            eprintln!("skipped: no real catalogue at {}", root.display());
+            return None;
+        }
+        let report = se_catalogue::load(&root).unwrap();
+        let agent = report
+            .agents
+            .into_iter()
+            .find(|a| a.frontmatter.id == id)
+            .unwrap_or_else(|| panic!("`{id}` is not in the real catalogue"));
+        assert!(!agent.frontmatter.tools.is_empty());
+        Some(se_tools_for(&agent.frontmatter.tools))
+    }
+
+    fn denied(allowed: &[String], tool: &str) -> bool {
+        Ruleset::from_rules(vec![se_permission::Rule::allow_all()]).evaluate_scoped(
+            "x",
+            tool,
+            "/x",
+            Some(allowed),
+        ) == se_permission::Effect::Deny
+    }
+
+    #[test]
+    fn the_real_chief_orchestrator_may_read_and_search_but_not_write_or_shell() {
+        let Some(allowed) = real_allowlist("chief-orchestrator") else {
+            return;
+        };
+        assert!(!denied(&allowed, "read") && !denied(&allowed, "search"), "{allowed:?}");
+        // It declares neither write-files nor run-shell.
+        for tool in ["write", "edit", "shell"] {
+            assert!(denied(&allowed, tool), "{tool}: {allowed:?}");
+        }
+        // It declares invoke-agent, so it is offered the `agent` tool.
+        assert!(allowed.iter().any(|t| t == "agent"), "{allowed:?}");
+    }
+
+    #[test]
+    fn the_real_backend_lead_may_read_write_edit_and_shell() {
+        let Some(allowed) = real_allowlist("backend-lead") else {
+            return;
+        };
+        for tool in ["read", "search", "write", "edit", "shell"] {
+            assert!(!denied(&allowed, tool), "{tool}: {allowed:?}");
+        }
+    }
+
+    // --- the conversation's specialist, saved for resume ---
+
+    fn temp_file(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "se-core-sticky-{name}-{}-{}",
+            std::process::id(),
+            unix_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("c.specialist")
+    }
+
+    fn unix_nanos() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    }
+
+    #[test]
+    fn a_chosen_specialist_is_saved_and_restored_and_clearing_saves_none() {
+        let path = temp_file("set-clear");
+        let (runner, _) = runner_with(Vec::new(), Duration::ZERO, None);
+        let runner = runner.with_specialist_file(path.clone());
+        assert_eq!(runner.sticky_specialist.get(), None);
+        runner.set_specialist(Some("backend-lead".into()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "backend-lead");
+        // Resume: a fresh runner on the same file comes back to it.
+        let (resumed, _) = runner_with(Vec::new(), Duration::ZERO, None);
+        let resumed = resumed.with_specialist_file(path.clone());
+        assert_eq!(resumed.sticky_specialist.get().as_deref(), Some("backend-lead"));
+        // `/agents none`: cleared, and saved as cleared.
+        resumed.set_specialist(None);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        let (again, _) = runner_with(Vec::new(), Duration::ZERO, None);
+        assert_eq!(again.with_specialist_file(path.clone()).sticky_specialist.get(), None);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_new_chat_starts_with_no_specialist() {
+        let old = temp_file("old-chat");
+        std::fs::write(&old, "backend-lead").unwrap();
+        // A new chat is a new conversation id, so a file not yet written.
+        let fresh = old.with_file_name("new.specialist");
+        let (runner, _) = runner_with(Vec::new(), Duration::ZERO, None);
+        assert_eq!(runner.with_specialist_file(fresh).sticky_specialist.get(), None);
+        let _ = std::fs::remove_dir_all(old.parent().unwrap());
+    }
 }
 
 #[cfg(test)]
 #[path = "team_run_tests.rs"]
 mod team_run_tests;
+
+#[path = "agent_tool.rs"]
+mod agent_tool;

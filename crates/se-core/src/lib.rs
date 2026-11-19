@@ -27,15 +27,22 @@ pub mod router;
 pub mod routing;
 pub mod runner;
 pub mod session_store;
+pub mod sessions;
 pub mod sink;
 pub mod team;
 pub mod tool_loop;
 pub mod tools;
 
-pub use engine::{start, start_isolated_pool, start_pool, CoreHandle, SubmitError};
+pub use engine::{
+    load_conversation, start, start_conversation, start_isolated_pool, start_pool, CoreHandle,
+    SubmitError,
+};
 pub use provider_runner::ProviderRunner;
 pub use runner::{ApprovalRunner, EchoRunner, Runner};
 pub use sink::{Disconnected, TurnSink};
+// The credential detector, for an interface that guards its composer: pure string
+// checks, so it carries none of the blocking-call concern that keeps providers out.
+pub use se_provider::credentials::looks_like_secret;
 
 // Re-exported so an interface needs one dependency, not two, for the
 // common types. The protocol crate stays separately usable for anything

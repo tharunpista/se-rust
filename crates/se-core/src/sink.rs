@@ -28,7 +28,7 @@ use std::time::Duration;
 const APPROVAL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 use se_protocol::{
-    CoreEvent, DeltaKind, Payload, SeqCounter, SessionId, Span, Stage, TaskId, ToolCallId, TurnId,
+    AgentEvent, AgentState, CoreEvent, DeltaKind, Payload, SeqCounter, SessionId, Span, Stage, TaskId, ToolCallId, TurnId,
     Usage,
 };
 
@@ -46,16 +46,34 @@ pub struct TurnSink {
     events: SyncSender<CoreEvent>,
     cancelled: Arc<AtomicBool>,
     /// Decisions arriving back from the supervisor, each naming the
-    /// call it answers (see `request_approval`).
-    approvals: Receiver<(ToolCallId, bool)>,
+    /// call it answers (see `request_approval`). Shared with this task's
+    /// sub-agents (`child`); holding the lock from prompt to answer is
+    /// what queues their approvals one at a time.
+    approvals: Arc<std::sync::Mutex<Receiver<(ToolCallId, bool)>>>,
+    /// Set on a sub-agent's sink: its id and role. Its events are then
+    /// wrapped as that agent's `Activity` (see [`TurnSink::child`]).
+    agent: Option<(String, String)>,
     /// Spans recorded so far, attached to the terminal event.
     pub(crate) timings: se_protocol::Timings,
     /// Set once a disconnect is seen so a runner that ignores the error
     /// cannot spin forever trying to send.
     disconnected: bool,
+    /// A compaction the runner asks the core to apply to the shared
+    /// transcript once the turn ends: replace its first `.0` messages
+    /// with `.1` (see [`TurnSink::compact_history`]).
+    pub(crate) compaction: Option<(usize, Vec<se_provider::Message>)>,
 }
 
 impl TurnSink {
+    /// Asks the core to replace the first `covers` messages of the
+    /// conversation with `with` (a summary), so later turns, a resumed
+    /// session and a switched provider all send the summary instead of
+    /// the full older history. Applied only if the transcript still
+    /// starts with what this turn saw.
+    pub fn compact_history(&mut self, covers: usize, with: Vec<se_provider::Message>) {
+        self.compaction = Some((covers, with));
+    }
+
     pub(crate) fn new(
         session: SessionId,
         task: TaskId,
@@ -71,10 +89,38 @@ impl TurnSink {
             seq,
             events,
             cancelled,
-            approvals,
+            approvals: Arc::new(std::sync::Mutex::new(approvals)),
+            agent: None,
             timings: se_protocol::Timings::default(),
             disconnected: false,
+            compaction: None,
         }
+    }
+
+    /// A sink for sub-agent `agent_id` (catalogue `role`) of this task:
+    /// same session, task, sequence and channels, its own cancel flag.
+    /// Its events reach the interface as `Payload::Agent(Activity)`,
+    /// except an approval prompt, which is sent as an ordinary prompt
+    /// naming the agent so the interface asks the human as usual.
+    pub(crate) fn child(&self, agent_id: &str, role: &str, cancelled: Arc<AtomicBool>) -> TurnSink {
+        TurnSink {
+            session: self.session,
+            task: self.task,
+            turn: None,
+            seq: self.seq.clone(),
+            events: self.events.clone(),
+            cancelled,
+            approvals: self.approvals.clone(),
+            agent: Some((agent_id.to_string(), role.to_string())),
+            timings: se_protocol::Timings::default(),
+            disconnected: false,
+            compaction: None,
+        }
+    }
+
+    /// `role#id` on a sub-agent's sink, for the audit trail.
+    pub(crate) fn agent_tag(&self) -> Option<String> {
+        self.agent.as_ref().map(|(id, role)| format!("{role}#{id}"))
     }
 
     pub fn session(&self) -> SessionId {
@@ -105,6 +151,40 @@ impl TurnSink {
     }
 
     pub(crate) fn emit(&mut self, payload: Payload) -> Result<(), Disconnected> {
+        let Some((id, role)) = self.agent.clone() else {
+            return self.send(payload);
+        };
+        let wrap = |payload| {
+            Payload::Agent(AgentEvent::Activity {
+                agent_id: id.clone(),
+                payload: Box::new(payload),
+            })
+        };
+        match payload {
+            // Never nested: lifecycle events go out as they are.
+            Payload::Agent(_) => self.send(payload),
+            Payload::ApprovalRequired {
+                call,
+                name,
+                summary,
+            } => {
+                let shown = format!("[{role} #{id}] wants to run {name}: {summary}");
+                self.send(wrap(Payload::ApprovalRequired {
+                    call,
+                    name: name.clone(),
+                    summary: summary.clone(),
+                }))?;
+                self.send(Payload::ApprovalRequired {
+                    call,
+                    name,
+                    summary: shown,
+                })
+            }
+            other => self.send(wrap(other)),
+        }
+    }
+
+    fn send(&mut self, payload: Payload) -> Result<(), Disconnected> {
         if self.disconnected {
             return Err(Disconnected);
         }
@@ -231,8 +311,33 @@ impl TurnSink {
     /// waiting, or if the interface disappeared: a withheld decision is
     /// never treated as permission.
     pub fn request_approval(&mut self, name: &str, summary: &str) -> Option<ToolCallId> {
-        let call = self.announce_approval(name, summary)?;
-        self.await_decision(call, name)
+        let id = self.agent.as_ref().map(|(id, _)| id.clone());
+        let state = |agent_id: &String, state| {
+            Payload::Agent(AgentEvent::State {
+                agent_id: agent_id.clone(),
+                state,
+            })
+        };
+        if let Some(id) = &id {
+            let _ = self.emit(state(id, AgentState::WaitingApproval));
+        }
+        // One prompt at a time per task: a second agent waits here.
+        let approvals = self.approvals.clone();
+        let queue = approvals.lock().unwrap_or_else(|e| e.into_inner());
+        // Cancelled while queued: never show a prompt nobody should answer.
+        let decided = if self.is_cancelled() {
+            None
+        } else {
+            self.announce_approval(name, summary)
+                .and_then(|call| self.wait(&queue, call, name))
+        };
+        drop(queue);
+        if let Some(id) = &id {
+            if !self.is_cancelled() {
+                let _ = self.emit(state(id, AgentState::Running));
+            }
+        }
+        decided
     }
 
     /// First half of [`request_approval`](Self::request_approval): mints
@@ -250,7 +355,19 @@ impl TurnSink {
     }
 
     /// Second half: waits for the decision naming `call`.
+    #[cfg(test)]
     pub(crate) fn await_decision(&mut self, call: ToolCallId, name: &str) -> Option<ToolCallId> {
+        let approvals = self.approvals.clone();
+        let queue = approvals.lock().unwrap_or_else(|e| e.into_inner());
+        self.wait(&queue, call, name)
+    }
+
+    fn wait(
+        &mut self,
+        approvals: &Receiver<(ToolCallId, bool)>,
+        call: ToolCallId,
+        name: &str,
+    ) -> Option<ToolCallId> {
         let waiting = se_protocol::Running::start(Stage::ApprovalWait);
         // A decision must name the call it answers. Anything else is
         // discarded and the wait continues.
@@ -262,7 +379,7 @@ impl TurnSink {
         // *next* request instantly -- so pressing `y` twice silently
         // approved a tool the user was never shown.
         let decision = loop {
-            match self.approvals.recv_timeout(APPROVAL_POLL_INTERVAL) {
+            match approvals.recv_timeout(APPROVAL_POLL_INTERVAL) {
                 Ok((answered, allow)) if answered == call => break allow,
                 // Not for this call: a stale or duplicated decision.
                 Ok(_) => continue,

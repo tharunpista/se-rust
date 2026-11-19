@@ -67,7 +67,7 @@ pub fn builtins() -> Vec<Builtin> {
             category: "Session",
             description: "List commands and keyboard shortcuts",
             handler: HandlerKind::UiAction,
-            security_critical: false,
+            security_critical: true,
             availability: Availability::Ready,
         },
         Builtin {
@@ -77,28 +77,59 @@ pub fn builtins() -> Vec<Builtin> {
             category: "Session",
             description: "Browse every registered command and where it came from",
             handler: HandlerKind::UiAction,
-            security_critical: false,
+            security_critical: true,
             availability: Availability::Ready,
         },
         Builtin {
             id: "new",
             path: "new",
-            aliases: &[],
+            aliases: &["clear"],
             category: "Session",
-            description: "Start a fresh session",
+            description: "Start a fresh conversation (/clear); the current one stays saved",
             handler: HandlerKind::CoreOp,
             security_critical: false,
-            availability: Availability::NotImplemented("sessions are not persisted yet (Phase 2a)"),
+            availability: Availability::Ready,
         },
         Builtin {
             id: "sessions",
             path: "sessions",
-            aliases: &[],
+            aliases: &["resume"],
             category: "Session",
-            description: "Browse and resume earlier sessions",
+            description: "Resume an earlier conversation (/resume): pick, rename, pin, order, delete",
             handler: HandlerKind::UiAction,
             security_critical: false,
-            availability: Availability::NotImplemented("sessions are not persisted yet (Phase 2a)"),
+            availability: Availability::Ready,
+        },
+        Builtin {
+            id: "copy",
+            path: "copy",
+            aliases: &[],
+            category: "Session",
+            description: "Copy the last answer to the clipboard (/copy N: the Nth from last)",
+            handler: HandlerKind::UiAction,
+            security_critical: false,
+            availability: Availability::Ready,
+        },
+        Builtin {
+            id: "mouse",
+            path: "mouse",
+            aliases: &[],
+            category: "Session",
+            description: "Toggle mouse capture (F2): on scrolls with the wheel, off lets you select text",
+            handler: HandlerKind::UiAction,
+            security_critical: false,
+            availability: Availability::Ready,
+        },
+        Builtin {
+            id: "mode",
+            path: "mode",
+            aliases: &[],
+            category: "Session",
+            description: "Work mode (Shift+Tab): manual asks before each change, auto runs without asking, plan only reads",
+            handler: HandlerKind::UiAction,
+            // Auto turns approvals off: a project command must not be able to stand in for it.
+            security_critical: true,
+            availability: Availability::Ready,
         },
         Builtin {
             id: "exit",
@@ -107,7 +138,8 @@ pub fn builtins() -> Vec<Builtin> {
             category: "Session",
             description: "Leave SE",
             handler: HandlerKind::UiAction,
-            security_critical: false,
+            // Protected with /help and /commands: a project must not be able to hide the way out.
+            security_critical: true,
             availability: Availability::Ready,
         },
         // ---- Models & providers -------------------------------------
@@ -172,7 +204,9 @@ pub fn builtins() -> Vec<Builtin> {
             description: "Browse available skills",
             handler: HandlerKind::UiAction,
             security_critical: false,
-            availability: Availability::NotImplemented("skill discovery lands in Phase 3"),
+            availability: Availability::NotImplemented(
+                "the skill loader exists, but SE does not run skills yet (Phase 5)",
+            ),
         },
         // ---- Team ----------------------------------------------------
         Builtin {
@@ -196,7 +230,9 @@ pub fn builtins() -> Vec<Builtin> {
             // The whole point of the gateway is that nothing can
             // intercept or redefine the permission surface.
             security_critical: true,
-            availability: Availability::NotImplemented("the permission gateway lands in Phase 2b"),
+            availability: Availability::NotImplemented(
+                "the gateway is built, but there is no rules file yet: in manual mode every tool call asks for approval (see /mode)",
+            ),
         },
         Builtin {
             id: "connectors",
@@ -305,7 +341,9 @@ mod tests {
     fn the_commands_that_must_not_be_shadowable_are_marked_security_critical() {
         // Pinned deliberately: if someone adds a credential, permission
         // or diagnostic surface later and forgets the flag, this fails.
-        let expected = ["connect", "permissions", "connectors", "doctor"];
+        let expected = [
+            "help", "commands", "mode", "exit", "connect", "permissions", "connectors", "doctor",
+        ];
         let actual: Vec<&str> = builtins()
             .iter()
             .filter(|b| b.security_critical)

@@ -16,6 +16,8 @@ pub enum Entry {
     /// makes streaming look like streaming.
     Assistant(String),
     Reasoning(String),
+    /// Who is answering: `agent · provider/model`, shown above a reply.
+    Speaker(String),
     Tool {
         name: String,
         summary: String,
@@ -71,6 +73,23 @@ pub enum CtrlC {
 /// How long a second Ctrl+C still counts as confirming the first.
 const CTRL_C_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// How long an approval prompt must have been on screen before `y`/`n`
+/// answer it, so a keystroke already in flight when it appeared cannot.
+pub const APPROVAL_ARM_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// The two fields `/connect` can turn the composer into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectStep {
+    /// Visible field for the provider's API address; the hidden key field follows.
+    Address { id: String, name: String },
+    /// Hidden field for the key, saved with the address given (if any).
+    Key {
+        id: String,
+        name: String,
+        url: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub transcript: Vec<Entry>,
@@ -111,6 +130,57 @@ pub struct AppState {
     pub last_total_rows: usize,
     pub last_viewport_rows: usize,
     pub usage: Usage,
+    /// Token totals across this session's finished tasks (`/usage`).
+    pub session_usage: Usage,
+    /// Whether the current task has reported usage yet, so a task that
+    /// reported none is not counted twice.
+    task_usage_seen: bool,
+    /// Models the providers reported, listed off the interface thread.
+    pub model_listing: crate::services::Listing,
+    /// `/models` was asked for while the listing was still running.
+    pub open_models_when_ready: bool,
+    /// `/providers` and `/doctor`, as the binary reports them.
+    pub providers_report: Option<crate::services::Report>,
+    pub doctor_report: Option<String>,
+    /// Saves the `/models` pick for the next launch.
+    pub remember_model: crate::services::Hook<crate::services::ModelMemory>,
+    pub list_providers: crate::services::Hook<crate::services::ProviderLister>,
+    pub save_key: crate::services::Hook<crate::services::KeySaver>,
+    pub copy: crate::services::Hook<crate::services::Clipboard>,
+    /// Whether the terminal reports the mouse to SE. Off by default so the
+    /// terminal's own drag-select works; on gives wheel scrolling (F2, /mouse).
+    pub mouse_capture: bool,
+    /// Manual, auto or plan; the core holds the copy that decides.
+    pub mode: se_protocol::WorkMode,
+    /// `/resume`, `/new`: see [`crate::services::Services`].
+    pub open_session: crate::services::Hook<crate::services::SessionOpener>,
+    pub session_id: Option<String>,
+    pub sessions_dir: Option<std::path::PathBuf>,
+    pub recent_projects: Option<std::path::PathBuf>,
+    /// The `/resume` picker, while open.
+    pub sessions: Option<crate::sessions::Overlay>,
+    /// Deletes made this run, newest last, for `u` in the picker.
+    pub trashed: Vec<(std::path::PathBuf, se_core::sessions::Trashed)>,
+    /// A conversation switch asked for (`Some(None)`: a new one); the loop
+    /// performs it with [`crate::switch_session`].
+    pub switch_to: Option<Option<String>>,
+    /// Results from background work (provider list, key validation).
+    pub inbox: crate::services::Inbox,
+    /// The provider list as last reported, for `/connect <id>`.
+    pub providers: Vec<crate::services::ProviderEntry>,
+    /// `/connect <id>` asked for before the provider list arrived.
+    pub connect_pending: Option<String>,
+    /// While set, the composer belongs to `/connect`, not the chat: its text is never
+    /// submitted to the model and never added to the transcript.
+    pub connect: Option<ConnectStep>,
+    /// The model SE started with; `model_override` wins over it.
+    pub default_model: Option<se_protocol::ModelRef>,
+    /// The specialist that answered last, for the header.
+    pub agent: Option<String>,
+    /// `provider/model` of the turn now running or last run.
+    pub turn_model: Option<String>,
+    /// The working folder, shortened for the header.
+    pub folder: String,
     /// Timings of the most recently finished task, shown in diagnostic
     /// mode (the Phase 1 gate requires stage timings to be visible).
     pub last_timings: Option<Timings>,
@@ -121,6 +191,10 @@ pub struct AppState {
     next_expected_seq: Option<u64>,
     /// When Ctrl+C was last pressed, for the two-press exit.
     last_ctrl_c: Option<std::time::Instant>,
+    /// When the pending approval prompt appeared, for [`APPROVAL_ARM_DELAY`].
+    pub approval_shown_at: Option<std::time::Instant>,
+    /// Deployed agents: the strip below the composer and its focus.
+    pub agents: crate::agents::Strip,
 }
 
 impl Default for AppState {
@@ -141,11 +215,40 @@ impl Default for AppState {
             last_total_rows: 0,
             last_viewport_rows: 0,
             usage: Usage::default(),
+            session_usage: Usage::default(),
+            task_usage_seen: false,
+            model_listing: crate::services::Listing::default(),
+            open_models_when_ready: false,
+            providers_report: None,
+            doctor_report: None,
+            remember_model: Default::default(),
+            list_providers: Default::default(),
+            save_key: Default::default(),
+            copy: Default::default(),
+            mouse_capture: false,
+            mode: Default::default(),
+            open_session: Default::default(),
+            session_id: None,
+            sessions_dir: None,
+            recent_projects: None,
+            sessions: None,
+            trashed: Vec::new(),
+            switch_to: None,
+            inbox: Default::default(),
+            providers: Vec::new(),
+            connect_pending: None,
+            connect: None,
+            default_model: None,
+            agent: None,
+            turn_model: None,
+            folder: String::new(),
             last_timings: None,
             show_diagnostics: false,
             dropped_events: 0,
             next_expected_seq: None,
             last_ctrl_c: None,
+            approval_shown_at: None,
+            agents: Default::default(),
         }
     }
 }
@@ -153,6 +256,39 @@ impl Default for AppState {
 impl AppState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether `y`/`n` may answer the pending approval at `now`: one is
+    /// pending, the composer holds no draft, and it has been visible for
+    /// at least [`APPROVAL_ARM_DELAY`].
+    pub fn approval_answerable(&self, now: std::time::Instant) -> bool {
+        self.awaiting_approval().is_some()
+            && self.composer.is_empty()
+            && self
+                .approval_shown_at
+                .is_some_and(|t| now.saturating_duration_since(t) >= APPROVAL_ARM_DELAY)
+    }
+
+    /// Forgets the open conversation's transcript and turn state, for a
+    /// switch to another core (whose event sequence starts over). Keeps the
+    /// model pick, mouse mode, commands and the composer draft.
+    pub fn reset_conversation(&mut self) {
+        self.transcript.clear();
+        self.activity = Activity::Idle;
+        self.status.clear();
+        self.scroll = 0;
+        self.usage = Usage::default();
+        self.session_usage = Usage::default();
+        self.task_usage_seen = false;
+        self.turn_model = None;
+        self.agent = None;
+        self.last_timings = None;
+        self.dropped_events = 0;
+        self.next_expected_seq = None;
+        self.approval_shown_at = None;
+        self.picker.close();
+        // The agents outlive the conversation (a team run keeps going); a view does not.
+        self.agents.focus = crate::agents::Focus::Composer;
     }
 
     pub fn is_busy(&self) -> bool {
@@ -171,6 +307,20 @@ impl AppState {
             Activity::Working { task } | Activity::AwaitingApproval { task, .. } => Some(task),
             Activity::Idle => None,
         }
+    }
+
+    /// The stored text of the `n`th-from-last answer (1 = the last), as the
+    /// model sent it: no wrapping, borders or colour.
+    pub fn nth_last_answer(&self, n: usize) -> Option<&str> {
+        let i = n.checked_sub(1)?;
+        self.transcript
+            .iter()
+            .rev()
+            .filter_map(|e| match e {
+                Entry::Assistant(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .nth(i)
     }
 
     pub fn push(&mut self, entry: Entry) {
@@ -234,6 +384,10 @@ impl AppState {
         };
         let is_specialist =
             |c: &&se_command::CommandSpec| c.handler == se_command::HandlerKind::SpecialistInvoke;
+        let is_model =
+            |c: &&se_command::CommandSpec| c.handler == se_command::HandlerKind::ModelSelect;
+        let is_provider =
+            |c: &&se_command::CommandSpec| c.handler == se_command::HandlerKind::ProviderConnect;
         match self.picker.scope() {
             // `/agents` is the one gateway into the specialist
             // catalogue (mirrors upstream OpenCode's single
@@ -246,13 +400,25 @@ impl AppState {
                 .commands
                 .query(query)
                 .into_iter()
-                .filter(|c| !is_specialist(c))
+                .filter(|c| !is_specialist(c) && !is_model(c) && !is_provider(c))
                 .collect(),
             crate::picker::PickerScope::Agents => self
                 .commands
                 .query(query)
                 .into_iter()
                 .filter(is_specialist)
+                .collect(),
+            crate::picker::PickerScope::Models => self
+                .commands
+                .query(query)
+                .into_iter()
+                .filter(is_model)
+                .collect(),
+            crate::picker::PickerScope::Providers => self
+                .commands
+                .query(query)
+                .into_iter()
+                .filter(is_provider)
                 .collect(),
         }
     }
@@ -309,6 +475,7 @@ impl AppState {
 
         match &event.payload {
             Payload::TaskStarted { request } => {
+                self.task_usage_seen = false;
                 self.push(Entry::User(request.clone()));
                 self.activity = Activity::Working { task: event.task };
                 // A new exchange the user just started is the one thing
@@ -318,6 +485,7 @@ impl AppState {
             }
             Payload::TurnStarted { provider, model } => {
                 self.status = format!("{provider} · {model}");
+                self.turn_model = Some(format!("{provider}/{model}"));
                 // A pre-turn approval (a specialist's `use_provider`) has
                 // no tool lifecycle after it; the turn starting is the
                 // proof it was answered.
@@ -335,14 +503,14 @@ impl AppState {
                 // (department + mission), not a new protocol field --
                 // this is a synchronous, local lookup, never a second
                 // round trip to the core.
-                let notice = match self.commands.resolve(agent_id) {
-                    Ok(spec) => format!(
-                        "routed through {agent_id} ({}) — mission: {}",
-                        spec.category, spec.description
-                    ),
-                    Err(_) => format!("routed through specialist: {agent_id}"),
+                // One short line per answer naming the agent and model;
+                // the agent's mission is in `/agents`, not on every turn.
+                self.agent = Some(agent_id.clone());
+                let who = match &self.turn_model {
+                    Some(m) => format!("{agent_id} \u{b7} {m}"),
+                    None => agent_id.clone(),
                 };
-                self.push(Entry::Notice(notice));
+                self.push(Entry::Speaker(who));
             }
             Payload::Delta { kind, text } => match kind {
                 DeltaKind::Text => self.append_assistant(text),
@@ -369,6 +537,15 @@ impl AppState {
                     task: event.task,
                     call: *call,
                 };
+                self.approval_shown_at = Some(std::time::Instant::now());
+                // The prompt must be on screen: nothing may cover it or
+                // leave it scrolled out of view.
+                self.picker.close();
+                // Else a `y` meant for a delete confirm could allow the tool.
+                self.sessions = None;
+                // An agent view would cover the prompt.
+                self.agents.focus = crate::agents::Focus::Composer;
+                self.scroll = 0;
             }
             Payload::ToolCompleted {
                 name, ok, preview, ..
@@ -396,9 +573,46 @@ impl AppState {
             }
             Payload::UsageUpdated(usage) => {
                 self.usage = *usage;
+                self.task_usage_seen = true;
             }
             Payload::TurnCompleted { .. } => {}
+            // C2's child agents arrive here; team runs feed the same fold.
+            Payload::Agent(e) => {
+                // A sub-agent's prompt is shown as a main prompt; its own
+                // (wrapped) next step for that call is the answer to it.
+                if let se_protocol::AgentEvent::Activity { payload, .. } = e {
+                    let answered = match payload.as_ref() {
+                        Payload::ToolRequested { call, .. } | Payload::ToolCompleted { call, .. } => {
+                            Some((*call, true))
+                        }
+                        Payload::ToolDenied { call, .. } => Some((*call, false)),
+                        _ => None,
+                    };
+                    if let (Some((call, allow)), Activity::AwaitingApproval { task, call: waiting }) =
+                        (answered, self.activity)
+                    {
+                        if call == waiting {
+                            self.mark_approval_decided(allow);
+                            self.activity = Activity::Working { task };
+                        }
+                    }
+                }
+                self.agents.apply(e)
+            }
             Payload::TaskFinished { outcome, timings } => {
+                if std::mem::take(&mut self.task_usage_seen) {
+                    let add = |a: Option<u64>, b: Option<u64>| match (a, b) {
+                        (None, None) => None,
+                        _ => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+                    };
+                    let (s, u) = (self.session_usage, self.usage);
+                    self.session_usage = Usage {
+                        input_tokens: add(s.input_tokens, u.input_tokens),
+                        output_tokens: add(s.output_tokens, u.output_tokens),
+                        cached_input_tokens: add(s.cached_input_tokens, u.cached_input_tokens),
+                        source: u.source,
+                    };
+                }
                 self.activity = Activity::Idle;
                 self.last_timings = Some(timings.clone());
                 match outcome {
@@ -445,6 +659,10 @@ impl AppState {
                         self.status = "exhausted".to_string();
                     }
                     Outcome::Failed { detail } => {
+                        // The provider marked a model unusable; the next /models must not offer it.
+                        if detail.contains("is now hidden from /models") {
+                            self.model_listing.reset();
+                        }
                         self.push(Entry::Error(detail.clone()));
                         self.status = "failed".to_string();
                     }
@@ -473,40 +691,11 @@ impl AppState {
     }
 
     fn settle_tool(&mut self, name: &str, new_state: ToolState, preview: &str) {
-        for entry in self.transcript.iter_mut().rev() {
-            if let Entry::Tool {
-                name: existing,
-                state,
-                summary,
-            } = entry
-            {
-                if existing == name && *state == ToolState::Running {
-                    *state = new_state;
-                    if !preview.is_empty() {
-                        *summary = preview.to_string();
-                    }
-                    return;
-                }
-            }
-        }
-        // No matching request: record it anyway rather than dropping the
-        // fact that a tool ran (I7).
-        self.push(Entry::Tool {
-            name: name.to_string(),
-            summary: preview.to_string(),
-            state: new_state,
-        });
+        settle_tool(&mut self.transcript, name, new_state, preview);
     }
 
     fn mark_approval_decided(&mut self, allow: bool) {
-        for entry in self.transcript.iter_mut().rev() {
-            if let Entry::Approval { decision, .. } = entry {
-                if decision.is_none() {
-                    *decision = Some(allow);
-                    return;
-                }
-            }
-        }
+        mark_approval_decided(&mut self.transcript, allow);
     }
 
     /// The assistant text accumulated so far, for tests and for copying.
@@ -520,8 +709,56 @@ impl AppState {
             .collect::<Vec<_>>()
             .join("\n")
     }
+}
 
+/// Settles the newest running `name` tool entry; shared with agent transcripts.
+pub(crate) fn settle_tool(transcript: &mut Vec<Entry>, name: &str, new_state: ToolState, preview: &str) {
+    for entry in transcript.iter_mut().rev() {
+        if let Entry::Tool {
+            name: existing,
+            state,
+            summary,
+        } = entry
+        {
+            if existing == name && *state == ToolState::Running {
+                *state = new_state;
+                if !preview.is_empty() {
+                    *summary = preview.to_string();
+                }
+                return;
+            }
+        }
+    }
+    // No matching request: record it anyway rather than dropping the
+    // fact that a tool ran (I7).
+    transcript.push(Entry::Tool {
+        name: name.to_string(),
+        summary: preview.to_string(),
+        state: new_state,
+    });
+}
+
+pub(crate) fn mark_approval_decided(transcript: &mut [Entry], allow: bool) {
+    for entry in transcript.iter_mut().rev() {
+        if let Entry::Approval { decision, .. } = entry {
+            if decision.is_none() {
+                *decision = Some(allow);
+                return;
+            }
+        }
+    }
+}
+
+impl AppState {
     /// One line describing usage, honest about where it came from.
+    /// The model the next turn will use, as `provider/model`.
+    pub fn current_model(&self) -> Option<String> {
+        self.model_override
+            .as_ref()
+            .or(self.default_model.as_ref())
+            .map(|m| format!("{}/{}", m.provider, m.model))
+    }
+
     pub fn usage_line(&self) -> String {
         let render = |v: Option<u64>| match v {
             Some(n) => n.to_string(),
@@ -761,6 +998,94 @@ mod tests {
             )
         });
         assert!(decided, "the decision must be visible in the transcript");
+    }
+
+    /// C2: a sub-agent's prompt is a main prompt; the agent's own wrapped
+    /// next step for that call (run or denied) settles it.
+    #[test]
+    fn a_sub_agents_answered_prompt_clears_on_its_wrapped_next_step() {
+        use se_protocol::AgentEvent;
+        let wrap = |payload| {
+            Payload::Agent(AgentEvent::Activity {
+                agent_id: "a1".into(),
+                payload: Box::new(payload),
+            })
+        };
+        for (allow, next) in [
+            (
+                true,
+                Payload::ToolRequested {
+                    call: ToolCallId::from_raw(7),
+                    name: "read".into(),
+                    summary: "note.txt".into(),
+                },
+            ),
+            (
+                false,
+                Payload::ToolDenied {
+                    call: ToolCallId::from_raw(7),
+                    name: "read".into(),
+                },
+            ),
+        ] {
+            let mut app = AppState::new();
+            app.apply(&ev(0, Payload::TaskStarted { request: "x".into() }));
+            app.apply(&ev(
+                1,
+                Payload::Agent(AgentEvent::Spawned {
+                    agent_id: "a1".into(),
+                    role: "reader".into(),
+                    parent: Some("main".into()),
+                    task: "t".into(),
+                }),
+            ));
+            app.apply(&ev(
+                2,
+                Payload::ApprovalRequired {
+                    call: ToolCallId::from_raw(7),
+                    name: "read".into(),
+                    summary: "[reader #a1] wants to run read: note.txt".into(),
+                },
+            ));
+            // Another call's step leaves the prompt up.
+            app.apply(&ev(
+                3,
+                wrap(Payload::ToolCompleted {
+                    call: ToolCallId::from_raw(8),
+                    name: "read".into(),
+                    ok: true,
+                    preview: String::new(),
+                }),
+            ));
+            assert_eq!(app.awaiting_approval(), Some(ToolCallId::from_raw(7)));
+            app.apply(&ev(4, wrap(next)));
+            assert_eq!(app.awaiting_approval(), None, "allow={allow}");
+            assert!(app.is_busy());
+            assert!(app.transcript.iter().any(|e| matches!(
+                e,
+                Entry::Approval { decision: Some(d), .. } if *d == allow
+            )));
+        }
+    }
+
+    #[test]
+    fn an_arriving_approval_closes_the_picker_and_snaps_to_the_bottom() {
+        let mut app = AppState::new();
+        app.apply(&ev(0, Payload::TaskStarted { request: "x".into() }));
+        app.composer.set("/".to_string());
+        app.picker.open(0);
+        app.scroll = 7;
+        app.apply(&ev(
+            1,
+            Payload::ApprovalRequired {
+                call: ToolCallId::from_raw(1),
+                name: "run_shell".into(),
+                summary: "ls".into(),
+            },
+        ));
+        assert!(!app.picker.is_open());
+        assert_eq!(app.scroll, 0);
+        assert!(app.approval_shown_at.is_some());
     }
 
     #[test]

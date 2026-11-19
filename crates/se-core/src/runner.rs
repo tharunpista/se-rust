@@ -45,6 +45,13 @@ pub trait Runner: Send + Sync + 'static {
     /// can enforce file claims and the token budget. Runners with no
     /// files or model calls to govern ignore it.
     fn attach_team(&mut self, _team: crate::team::TeamContext) {}
+
+    /// Sets (or, with `None`, clears) the specialist later unnamed turns
+    /// stay with. Runners with no such notion ignore it.
+    fn set_specialist(&self, _id: Option<String>) {}
+
+    /// Sets the work mode. Runners that run no tools ignore it.
+    fn set_mode(&self, _mode: se_protocol::WorkMode) {}
 }
 
 /// A runner with no dependencies, used to exercise the pipeline.

@@ -134,7 +134,7 @@ SE stays a standalone CLI agent. Its differentiator: **several vendors' models w
 
 ## Where the project is (updated 2026-11-17)
 
-Phases 0–3 are done. **Phase 4 is built and mock-verified; its live and manual rows are still open** (see the status below). Phases 5 and 6 remain, so there are **two phases to the Phase 6 gate**.
+Phases 0–3 are done. **Phase 4 is built and passed its live multi-vendor gate on 2026-11-17; only the manual Windows Terminal run is open** (see the status below). Phases 5 and 6 remain, so there are **two phases to the Phase 6 gate**.
 
 ### Phase 4 status, item by item (2026-11-17)
 
@@ -173,5 +173,38 @@ Carry-over debt closed on 2026-11-16:
 - **Row 4.9**: see Phase 4 item 1.
 - **Row 3.9, execution profile**: a specialist's `max_calls` caps tool calls per turn, and `context_budget_tokens` trims the oldest whole prior exchanges (`fit_history`). Tokens are estimated as chars/4, and only prior history is trimmed (`shortcut:` comment).
 - Phase 0's text still says "Gate awaiting user review", although Phases 1–3 were built on it.
+
+### Round of 2026-11-17 (live verification, forced specialists, conversation memory)
+
+- **First live runs** on NVIDIA NIM: a 5-node team (solution-architect, 2-model ensemble, evaluator, qa-lead) completed, 11.7k tokens, about 6 minutes. Only `mistralai/mistral-large-4-1t-a52b` and `minimaxai/minimax-m3.1-flash` answer for this account; listed models can still return 404/410.
+- **Fixed:** `se exec` and `se team run` printed only "failed" and dropped the reason; both now print it. `se team run` no longer needs `--provider` when the file names its models. `se exec` sends reasoning to stderr so stdout is only the answer. `se doctor` rewritten to match the build. Session IDs restart from `s1` in every process, so every run appended to one `s1.jsonl`; event logs are now one file per process.
+- **Forced specialists:** with auto-routing on, every turn runs as a catalogue agent: named, else routed, else `chief-orchestrator` (`FALLBACK_AGENT_ID`, the catalogue's own `activation: always` role). An unreadable catalogue fails the turn instead of running it with no role. Unnamed ensemble members use the free deterministic keyword match, so their packets stay identical (row 4.3).
+- **Conversation memory:** `.se/sessions/<id>.conversation.json` is saved after each completed turn (temp file + rename). `se --resume` / `se --resume=<id>` continues it on any provider or model. Past `SE_COMPACT_TOKENS` (default 12000, chars/4) the turn's own model summarizes the older part once (last 2 exchanges kept). The summary replaces those messages in the saved file, so later turns, resumes and model switches send summary + recent turns and never summarize the same text twice. Summary usage is part of the turn's usage. Live-verified: a conversation started on Mistral resumed on MiniMax with the right answer, and a live compaction replaced 4 messages with a summary. Tested by `a_long_conversation_is_compacted_once_and_resumes_from_the_summary`.
+- **Not built:** the TUI does not redraw a resumed conversation's earlier turns (the model still receives them). No graph/vector memory store: nothing needs retrieval yet, and the summary already bounds what is sent. No provider prompt caching (Anthropic `cache_control`).
+- **Open product issue:** routing sees only the current turn, so follow-up questions get odd specialists (`ux-lead`, `cryptography-key-management-engineer` for "what's the codename?"), and it costs 2 small model calls per turn.
+
+### Round of 2026-11-17, part 2 (subscriptions, routing, retries, caching)
+
+- **Agent CLIs as backends** (`se-provider/src/external.rs`): `claude-code` (the user's Claude subscription), `codex` (ChatGPT plan), `opencode`, `kilo`, `cline`. Each runs as a text-only model through its own login; SE never reads its tokens. Claude Code runs with `--tools ""` and no MCP or settings; Codex has no tools-off switch, so it runs read-only in an empty scratch folder; OpenCode/Kilo run their `plan` agent there; Cline runs in plan mode with auto-approve off. Prompts go on stdin (Cline: argument, capped) and the CLI is started directly, never through `cmd.exe`. Live-verified: claude-code, codex, opencode, kilo. Cline: its login had expired, so it is untested. Measured per-call overhead: Codex ~33k and OpenCode ~40k input tokens of their own prompts; Claude Code ~2k. Agent CLIs are routed by keyword only (`is_agent_cli`), never with extra model calls.
+- **Phase 4 live gate: passed.** `se team run` with api-architect (claude-code), data-modeling-engineer (NVIDIA), a 3-vendor ensemble (claude-code, codex, NVIDIA) with the evaluator, and a qa-lead review: concurrent branches, every position shown with quotes (two flagged `[UNVERIFIED]`), 53k tokens, 3m22s, journaled.
+- **Routing:** a conversation keeps its specialist (`sticky_specialist`); follow-ups make no routing calls; `/<id>` switches it; the fallback never sticks. Team nodes still route per node.
+- **Retries:** a retriable error (429, 5xx, transport, timeout) before anything streamed is retried at most twice (1s, 3s, or the provider's `retry_after` capped at 30s); refusals and auth errors never are.
+- **Prompt caching:** native Anthropic marks the system prompt and the newest block `cache_control: ephemeral`.
+- **TUI:** a resumed conversation's saved turns are redrawn.
+- **Still open:** the manual Windows Terminal run; Cline once re-authenticated; the budget overshoot, per-model hand-off sizing and the `credentials::load` items above.
+
+### First manual TUI run (2026-11-17): bugs found and fixed
+
+- **Echo instead of a model:** with several providers configured and none named, `se` started the local echo, and `/models` could not help (the core was an `EchoRunner`). Now it starts `ProviderRunner::unselected()`: a turn with no model fails with "pick one with /models" and calls nothing; the echo is only for a machine with no provider. The `/models` pick is saved to `~/.se/last-model` and used on the next launch when no flags are given (flags win).
+- **A user's own `/models` pick asked permission every turn** (every interactive turn is a specialist turn). It now passes the gateway as the user's consent: never asked, still audited, and a ruleset deny still wins.
+- **Multi-line notices collapsed into one paragraph** (`/connect`, `/help`, `/providers`, `/doctor`); the banner was cut off at the screen edge (now wraps, up to 3 rows); the composer advertised Shift+Enter while the help bar said Alt+Enter (both now use the key probe).
+- **"/x is available but its panel is not built"** for `/providers`, `/usage`, `/connect`, `/doctor`; `/models` had no list. All answer now; `/models` lists every configured provider's models in parallel off the interface thread and opens a picker. A test runs every ready builtin and fails on the old fallback text.
+
+### Second manual pass (2026-11-17): keys, logins, and the screen
+
+- **API keys inside SE:** `/connect` lists every provider with its real state; choosing an API provider turns the composer into a hidden key field (dots only, `/` never opens the picker, Esc wipes it). Enter hands the key to `store_and_validate` on a background thread (OS secure storage, endpoint-pinned, then checked against the provider); it never reaches the transcript, the session log or a model. Tests assert all of that. `se connect <id>` now asks with a hidden prompt (raw mode; piped stdin also works) instead of requiring `--from-env`, and says when an environment variable will shadow the saved key.
+- **Real login state:** `ModelProvider::login_status` runs each CLI's own status command (`claude auth status`, `codex login status`, `opencode/kilo auth list`) off the interface thread; only whether and how the user is logged in is kept, never an email or org. A logged-in CLI is never told to log in.
+- **Codex models:** read from Codex's own `models_cache.json` (visible models, its configured default first) instead of only `default`.
+- **Screen:** header shows model, agent and folder; one `● agent · model` line per answer instead of the agent's mission each turn; Markdown rendered (fences, headings, bold, inline code, bullets); picker shows "n of N", aligned columns; `/help` lists keys and marks unbuilt commands; no token text before anything ran; banner is for warnings only.
 
 **Next: Phase 5** (provider breadth, MCP client, pricing), after the Phase 4 manual Windows Terminal run and one live multi-vendor run.

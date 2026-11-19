@@ -145,6 +145,9 @@ fn runner(ws: &Path, vendors: &[(&str, Option<(u64, u64)>)]) -> (ProviderRunner,
         workspace_root: ws.to_path_buf(),
         audit: Arc::new(NullAuditSink),
         auto_route: false,
+        compact_at_tokens: None,
+        sticky_specialist: Default::default(),
+        mode: Default::default(),
         team: None,
     };
     (runner, seen)
@@ -549,7 +552,10 @@ fn a_task_stopped_by_the_budget_before_any_tool_runs_is_retried_after_a_raise() 
     // router falls back to keywords) costs 110 of a 100-token budget.
     let (r, seen) = runner(&ws, &[("p1", Some((90, 20)))]);
     let r = r
-        .with_catalogue_root(catalogue(&ws, &["developer"]))
+        .with_catalogue_root(catalogue(
+            &ws,
+            &["developer", crate::provider_runner::FALLBACK_AGENT_ID],
+        ))
         .with_auto_route(true);
     let graph = TaskGraph::new(vec![node("x", "Build it.", &[])]).unwrap();
     let limits = Limits {

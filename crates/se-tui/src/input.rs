@@ -5,7 +5,7 @@
 //! now" in one readable place and lets the keymap be tested exhaustively
 //! without a terminal.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 
 use crate::state::{Activity, AppState};
 
@@ -40,6 +40,10 @@ pub enum Action {
     ScrollToLatest,
     ScrollToOldest,
     ToggleDiagnostics,
+    /// F2: mouse capture on (wheel scrolls) or off (terminal selects text).
+    ToggleMouse,
+    /// Shift+Tab: manual -> auto -> plan -> manual.
+    CycleMode,
     // Command picker. While the picker is open it owns the navigation
     // keys, so these are distinct from the transcript's scroll actions
     // rather than overloading them.
@@ -52,15 +56,92 @@ pub enum Action {
     PickerComplete,
     /// Close the picker, leaving the draft exactly as it was.
     PickerCancel,
+    /// A key for the open `/resume` picker (see [`crate::sessions::key`]).
+    SessionKey(KeyEvent),
+    /// A key for the agent strip or an agent's view (see [`crate::agents::key`]).
+    AgentKey(KeyEvent),
+    /// A left click on this screen row of the agent strip (mouse capture on).
+    AgentClick(u16),
 }
 
-/// Maps a keypress to intent. Pure: no I/O, no mutation.
+/// How long the event loop waits for a follow-on event when gathering a
+/// batch. Windows consoles often deliver a paste as plain key events
+/// (no bracketed paste); they arrive back to back, well inside this,
+/// while human keystrokes are tens of milliseconds apart.
+pub const PASTE_GAP: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// The text a key press contributes if it is part of a paste burst:
+/// plain/shifted characters (AltGr arrives as Ctrl+Alt), Enter and Tab.
+fn pasted_text(key: &KeyEvent) -> Option<char> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    let m = key.modifiers - KeyModifiers::SHIFT;
+    match key.code {
+        KeyCode::Char(c) if m.is_empty() || m == KeyModifiers::CONTROL | KeyModifiers::ALT => Some(c),
+        KeyCode::Enter if key.modifiers.is_empty() => Some('\n'),
+        KeyCode::Tab if key.modifiers.is_empty() => Some('\t'),
+        _ => None,
+    }
+}
+
+/// Folds each run of two or more back-to-back text key presses in one
+/// gathered batch into a single [`Event::Paste`], so an un-bracketed paste
+/// behaves like a bracketed one: its Enters become newlines, it cannot
+/// answer an approval, and a leading `/` does not open the picker or run a
+/// command. Release events inside a run are dropped; a lone press (with
+/// its release) passes through untouched, so ordinary typing is unchanged.
+pub fn coalesce_paste(events: Vec<Event>) -> Vec<Event> {
+    let mut out = Vec::with_capacity(events.len());
+    let mut run: Vec<Event> = Vec::new();
+    let mut text = String::new();
+    let mut presses = 0;
+    let flush = |out: &mut Vec<Event>, run: &mut Vec<Event>, text: &mut String, presses: &mut usize| {
+        if *presses >= 2 {
+            out.push(Event::Paste(std::mem::take(text)));
+            run.clear();
+        } else {
+            out.append(run);
+            text.clear();
+        }
+        *presses = 0;
+    };
+    for ev in events {
+        match &ev {
+            Event::Key(k) if pasted_text(k).is_some() => {
+                text.push(pasted_text(k).expect("checked"));
+                presses += 1;
+                run.push(ev);
+            }
+            Event::Key(k) if k.kind == KeyEventKind::Release && presses > 0 => run.push(ev),
+            _ => {
+                flush(&mut out, &mut run, &mut text, &mut presses);
+                out.push(ev);
+            }
+        }
+    }
+    flush(&mut out, &mut run, &mut text, &mut presses);
+    out
+}
+
+/// Maps a keypress to intent at the current time. See [`action_for_key_at`].
+pub fn action_for_key(state: &AppState, key: KeyEvent) -> Action {
+    action_for_key_at(state, key, std::time::Instant::now())
+}
+
+/// Maps a keypress to intent. Pure: no I/O, no mutation; `now` is
+/// passed in so the approval timing can be tested.
 ///
 /// Precedence, deliberately narrow:
-/// 1. a pending approval owns `y`/`n` and nothing else types into it;
+/// 1. a pending approval with an empty composer owns the keyboard:
+///    `y`/`n` answer it once it has been shown for
+///    [`crate::state::APPROVAL_ARM_DELAY`], and are ignored before that;
+///    other typing is ignored. A draft typed before the prompt arrived
+///    stays editable (Enter does not send it) and `y`/`n` only answer
+///    once it is cleared, so a word in progress cannot answer;
 /// 2. window-level keys (quit, interrupt, Ctrl+C, diagnostics, scroll);
 /// 3. otherwise the composer has the keyboard.
-pub fn action_for_key(state: &AppState, key: KeyEvent) -> Action {
+pub fn action_for_key_at(state: &AppState, key: KeyEvent, now: std::time::Instant) -> Action {
     // Windows reports press and release; acting on both doubles every
     // keystroke. Only presses (and repeats) are intent.
     if key.kind == KeyEventKind::Release {
@@ -73,13 +154,23 @@ pub fn action_for_key(state: &AppState, key: KeyEvent) -> Action {
     // A decision is pending: only the answer and an interrupt mean
     // anything. Typing is ignored, because the user is being asked a
     // question, not composing.
-    if state.awaiting_approval().is_some() {
+    let awaiting = state.awaiting_approval().is_some();
+    if awaiting && state.composer.is_empty() {
+        let armed = state.approval_answerable(now);
         return match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => Action::Decide(true),
-            KeyCode::Char('n') | KeyCode::Char('N') => Action::Decide(false),
+            KeyCode::Char('y') | KeyCode::Char('Y') if armed => Action::Decide(true),
+            KeyCode::Char('n') | KeyCode::Char('N') if armed => Action::Decide(false),
             KeyCode::Esc => Action::Interrupt,
             KeyCode::Char('c') if ctrl => Action::CtrlC,
             _ => Action::Nothing,
+        };
+    }
+
+    // The `/resume` picker owns every key but Ctrl+C while it is open.
+    if state.sessions.is_some() {
+        return match key.code {
+            KeyCode::Char('c') if ctrl => Action::CtrlC,
+            _ => Action::SessionKey(key),
         };
     }
 
@@ -102,10 +193,18 @@ pub fn action_for_key(state: &AppState, key: KeyEvent) -> Action {
         }
     }
 
+    // The agent strip / view owns the navigation keys while focused, and
+    // ↓ from an empty composer enters it.
+    if crate::agents::wants(state, &key) {
+        return Action::AgentKey(key);
+    }
+
     match key.code {
         KeyCode::Char('c') if ctrl => Action::CtrlC,
         KeyCode::Char('q') if ctrl => Action::Quit,
         KeyCode::Char('d') if ctrl => Action::ToggleDiagnostics,
+        KeyCode::F(2) => Action::ToggleMouse,
+        KeyCode::BackTab => Action::CycleMode,
         KeyCode::Char('u') if ctrl => Action::ClearComposer,
         // readline-style line motion, a consistent documented policy in
         // place of a selection model.
@@ -114,6 +213,8 @@ pub fn action_for_key(state: &AppState, key: KeyEvent) -> Action {
 
         // Esc interrupts a running task and never quits the application
         // (the directive is explicit). When idle it does nothing.
+        // Esc also abandons a hidden key entry, wiping what was typed.
+        KeyCode::Esc if state.connect.is_some() => Action::ClearComposer,
         KeyCode::Esc => match state.activity {
             Activity::Idle => Action::Nothing,
             _ => Action::Interrupt,
@@ -123,6 +224,8 @@ pub fn action_for_key(state: &AppState, key: KeyEvent) -> Action {
         // because Windows Terminal does not reliably deliver the SHIFT
         // modifier with Enter unless the user has bound it -- Alt+Enter
         // is the dependable alternative.
+        // A draft kept while an approval waits is not sent from under it.
+        KeyCode::Enter if awaiting => Action::Nothing,
         KeyCode::Enter if shift || alt => Action::InsertNewline,
         KeyCode::Enter => {
             let text = state.composer.text().trim();
@@ -154,12 +257,17 @@ pub fn action_for_key(state: &AppState, key: KeyEvent) -> Action {
     }
 }
 
-/// Maps a mouse event to intent. Scrolling only: a click target needs a
-/// layout to resolve against, which this crate does not hold.
-pub fn action_for_mouse(_state: &AppState, mouse: MouseEvent) -> Action {
+/// Maps a mouse event to intent: wheel scrolling, and a left click on an
+/// agent strip row (rows recorded by the last frame).
+pub fn action_for_mouse(state: &AppState, mouse: MouseEvent) -> Action {
     match mouse.kind {
         MouseEventKind::ScrollUp => Action::ScrollUp(3),
         MouseEventKind::ScrollDown => Action::ScrollDown(3),
+        MouseEventKind::Down(crossterm::event::MouseButton::Left)
+            if state.agents.hit.iter().any(|(y, _)| *y == mouse.row) =>
+        {
+            Action::AgentClick(mouse.row)
+        }
         _ => Action::Nothing,
     }
 }
@@ -171,12 +279,23 @@ pub fn action_for_mouse(_state: &AppState, mouse: MouseEvent) -> Action {
 /// crate must not hold a core handle and reach through it, which is how
 /// the previous implementation ran a model call from a key handler.
 pub fn apply_local(state: &mut AppState, action: &Action) {
+    // Typing goes back to the composer from the strip or a view.
+    if matches!(
+        action,
+        Action::InsertChar(_) | Action::InsertNewline | Action::Backspace | Action::Delete
+    ) && state.agents.focus != crate::agents::Focus::Composer
+    {
+        crate::agents::set_focus(state, crate::agents::Focus::Composer);
+    }
     match action {
         Action::InsertChar(c) => {
             // The picker opens on the slash itself, before any further
             // keystroke, which is charter §3.1's "appear on the first
             // slash without requiring Enter".
+            // Never while /connect owns the composer: a key or URL contains `/`.
             let opens = *c == '/'
+                && state.connect.is_none()
+                && state.awaiting_approval().is_none()
                 && !state.picker.is_open()
                 && crate::picker::Picker::should_open(
                     state.composer.text(),
@@ -239,9 +358,15 @@ pub fn apply_local(state: &mut AppState, action: &Action) {
             state.clamp_scroll();
         }
         Action::ToggleDiagnostics => state.show_diagnostics = !state.show_diagnostics,
+        // The run loop sees the flag change and tells the terminal.
+        Action::ToggleMouse => state.mouse_capture = !state.mouse_capture,
+        Action::SessionKey(key) => crate::sessions::key(state, *key),
+        Action::AgentKey(key) => crate::agents::key(state, *key),
+        Action::AgentClick(y) => crate::agents::click(state, *y),
         // Core-bound or state/timing-resolved elsewhere.
         Action::Nothing
         | Action::Interrupt
+        | Action::CycleMode
         | Action::Decide(_)
         | Action::CtrlC
         | Action::PickerAccept => {}
@@ -296,7 +421,93 @@ mod tests {
             task: TaskId::from_raw(1),
             call: ToolCallId::from_raw(1),
         };
+        s.approval_shown_at = Some(std::time::Instant::now() - crate::state::APPROVAL_ARM_DELAY);
         s
+    }
+
+    /// Key presses (each followed by its release, as Windows reports)
+    /// for `s`, with `\n` as Enter.
+    fn burst(s: &str) -> Vec<Event> {
+        s.chars()
+            .flat_map(|c| {
+                let code = if c == '\n' { KeyCode::Enter } else { KeyCode::Char(c) };
+                let mut up = press(code);
+                up.kind = KeyEventKind::Release;
+                [Event::Key(press(code)), Event::Key(up)]
+            })
+            .collect()
+    }
+
+    /// Mirrors the event loop: coalesce one gathered batch, then route
+    /// keys through `action_for_key` and pastes into the composer.
+    fn feed(state: &mut AppState, batch: Vec<Event>) -> Vec<Action> {
+        let mut acted = Vec::new();
+        for ev in coalesce_paste(batch) {
+            match ev {
+                Event::Key(k) => {
+                    let a = action_for_key(state, k);
+                    apply_local(state, &a);
+                    acted.push(a);
+                }
+                Event::Paste(t) => state.composer.insert_str(&t),
+                _ => {}
+            }
+        }
+        acted
+    }
+
+    fn sends_or_decides(acted: &[Action]) -> bool {
+        acted
+            .iter()
+            .any(|a| matches!(a, Action::Submit(_) | Action::Decide(_) | Action::PickerAccept))
+    }
+
+    #[test]
+    fn a_key_burst_with_enter_inserts_a_newline_and_does_not_submit() {
+        let mut s = AppState::new();
+        let acted = feed(&mut s, burst("hello\nworld"));
+        assert_eq!(s.composer.text(), "hello\nworld");
+        assert!(!sends_or_decides(&acted), "{acted:?}");
+    }
+
+    #[test]
+    fn a_burst_starting_with_slash_runs_no_command_and_opens_no_picker() {
+        let mut s = AppState::new();
+        let acted = feed(&mut s, burst("/help\n"));
+        assert_eq!(s.composer.text(), "/help\n");
+        assert!(!sends_or_decides(&acted), "{acted:?}");
+        assert!(!s.picker.is_open());
+    }
+
+    #[test]
+    fn a_burst_cannot_answer_an_armed_approval() {
+        for text in ["yy", "y\n", "yes", "n\n"] {
+            let mut s = awaiting();
+            assert!(s.composer.is_empty());
+            let acted = feed(&mut s, burst(text));
+            assert!(!sends_or_decides(&acted), "{text:?}: {acted:?}");
+        }
+    }
+
+    #[test]
+    fn human_paced_typing_still_submits_and_answers() {
+        // Each keystroke is its own batch, as when keys are > PASTE_GAP apart.
+        let mut s = AppState::new();
+        let mut acted = Vec::new();
+        for c in "hi\n".chars() {
+            acted.extend(feed(&mut s, burst(&c.to_string())));
+        }
+        acted.retain(|a| *a != Action::Nothing); // releases
+        assert_eq!(acted.last(), Some(&Action::Submit("hi".to_string())));
+
+        let mut s = AppState::new();
+        for c in "/help".chars() {
+            feed(&mut s, burst(&c.to_string()));
+        }
+        assert!(s.picker.is_open(), "a typed / still opens the picker");
+
+        let mut s = awaiting();
+        assert_eq!(feed(&mut s, burst("y")), vec![Action::Decide(true), Action::Nothing]);
     }
 
     #[test]
@@ -445,6 +656,37 @@ mod tests {
             Action::Nothing
         );
         assert_eq!(action_for_key(&s, press(KeyCode::Enter)), Action::Nothing);
+    }
+
+    #[test]
+    fn an_approval_is_not_answered_in_its_first_moments() {
+        let mut s = awaiting();
+        let shown = std::time::Instant::now();
+        s.approval_shown_at = Some(shown);
+        let early = shown + crate::state::APPROVAL_ARM_DELAY / 2;
+        assert_eq!(action_for_key_at(&s, press(KeyCode::Char('y')), early), Action::Nothing);
+        assert_eq!(action_for_key_at(&s, press(KeyCode::Char('n')), early), Action::Nothing);
+        let late = shown + crate::state::APPROVAL_ARM_DELAY;
+        assert_eq!(action_for_key_at(&s, press(KeyCode::Char('y')), late), Action::Decide(true));
+        assert_eq!(action_for_key_at(&s, press(KeyCode::Char('n')), late), Action::Decide(false));
+    }
+
+    #[test]
+    fn a_draft_in_the_composer_keeps_y_and_n_from_answering() {
+        let mut s = awaiting();
+        s.composer.set("draft".to_string());
+        // y/n type into the draft; Enter does not send it; Esc still interrupts.
+        assert_eq!(action_for_key(&s, press(KeyCode::Char('y'))), Action::InsertChar('y'));
+        assert_eq!(action_for_key(&s, press(KeyCode::Char('n'))), Action::InsertChar('n'));
+        assert_eq!(action_for_key(&s, press(KeyCode::Enter)), Action::Nothing);
+        assert_eq!(action_for_key(&s, press(KeyCode::Esc)), Action::Interrupt);
+        // A '/' in the draft does not open the picker over the prompt.
+        apply_local(&mut s, &Action::InsertChar(' '));
+        apply_local(&mut s, &Action::InsertChar('/'));
+        assert!(!s.picker.is_open());
+        // Once cleared, the answer keys work again.
+        apply_local(&mut s, &Action::ClearComposer);
+        assert_eq!(action_for_key(&s, press(KeyCode::Char('y'))), Action::Decide(true));
     }
 
     #[test]

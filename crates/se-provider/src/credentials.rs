@@ -67,6 +67,22 @@ fn origin_entry(id: &str) -> Result<keyring::Entry, String> {
     entry(&format!("{id}#origin"))
 }
 
+/// The API address the user gave `se connect` for a service with none built in. Not a
+/// secret: kept beside the key so it is set, pinned and removed together with it.
+fn url_entry(id: &str) -> Result<keyring::Entry, String> {
+    entry(&format!("{id}#url"))
+}
+
+pub fn stored_base_url(id: &str) -> Option<String> {
+    url_entry(id).ok()?.get_password().ok()
+}
+
+pub fn store_base_url(id: &str, url: &str) -> Result<(), String> {
+    url_entry(id)?
+        .set_password(url)
+        .map_err(|e| e.to_string())
+}
+
 /// Normalises a URL to its origin: scheme + authority (host and port,
 /// if given), lowercased. Enough to detect "this credential is now
 /// being sent somewhere new" without caring about the request path.
@@ -283,10 +299,12 @@ pub fn store(id: &str, secret: &str, origin: Option<&str>) -> Result<(), String>
 pub fn delete(id: &str) -> Result<(), String> {
     // Best-effort: a missing or already-absent pin must never block
     // removing the credential itself.
-    let _ = origin_entry(id).and_then(|e| match e.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(e.to_string()),
-    });
+    for side in [origin_entry(id), url_entry(id)] {
+        let _ = side.and_then(|e| match e.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(e.to_string()),
+        });
+    }
     match entry(id)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(e.to_string()),
@@ -299,6 +317,113 @@ pub fn delete(id: &str) -> Result<(), String> {
 /// saved", without exposing characters to a screenshot or a shoulder.
 pub fn fingerprint(secret: &str) -> String {
     format!("{} characters", secret.chars().count())
+}
+
+/// Vendor key prefixes (`sk-` also covers `sk-ant-`, `sk-proj-`, `sk-or-`).
+const SECRET_PREFIXES: &[&str] = &[
+    "sk-", "sk_", "nvapi-", "gsk_", "AIza", "ghp_", "gho_", "ghu_", "ghs_", "github_pat_",
+    "xoxb-", "xoxp-", "xoxa-", "hf_", "r8_", "pplx-", "glpat-", "xai-", "fw_", "AKIA",
+];
+
+const KEY_WORDS: &[&str] = &["key", "token", "secret", "apikey", "="];
+
+fn digits(s: &str) -> usize {
+    s.chars().filter(char::is_ascii_digit).count()
+}
+
+/// A vendor-prefixed key: at least 16 characters after the prefix, and either 3+ digits
+/// or one unbroken 20+ character run, so identifiers like `sk_buff_head_v2_allocation`
+/// and prose like `sk-learn-and-numpy-...` do not count.
+fn is_prefixed_key(t: &str) -> bool {
+    SECRET_PREFIXES.iter().any(|p| {
+        t.strip_prefix(p).is_some_and(|rest| {
+            rest.len() >= 16
+                && (digits(rest) >= 3 || rest.split(['-', '_']).any(|piece| piece.len() >= 20))
+        })
+    })
+}
+
+/// A random-looking key with no known prefix: one unbroken 24+ character run (split on
+/// `-`/`_` too, so slugs and snake/kebab identifiers never qualify) with 3+ digits and
+/// both cases. Or, on a line that talks about a key (`key`, `token`, `secret`, `=`), a
+/// 40+ character lowercase+digit run containing a non-hex letter.
+/// Not caught, by choice: pure hex (git SHAs, and Azure's 32-hex keys, which look the same).
+fn is_random_key(t: &str, keyish_line: bool) -> bool {
+    let has = |s: &str, f: fn(&char) -> bool| s.chars().any(|c| f(&c));
+    t.split(['-', '_']).any(|piece| {
+        piece.len() >= 24
+            && digits(piece) >= 3
+            && has(piece, char::is_ascii_lowercase)
+            && has(piece, char::is_ascii_uppercase)
+    }) || (keyish_line
+        && t.len() >= 40
+        && digits(t) >= 3
+        && t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && has(t, |c| ('g'..='z').contains(c)))
+}
+
+/// Runs of `[A-Za-z0-9_-]`, the alphabet keys are drawn from. Anything else ends a token,
+/// and so does a backslash with the character after it, so JSON's `\nsk-...` is caught.
+fn tokens(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = None;
+    let mut chars = text.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            start.get_or_insert(i);
+            continue;
+        }
+        if let Some(s) = start.take() {
+            out.push(&text[s..i]);
+        }
+        if c == '\\' {
+            chars.next();
+        }
+    }
+    if let Some(s) = start {
+        out.push(&text[s..]);
+    }
+    out
+}
+
+/// Every credential-shaped token in `text`. Words that are URLs, `data:` URIs or
+/// `sha256-`/`sha512-` integrity strings only face the vendor-prefix rule: their long
+/// random ids (Google Docs, base64) are not keys.
+fn secret_tokens(text: &str) -> Vec<&str> {
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        let keyish = KEY_WORDS.iter().any(|w| lower.contains(w));
+        for word in line.split_whitespace() {
+            let opaque = word.contains("://")
+                || word.contains("data:")
+                || ["sha1-", "sha256-", "sha384-", "sha512-"]
+                    .iter()
+                    .any(|p| word.contains(p));
+            for t in tokens(word) {
+                if is_prefixed_key(t) || (!opaque && is_random_key(t, keyish)) {
+                    found.push(t);
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Whether text carries something shaped like an API key or token, anywhere in it.
+/// Used to stop a pasted key from reaching a model, the transcript or a session file.
+pub fn looks_like_secret(text: &str) -> bool {
+    !secret_tokens(text).is_empty()
+}
+
+/// `text` with every credential-shaped token replaced by `[REDACTED]`: the last line of
+/// defence before anything is written to disk or loaded back from it.
+pub fn redact_secrets(text: &str) -> String {
+    let mut out = text.to_string();
+    for t in secret_tokens(text) {
+        out = out.replace(t, "[REDACTED]");
+    }
+    out
 }
 
 /// Serialises tests that touch real OS credential storage.
@@ -315,6 +440,59 @@ pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_shaped_text_is_caught_and_prose_is_not() {
+        // Fake keys, shaped like real ones.
+        for key in [
+            "sk-abcdefghij0123456789ABCDEFGHIJ0123456789abcdefghij0",
+            "sk-proj-Ab3dEf6hIj9kLm2nOp5q",
+            "sk-ant-api03-abcdef1234567890",
+            "sk-or-v1-0123456789abcdef0123456789abcdef",
+            "nvapi-0123456789abcdefABCDEF",
+            "xai-Ab12Cd34Ef56Gh78Ij90Kl",
+            "fw_3ZkXq81vN2pLm7Rt4Yw9Bc",
+            "AIzaSyA1234567890abcdefghijklmnopqrstu",
+            "ghp_0123456789abcdefghijABCDEFGHIJ012345",
+            "AKIAABCDEFGHIJ012345",
+            "Zq8XkLm2Pw9vRt4Yn6Bc1Hd5Jf3Gs7Ae0Uo", // no prefix, random
+        ] {
+            assert!(looks_like_secret(key), "{key}");
+            assert!(looks_like_secret(&format!("here is my key: {key} thanks")), "{key}");
+            assert_eq!(redact_secrets(&format!("k={key}!")), "k=[REDACTED]!");
+        }
+        // 40+ lowercase+digit, only on a line that talks about a key.
+        let lower = "q7w8e9r0t1y2u3i4o5p6a7s8d9f0g1h2j3k4l5z6x7";
+        assert!(looks_like_secret(&format!("api_key={lower}")));
+        assert!(!looks_like_secret(&format!("build {lower} finished")));
+        // JSON-escaped newline in front of a key, as on disk.
+        let json = r#"{"content":"hello\nsk-abcdefghij0123456789ABCDEFGHIJ"}"#;
+        assert!(looks_like_secret(json));
+        assert_eq!(redact_secrets(json), r#"{"content":"hello\n[REDACTED]"}"#);
+        // A vendor key in a URL query still counts.
+        assert!(looks_like_secret("https://x.example/v1?key=sk-abcdefghij0123456789ABCDEF"));
+
+        for prose in [
+            "did it connect the api key",
+            "use sk-learn-and-numpy-for-this-task please",
+            "free sk_buff_head_v2_allocation on exit",
+            "see %USERPROFILE%\\SE\\se-rust\\crates\\se-provider\\src\\credentials.rs",
+            "https://integrate.api.nvidia.com/v1/chat/completions?stream=true",
+            "commit 3f9a1c2b4d5e6f7081928374655647382910abcd broke it", // lowercase hex SHA
+            "sha=3f9a1c2b4d5e6f7081928374655647382910abcd",              // hex even with =
+            "rename handle_provider_connection_request_for_tui to something shorter",
+            "/connect apinex https://api.apinex.example/v1",
+            "JIRA-1234-Add-new-login-flow-for-users",
+            "ConfigureServicesForOAuth2Provider",
+            "test_handles_HTTP2_upgrade_when_server_rejects_it",
+            "https://docs.google.com/document/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit",
+            "\"integrity\": \"sha512-Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z==\"",
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+        ] {
+            assert!(!looks_like_secret(prose), "{prose}");
+            assert_eq!(redact_secrets(prose), prose);
+        }
+    }
 
     /// A per-run id, so a test never touches a real stored credential.
     fn scratch_id(name: &str) -> String {

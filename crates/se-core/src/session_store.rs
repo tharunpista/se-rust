@@ -50,6 +50,8 @@ impl SessionStore {
     pub fn append(&mut self, event: &CoreEvent) -> io::Result<()> {
         let line = serde_json::to_string(event)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        // Last line of defence: nothing key-shaped reaches the log on disk.
+        let line = se_provider::credentials::redact_secrets(&line);
         self.file.write_all(line.as_bytes())?;
         self.file.write_all(b"\n")?;
         self.file.flush()

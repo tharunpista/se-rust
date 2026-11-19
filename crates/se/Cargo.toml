@@ -23,6 +23,7 @@ se-permission = { path = "../se-permission" }
 clap = { workspace = true }
 crossterm = { workspace = true }
 ratatui = { workspace = true }
+base64 = { workspace = true }
 
 [lints]
 workspace = true

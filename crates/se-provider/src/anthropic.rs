@@ -80,6 +80,17 @@ pub fn request_body(request: &ChatRequest) -> serde_json::Value {
         }
     }
 
+    // Prompt caching: one breakpoint on the system prompt (a specialist's
+    // body, which repeats every turn) and one on the newest block, so the
+    // next turn re-reads the whole prefix at the cached rate. Prompts under
+    // the model's minimum cacheable length are simply not cached.
+    if let Some(block) = messages
+        .last_mut()
+        .and_then(|m| m["content"].as_array_mut())
+        .and_then(|blocks| blocks.last_mut())
+    {
+        block["cache_control"] = serde_json::json!({"type": "ephemeral"});
+    }
     let mut body = serde_json::json!({
         "model": request.model,
         "max_tokens": request.max_tokens,
@@ -87,7 +98,11 @@ pub fn request_body(request: &ChatRequest) -> serde_json::Value {
         "stream": true,
     });
     if !system.is_empty() {
-        body["system"] = serde_json::Value::String(system.join("\n\n"));
+        body["system"] = serde_json::json!([{
+            "type": "text",
+            "text": system.join("\n\n"),
+            "cache_control": {"type": "ephemeral"},
+        }]);
     }
     if !request.tools.is_empty() {
         body["tools"] = request
@@ -255,7 +270,8 @@ mod tests {
             Message::tool_result("toolu_1", "A"),
             Message::tool_result("toolu_2", "B"),
         ]));
-        assert_eq!(body["system"], "be careful");
+        assert_eq!(body["system"][0]["text"], "be careful");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["stream"], true);
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 3, "user, assistant, one merged user: {msgs:?}");
@@ -268,6 +284,14 @@ mod tests {
         assert_eq!(msgs[2]["role"], "user");
         assert_eq!(results.len(), 2, "consecutive results share one message");
         assert_eq!(results[1]["tool_use_id"], "toolu_2");
+        assert_eq!(
+            results[1]["cache_control"]["type"], "ephemeral",
+            "newest block cached"
+        );
+        assert!(
+            results[0].get("cache_control").is_none(),
+            "only one message breakpoint"
+        );
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
     }
 

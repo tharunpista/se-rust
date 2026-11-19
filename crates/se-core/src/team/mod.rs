@@ -9,5 +9,5 @@ pub mod journal;
 pub mod monitor;
 
 pub use context::{Conflict, TeamContext};
-pub use driver::{Limits, NodeRecord, TeamRun};
+pub use driver::{agent_state, Limits, NodeRecord, TeamRun};
 pub use graph::{GraphError, NodeKind, NodeSpec, NodeState, TaskGraph, TransitionError};

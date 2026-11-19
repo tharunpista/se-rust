@@ -9,8 +9,9 @@ use std::sync::Mutex;
 
 use se_permission::{AuditRecord, AuditSink};
 
-/// Appends one JSON line per decision. Records carry env-var names only
-/// (see `AuditRecord`), so nothing here needs redacting.
+/// Appends one JSON line per decision. Each line goes through the same
+/// credential redaction as the session log before it is written, since
+/// a resource scope (a command line, a URL) can carry a pasted key.
 pub struct FileAuditSink {
     file: Mutex<std::fs::File>,
 }
@@ -46,6 +47,7 @@ impl AuditSink for FileAuditSink {
             "resource": record.resource_scope,
             "effect": format!("{:?}", record.effect),
         });
+        let line = se_provider::credentials::redact_secrets(&line.to_string());
         let mut file = self.file.lock().unwrap_or_else(|e| e.into_inner());
         // One write per line so a crash can truncate at most the last one.
         file.write_all(format!("{line}\n").as_bytes())
@@ -71,4 +73,37 @@ pub fn read(path: &Path) -> std::io::Result<Vec<serde_json::Value>> {
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_secret_in_a_record_is_written_redacted() {
+        let dir = std::env::temp_dir().join(format!("se-audit-redact-{}", std::process::id()));
+        let path = dir.join("audit.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let sink = FileAuditSink::open(&path).unwrap();
+        // Fake keys, shaped like real ones.
+        let scope = "curl -H 'Authorization: Bearer ghp_0123456789abcdefghijABCDEFGHIJ012345' \
+                     OPENAI=sk-test-FAKE1234567890abcdef";
+        sink.record(AuditRecord {
+            agent_id: "a".into(),
+            session: se_protocol::SessionId::from_raw(1),
+            task: se_protocol::TaskId::from_raw(1),
+            tool_name: "run_shell".into(),
+            resource_scope: scope.into(),
+            effect: se_permission::Effect::Allow,
+        })
+        .unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!written.contains("ghp_0123456789"), "{written}");
+        assert!(!written.contains("sk-test-FAKE"), "{written}");
+        assert!(written.contains("[REDACTED]"), "{written}");
+        // Still one parseable JSON line.
+        assert_eq!(written.lines().count(), 1);
+        serde_json::from_str::<serde_json::Value>(written.trim()).unwrap();
+    }
 }

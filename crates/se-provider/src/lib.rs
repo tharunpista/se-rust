@@ -13,6 +13,8 @@
 
 pub mod anthropic;
 pub mod credentials;
+pub mod external;
+pub mod model_access;
 pub mod openai_compatible;
 
 pub use credentials::Source;
@@ -159,6 +161,29 @@ pub struct ModelInfo {
     pub context_window: Option<u64>,
     pub supports_tools: Option<bool>,
     pub supports_vision: Option<bool>,
+}
+
+/// The models a credential can actually use, from [`ModelProvider::usable_models`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsableModels {
+    /// Shown: available, or not yet checkable.
+    pub models: Vec<ModelInfo>,
+    /// Ids among `models` whose probe gave no verdict (5xx, timeout, firewall page).
+    pub unchecked: Vec<String>,
+    /// Listed by the provider but not usable with this credential, and why.
+    pub hidden: Vec<(String, model_access::Verdict)>,
+}
+
+impl UsableModels {
+    /// "N hidden: ..." for the picker or CLI, or `None` when nothing was hidden.
+    pub fn hidden_summary(&self, refresh_hint: &str) -> Option<String> {
+        let paid = self
+            .hidden
+            .iter()
+            .filter(|(_, v)| matches!(v, model_access::Verdict::Paid(_)))
+            .count();
+        model_access::hidden_summary(paid, self.hidden.len() - paid, refresh_hint)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,6 +346,17 @@ pub trait ModelProvider: Send + Sync {
     /// prompt is sent and no tokens are billed.
     fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError>;
 
+    /// The listed models this credential can actually use. By default every
+    /// listed model; keyed OpenAI-compatible services probe and cache
+    /// (see [`model_access`]). `refresh` ignores the cache.
+    fn usable_models(&self, refresh: bool) -> Result<UsableModels, ProviderError> {
+        let _ = refresh;
+        Ok(UsableModels {
+            models: self.list_models()?,
+            ..UsableModels::default()
+        })
+    }
+
     /// Confirms the credential actually works, by listing models.
     ///
     /// Separate from [`detect`](Self::detect) because "a key is present"
@@ -337,6 +373,21 @@ pub trait ModelProvider: Send + Sync {
     /// `None` by default: a provider with no configured endpoint has
     /// nothing to pin yet.
     fn current_origin(&self) -> Option<String> {
+        None
+    }
+
+    /// A whole agent CLI (Claude Code, Codex, ...) rather than a model API:
+    /// every call starts a process and carries the CLI's own prompt, so
+    /// callers should not spend extra calls on it (routing, for one).
+    fn is_agent_cli(&self) -> bool {
+        false
+    }
+
+    /// For a provider reached through another tool's own login (an agent
+    /// CLI): whether that login is live. `Ok` describes it, `Err` says
+    /// how to log in. `None` for API-key providers. Starts a process, so
+    /// call it off any interface thread.
+    fn login_status(&self) -> Option<Result<String, String>> {
         None
     }
 }
@@ -357,9 +408,9 @@ impl Registry {
     /// built at any moment sees the same credential state as any other.
     /// That is deliberate -- the opposite arrangement was a real defect.
     pub fn new() -> Self {
-        Registry {
-            providers: openai_compatible::registered(),
-        }
+        let mut providers = openai_compatible::registered();
+        providers.extend(external::registered());
+        Registry { providers }
     }
 
     pub fn empty() -> Self {
@@ -419,7 +470,11 @@ mod tests {
         assert!(ids.contains(&"nvidia"), "{ids:?}");
         assert!(ids.contains(&"openai"), "{ids:?}");
         assert!(ids.contains(&"openrouter"), "{ids:?}");
-        assert_eq!(ids.len(), CATALOGUE.len());
+        assert!(
+            ids.contains(&"claude-code") && ids.contains(&"codex"),
+            "{ids:?}"
+        );
+        assert_eq!(ids.len(), CATALOGUE.len() + external::registered().len());
     }
 
     #[test]

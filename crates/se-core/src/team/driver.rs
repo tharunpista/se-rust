@@ -14,7 +14,9 @@ use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use se_protocol::{ApprovalDecision, CoreEvent, Outcome, Payload, TaskId, Usage};
+use se_protocol::{
+    AgentEvent, AgentState, ApprovalDecision, CoreEvent, Outcome, Payload, TaskId, Usage,
+};
 
 use super::context::TeamContext;
 use super::graph::{NodeKind, NodeState, TaskGraph, TransitionError};
@@ -140,6 +142,36 @@ pub struct TeamRun {
     /// Set when the journal cannot be written. No new node starts after
     /// that: work that cannot be recorded could be replayed on resume.
     journal_error: Option<String>,
+    /// Agent lifecycle/activity events not yet taken by an interface.
+    agent_events: Vec<AgentEvent>,
+    /// What each node was last announced as, and its last reported tokens.
+    announced: HashMap<String, AgentState>,
+    announced_tokens: HashMap<String, u64>,
+}
+
+/// The strip state a node maps to. `None`: it has not started (pending,
+/// ready) or never will (blocked), so it is not an agent yet.
+pub fn agent_state(state: NodeState) -> Option<AgentState> {
+    match state {
+        NodeState::Pending | NodeState::Ready | NodeState::Blocked => None,
+        NodeState::Running => Some(AgentState::Running),
+        // Both wait on a human.
+        NodeState::WaitingApproval | NodeState::NeedsConfirmation => {
+            Some(AgentState::WaitingApproval)
+        }
+        NodeState::Completed => Some(AgentState::Done),
+        NodeState::Failed => Some(AgentState::Failed),
+        NodeState::Cancelled => Some(AgentState::Cancelled),
+    }
+}
+
+/// First line of `text`, at most `max` chars.
+pub(crate) fn one_line(text: &str, max: usize) -> String {
+    let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    match line.char_indices().nth(max) {
+        Some((at, _)) => format!("{}…", &line[..at]),
+        None => line.to_string(),
+    }
 }
 
 impl TeamRun {
@@ -244,6 +276,9 @@ impl TeamRun {
             journal,
             recorded: HashMap::new(),
             journal_error: None,
+            agent_events: Vec::new(),
+            announced: HashMap::new(),
+            announced_tokens: HashMap::new(),
         };
         run.submit_ready();
         run
@@ -331,6 +366,72 @@ impl TeamRun {
         std::mem::take(&mut self.notices)
     }
 
+    /// Agent events since the last call: each node that started becomes an
+    /// agent (id = node id), with its state changes, tokens and activity.
+    pub fn take_agent_events(&mut self) -> Vec<AgentEvent> {
+        self.sync_agents();
+        std::mem::take(&mut self.agent_events)
+    }
+
+    /// Diffs node states and tokens against what was last announced.
+    /// Only nodes submitted by this process become agents.
+    fn sync_agents(&mut self) {
+        for n in self.graph.nodes() {
+            let id = &n.id;
+            let Some(state) = self.graph.state(id).and_then(agent_state) else {
+                continue;
+            };
+            if !self.submitted.values().any(|s| s == id) {
+                continue;
+            }
+            let previous = self.announced.insert(id.clone(), state);
+            if previous.is_none() {
+                let role = match (n.agent.as_str(), n.kind) {
+                    (_, NodeKind::Evaluate) => "evaluator",
+                    ("", _) => "auto",
+                    (agent, _) => agent,
+                };
+                self.agent_events.push(AgentEvent::Spawned {
+                    agent_id: id.clone(),
+                    role: role.to_string(),
+                    parent: None,
+                    task: one_line(&n.request, 80),
+                });
+            }
+            if let Some(used) = self.records.get(id).and_then(NodeRecord::tokens) {
+                if self.announced_tokens.insert(id.clone(), used) != Some(used) {
+                    self.agent_events.push(AgentEvent::Tokens {
+                        agent_id: id.clone(),
+                        used,
+                    });
+                }
+            }
+            if previous == Some(state) {
+                continue;
+            }
+            let agent_id = id.clone();
+            self.agent_events.push(match (state, self.outcomes.get(id)) {
+                (AgentState::Done, outcome) => AgentEvent::Done {
+                    agent_id,
+                    summary: match outcome {
+                        Some(Outcome::Completed { final_text }) => one_line(final_text, 120),
+                        _ => String::new(),
+                    },
+                },
+                (AgentState::Failed, outcome) => AgentEvent::Failed {
+                    agent_id,
+                    error: match outcome {
+                        Some(Outcome::Failed { detail }) => one_line(detail, 120),
+                        Some(Outcome::Incomplete { reason, .. }) => one_line(reason, 120),
+                        Some(other) => other.label().to_string(),
+                        None => "failed".to_string(),
+                    },
+                },
+                (state, _) => AgentEvent::State { agent_id, state },
+            });
+        }
+    }
+
     /// (tokens spent, budget, model calls that reported no usage).
     pub fn budget(&self) -> (u64, Option<u64>, u64) {
         (
@@ -416,6 +517,19 @@ impl TeamRun {
                 continue;
             };
             let state = self.graph.state(&node);
+            if matches!(
+                event.payload,
+                Payload::Delta { .. }
+                    | Payload::ToolRequested { .. }
+                    | Payload::ToolCompleted { .. }
+                    | Payload::ToolDenied { .. }
+                    | Payload::ApprovalRequired { .. }
+            ) {
+                self.agent_events.push(AgentEvent::Activity {
+                    agent_id: node.clone(),
+                    payload: Box::new(event.payload.clone()),
+                });
+            }
             // Transition errors are expected and ignored here: a node
             // cancelled while its worker winds down still reports, and
             // the graph rightly refuses to revive it.
@@ -606,7 +720,7 @@ impl TeamRun {
                 }
                 // Capacity was checked above, so this is the core
                 // disagreeing or gone. Nothing ran: fail the node.
-                Err(SubmitError::Busy { .. }) => {
+                Err(SubmitError::Busy { .. } | SubmitError::LooksLikeSecret) => {
                     let _ = self.graph.finish(&id, false);
                 }
                 Err(SubmitError::Stopped) => {
@@ -616,6 +730,8 @@ impl TeamRun {
             }
         }
         self.sync_journal();
+        // Spawned goes out before any of the new task's activity can.
+        self.sync_agents();
     }
 }
 
@@ -921,6 +1037,122 @@ mod tests {
         assert_eq!(run.graph().state("asks"), Some(NodeState::Cancelled));
         assert_eq!(run.graph().state("child"), Some(NodeState::Cancelled));
         assert!(log.iter().all(|(n, _)| n != "child"), "child never started");
+    }
+
+    #[test]
+    fn node_states_map_to_agent_states() {
+        use AgentState as A;
+        for (node, agent) in [
+            (NodeState::Pending, None),
+            (NodeState::Ready, None),
+            (NodeState::Blocked, None),
+            (NodeState::Running, Some(A::Running)),
+            (NodeState::WaitingApproval, Some(A::WaitingApproval)),
+            (NodeState::NeedsConfirmation, Some(A::WaitingApproval)),
+            (NodeState::Completed, Some(A::Done)),
+            (NodeState::Failed, Some(A::Failed)),
+            (NodeState::Cancelled, Some(A::Cancelled)),
+        ] {
+            assert_eq!(agent_state(node), agent, "{node:?}");
+        }
+    }
+
+    /// Started nodes become agents: spawned once, before their activity,
+    /// then done/failed with a summary. A blocked node never appears.
+    #[test]
+    fn a_team_run_emits_agent_lifecycle_events() {
+        let mut run = TeamRun::start(
+            TaskGraph::new(vec![
+                node("a", "first", &[]),
+                node("b", "fail", &["a"]),
+                node("after_b", "never", &["b"]),
+            ])
+            .unwrap(),
+            Shared(Arc::default()),
+            2,
+        );
+        let mut events = run.take_agent_events();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !run.is_done() {
+            assert!(std::time::Instant::now() < deadline);
+            run.tick_blocking(Duration::from_millis(20));
+            events.extend(run.take_agent_events());
+        }
+        events.extend(run.take_agent_events());
+        let spawned: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Spawned { agent_id, role, parent, task } => {
+                    assert_eq!((role.as_str(), parent), ("backend-lead", &None));
+                    assert!(!task.is_empty());
+                    Some(agent_id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(spawned, ["a", "b"], "{events:?}");
+        assert!(events.contains(&AgentEvent::Done {
+            agent_id: "a".into(),
+            summary: "done: first".into()
+        }));
+        assert!(events.contains(&AgentEvent::Failed {
+            agent_id: "b".into(),
+            error: "planned failure".into()
+        }));
+        // Announced right after submission, so never skipped.
+        assert!(events.contains(&AgentEvent::State {
+            agent_id: "a".into(),
+            state: AgentState::Running
+        }));
+        // Nothing more once everything is announced.
+        assert!(run.take_agent_events().is_empty());
+    }
+
+    #[test]
+    fn a_waiting_then_cancelled_node_reports_both_states_and_its_approval() {
+        let mut run = TeamRun::start(
+            TaskGraph::new(vec![node("asks", "approve", &[])]).unwrap(),
+            Shared(Arc::default()),
+            1,
+        );
+        let mut events = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while run.graph().state("asks") != Some(NodeState::WaitingApproval) {
+            assert!(std::time::Instant::now() < deadline);
+            run.tick_blocking(Duration::from_millis(20));
+            events.extend(run.take_agent_events());
+        }
+        events.extend(run.take_agent_events());
+        run.cancel("asks").unwrap();
+        events.extend(run.take_agent_events());
+        let id = || "asks".to_string();
+        let at = |want: &AgentEvent| {
+            events
+                .iter()
+                .position(|e| e == want)
+                .unwrap_or_else(|| panic!("{want:?} missing from {events:?}"))
+        };
+        let spawned = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::Spawned { .. }))
+            .unwrap();
+        let waiting = at(&AgentEvent::State {
+            agent_id: id(),
+            state: AgentState::WaitingApproval,
+        });
+        let cancelled = at(&AgentEvent::State {
+            agent_id: id(),
+            state: AgentState::Cancelled,
+        });
+        let approval = events
+            .iter()
+            .position(|e| {
+                matches!(e, AgentEvent::Activity { payload, .. }
+                    if matches!(**payload, Payload::ApprovalRequired { .. }))
+            })
+            .unwrap();
+        assert!(spawned < approval && spawned < waiting && waiting < cancelled);
+        drive(&mut run);
     }
 
     /// A journal that cannot be written ends the run as cancelled with

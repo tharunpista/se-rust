@@ -62,6 +62,12 @@ pub enum HandlerKind {
     /// resolved elsewhere, never by this dependency-free crate --
     /// supplies the system prompt, not the command's own text.
     SpecialistInvoke,
+    /// Selects the model for later turns (`path` is `provider/model`).
+    /// Built at runtime from what providers actually report.
+    ModelSelect,
+    /// Connects one provider (`path` is its id): a hidden key entry for an
+    /// API provider, the login state for an agent CLI.
+    ProviderConnect,
 }
 
 /// Builds the stable id for a loaded (non-builtin) command: its
@@ -217,6 +223,13 @@ impl Registry {
             self.names.insert(name.to_string(), idx);
         }
         Ok(outcome)
+    }
+
+    /// Drops every command `drop` matches (a model list that changed, say).
+    /// Slots stay so indices never shift; only the names go, which is what `query` checks.
+    pub fn unregister_where(&mut self, drop: impl Fn(&CommandSpec) -> bool) {
+        let commands = &self.commands;
+        self.names.retain(|_, idx| !drop(&commands[*idx]));
     }
 
     /// Number of commands actually resolvable right now -- excludes
