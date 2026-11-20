@@ -342,7 +342,14 @@ mod tests {
         // Pinned deliberately: if someone adds a credential, permission
         // or diagnostic surface later and forgets the flag, this fails.
         let expected = [
-            "help", "commands", "mode", "exit", "connect", "permissions", "connectors", "doctor",
+            "help",
+            "commands",
+            "mode",
+            "exit",
+            "connect",
+            "permissions",
+            "connectors",
+            "doctor",
         ];
         let actual: Vec<&str> = builtins()
             .iter()

@@ -42,8 +42,12 @@ pub fn start(
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let team = file::parse(&text)?;
-    let (runner, warning) =
-        build_runner(cli, &team.graph, Ruleset::from_rules(team.provider_rules), mode)?;
+    let (runner, warning) = build_runner(
+        cli,
+        &team.graph,
+        Ruleset::from_rules(team.provider_rules),
+        mode,
+    )?;
     let journal = std::env::current_dir()
         .map_err(|e| format!("no working directory: {e}"))?
         .join(".se")

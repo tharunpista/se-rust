@@ -1014,7 +1014,10 @@ mod tests {
             Err(SubmitError::LooksLikeSecret)
         ));
         std::thread::sleep(Duration::from_millis(50));
-        assert!(handle.drain().is_empty(), "nothing started, nothing recorded");
+        assert!(
+            handle.drain().is_empty(),
+            "nothing started, nothing recorded"
+        );
         handle.shutdown();
     }
 

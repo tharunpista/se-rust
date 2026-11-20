@@ -106,7 +106,12 @@ pub fn list(dir: &Path) -> (Vec<Row>, Option<String>) {
         .flatten()
         .filter_map(Result::ok)
         .filter_map(|e| {
-            let id = e.file_name().into_string().ok()?.strip_suffix(CONVERSATION)?.to_string();
+            let id = e
+                .file_name()
+                .into_string()
+                .ok()?
+                .strip_suffix(CONVERSATION)?
+                .to_string();
             let modified = e.metadata().ok()?.modified().ok()?;
             let saved = crate::load_conversation(&e.path()).unwrap_or_default();
             let asked = saved
@@ -115,7 +120,13 @@ pub fn list(dir: &Path) -> (Vec<Row>, Option<String>) {
                     m.role == se_provider::Role::User
                         && !m.content.starts_with(crate::provider_runner::MEMORY_PREFIX)
                 })
-                .map(|m| m.content.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim())
+                .map(|m| {
+                    m.content
+                        .lines()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or("")
+                        .trim()
+                })
                 .filter(|t| !t.is_empty())
                 .map(|t| t.chars().take(80).collect::<String>());
             let arrangement = index.sessions.get(&id).cloned().unwrap_or_default();
@@ -126,7 +137,10 @@ pub fn list(dir: &Path) -> (Vec<Row>, Option<String>) {
             Some((
                 arrangement.order,
                 Row {
-                    title: arrangement.title.or(asked).unwrap_or_else(|| "(no messages)".to_string()),
+                    title: arrangement
+                        .title
+                        .or(asked)
+                        .unwrap_or_else(|| "(no messages)".to_string()),
                     modified,
                     model,
                     messages: saved.len(),
@@ -137,12 +151,18 @@ pub fn list(dir: &Path) -> (Vec<Row>, Option<String>) {
         })
         .collect();
     rows.sort_by(|(ao, a), (bo, b)| {
-        (!a.pinned, ao.unwrap_or(u32::MAX), std::cmp::Reverse(a.modified), &a.id).cmp(&(
-            !b.pinned,
-            bo.unwrap_or(u32::MAX),
-            std::cmp::Reverse(b.modified),
-            &b.id,
-        ))
+        (
+            !a.pinned,
+            ao.unwrap_or(u32::MAX),
+            std::cmp::Reverse(a.modified),
+            &a.id,
+        )
+            .cmp(&(
+                !b.pinned,
+                bo.unwrap_or(u32::MAX),
+                std::cmp::Reverse(b.modified),
+                &b.id,
+            ))
     });
     (rows.into_iter().map(|(_, r)| r).collect(), notice)
 }
@@ -223,11 +243,16 @@ pub fn sidecars(dir: &Path, id: &str) -> Vec<String> {
 /// earlier trash of the same id.
 pub fn trash(dir: &Path, id: &str, open: Option<&str>) -> io::Result<Trashed> {
     if open == Some(id) || id.is_empty() {
-        return Err(io::Error::other(format!("{id} is the open conversation: switch away from it first")));
+        return Err(io::Error::other(format!(
+            "{id} is the open conversation: switch away from it first"
+        )));
     }
     let files = sidecars(dir, id);
     if files.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, format!("no files for session {id}")));
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no files for session {id}"),
+        ));
     }
     let bin = dir.join(TRASH).join(id);
     if bin.exists() {
@@ -245,7 +270,11 @@ pub fn trash(dir: &Path, id: &str, open: Option<&str>) -> io::Result<Trashed> {
             index.sessions.remove(id);
         })?;
     }
-    Ok(Trashed { id: id.to_string(), files, arrangement })
+    Ok(Trashed {
+        id: id.to_string(),
+        files,
+        arrangement,
+    })
 }
 
 /// Puts a [`trash`]ed session back, byte for byte, with its index entry.
@@ -254,7 +283,10 @@ pub fn restore(dir: &Path, trashed: &Trashed) -> io::Result<()> {
     if let Some(clash) = trashed.files.iter().find(|f| dir.join(f).exists()) {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            format!("{clash} exists again in {}; not overwriting it", dir.display()),
+            format!(
+                "{clash} exists again in {}; not overwriting it",
+                dir.display()
+            ),
         ));
     }
     move_all(&trashed.files, &bin, dir)?;
@@ -301,11 +333,21 @@ pub fn recent_projects(file: &Path) -> Vec<RecentProject> {
 pub fn touch_recent(file: &Path, project: &Path, now: u64) -> io::Result<()> {
     let same = |a: &Path| {
         let (a, b) = (a.to_string_lossy(), project.to_string_lossy());
-        if cfg!(windows) { a.eq_ignore_ascii_case(&b) } else { a == b }
+        if cfg!(windows) {
+            a.eq_ignore_ascii_case(&b)
+        } else {
+            a == b
+        }
     };
     let mut list = recent_projects(file);
     list.retain(|p| !same(&p.path));
-    list.insert(0, RecentProject { path: project.to_path_buf(), last_used: now });
+    list.insert(
+        0,
+        RecentProject {
+            path: project.to_path_buf(),
+            last_used: now,
+        },
+    );
     list.sort_by_key(|p| std::cmp::Reverse(p.last_used));
     list.truncate(RECENT_CAP);
     write_json(file, &list)
@@ -323,7 +365,8 @@ mod tests {
         fn new() -> Self {
             static N: AtomicU32 = AtomicU32::new(0);
             let n = N.fetch_add(1, Ordering::SeqCst);
-            let path = std::env::temp_dir().join(format!("se-sessions-test-{}-{n}", std::process::id()));
+            let path =
+                std::env::temp_dir().join(format!("se-sessions-test-{}-{n}", std::process::id()));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).unwrap();
             TempDir(path)
@@ -339,11 +382,20 @@ mod tests {
     /// A conversation saved `age` seconds ago, asking `first`.
     fn save(dir: &Path, id: &str, first: &str, age: u64) {
         use se_provider::{Message, Role};
-        let json = serde_json::to_string(&[Message::text(Role::User, first), Message::text(Role::Assistant, "ok")]).unwrap();
+        let json = serde_json::to_string(&[
+            Message::text(Role::User, first),
+            Message::text(Role::Assistant, "ok"),
+        ])
+        .unwrap();
         let path = dir.join(format!("{id}{CONVERSATION}"));
         std::fs::write(&path, json).unwrap();
         let when = SystemTime::now() - Duration::from_secs(age);
-        std::fs::File::options().write(true).open(&path).unwrap().set_modified(when).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
     }
 
     fn ids(dir: &Path) -> Vec<String> {
@@ -386,7 +438,9 @@ mod tests {
         assert_eq!(list(&d.0).0[0].title, "what is rust");
         rename(&d.0, "a", "  Rust notes ").unwrap();
         assert_eq!(list(&d.0).0[0].title, "Rust notes");
-        assert!(std::fs::read_to_string(d.0.join(INDEX)).unwrap().contains("Rust notes"));
+        assert!(std::fs::read_to_string(d.0.join(INDEX))
+            .unwrap()
+            .contains("Rust notes"));
         rename(&d.0, "a", "").unwrap();
         assert_eq!(list(&d.0).0[0].title, "what is rust");
     }
@@ -401,10 +455,16 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(notice.unwrap().contains("unreadable"));
         // Listing never rewrites it.
-        assert_eq!(std::fs::read_to_string(d.0.join(INDEX)).unwrap(), "{ not json");
+        assert_eq!(
+            std::fs::read_to_string(d.0.join(INDEX)).unwrap(),
+            "{ not json"
+        );
         // A change keeps the bad file aside, then starts fresh.
         rename(&d.0, "a", "kept").unwrap();
-        assert_eq!(std::fs::read_to_string(d.0.join("index.json.bad")).unwrap(), "{ not json");
+        assert_eq!(
+            std::fs::read_to_string(d.0.join("index.json.bad")).unwrap(),
+            "{ not json"
+        );
         let (rows, notice) = list(&d.0);
         assert!(notice.is_none());
         assert!(rows.iter().any(|r| r.title == "kept"));
@@ -439,7 +499,10 @@ mod tests {
             assert_eq!(&std::fs::read(d.0.join(f)).unwrap(), bytes, "{f}");
         }
         let rows = list(&d.0).0;
-        assert_eq!((rows[0].id.as_str(), rows[0].title.as_str(), rows[0].pinned), ("17", "titled", true));
+        assert_eq!(
+            (rows[0].id.as_str(), rows[0].title.as_str(), rows[0].pinned),
+            ("17", "titled", true)
+        );
         assert!(!d.0.join(".trash").join("17").exists());
     }
 
@@ -459,7 +522,10 @@ mod tests {
         touch_recent(&file, Path::new("/p/two"), 2).unwrap();
         touch_recent(&file, Path::new("/p/one"), 3).unwrap();
         let list = recent_projects(&file);
-        assert_eq!(list.iter().map(|p| p.path.clone()).collect::<Vec<_>>(), [PathBuf::from("/p/one"), PathBuf::from("/p/two")]);
+        assert_eq!(
+            list.iter().map(|p| p.path.clone()).collect::<Vec<_>>(),
+            [PathBuf::from("/p/one"), PathBuf::from("/p/two")]
+        );
         for n in 0..60 {
             touch_recent(&file, &PathBuf::from(format!("/q/{n}")), 10 + n).unwrap();
         }

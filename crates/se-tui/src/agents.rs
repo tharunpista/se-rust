@@ -32,7 +32,9 @@ pub struct Agent {
 
 impl Agent {
     pub fn elapsed(&self, now: Instant) -> std::time::Duration {
-        self.ended.unwrap_or(now).saturating_duration_since(self.started)
+        self.ended
+            .unwrap_or(now)
+            .saturating_duration_since(self.started)
     }
 }
 
@@ -137,7 +139,9 @@ impl Strip {
             AgentEvent::Tokens { used, .. } => agent.tokens = Some(*used),
             AgentEvent::Done { summary, .. } => {
                 set(agent, AgentState::Done);
-                agent.transcript.push(Entry::Notice(format!("done: {summary}")));
+                agent
+                    .transcript
+                    .push(Entry::Notice(format!("done: {summary}")));
             }
             AgentEvent::Failed { error, .. } => {
                 set(agent, AgentState::Failed);
@@ -173,7 +177,11 @@ fn fold(t: &mut Vec<Entry>, payload: &Payload) {
         Payload::ToolCompleted {
             name, ok, preview, ..
         } => {
-            let state = if *ok { ToolState::Ok } else { ToolState::Failed };
+            let state = if *ok {
+                ToolState::Ok
+            } else {
+                ToolState::Failed
+            };
             crate::state::settle_tool(t, name, state, preview);
         }
         Payload::ToolDenied { name, .. } => {
@@ -201,7 +209,12 @@ pub fn set_focus(state: &mut AppState, focus: Focus) {
 pub fn wants(state: &AppState, key: &KeyEvent) -> bool {
     let nav = matches!(
         key.code,
-        KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Esc | KeyCode::PageUp | KeyCode::PageDown
+        KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Enter
+            | KeyCode::Esc
+            | KeyCode::PageUp
+            | KeyCode::PageDown
     );
     match state.agents.focus {
         Focus::Composer => {
@@ -433,7 +446,10 @@ pub(crate) mod tests {
             summary: "ok".into(),
             state: ToolState::Ok
         }));
-        assert!(s.transcript.is_empty(), "nothing leaked into the main transcript");
+        assert!(
+            s.transcript.is_empty(),
+            "nothing leaked into the main transcript"
+        );
         assert_eq!(s.agents.agents.len(), 1);
     }
 }

@@ -181,9 +181,15 @@ mod tests {
     /// whole catalogue stays small.
     #[test]
     fn the_real_catalogue_fits_a_two_step_choice() {
-        let root_buf = std::path::PathBuf::from(std::env::var("SE_CATALOGUE_ROOT").unwrap_or_else(|_| {
-            format!("{}/SE/se/agents", std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default())
-        }));
+        let root_buf =
+            std::path::PathBuf::from(std::env::var("SE_CATALOGUE_ROOT").unwrap_or_else(|_| {
+                format!(
+                    "{}/SE/se/agents",
+                    std::env::var("USERPROFILE")
+                        .or_else(|_| std::env::var("HOME"))
+                        .unwrap_or_default()
+                )
+            }));
         let root = root_buf.as_path();
         if !root.exists() {
             eprintln!("skipped: no real catalogue on this machine");

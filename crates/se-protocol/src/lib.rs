@@ -367,11 +367,20 @@ pub enum AgentEvent {
         state: AgentState,
     },
     /// Reported tokens so far (input + output), a running total.
-    Tokens { agent_id: String, used: u64 },
+    Tokens {
+        agent_id: String,
+        used: u64,
+    },
     /// Terminal: implies state `Done`.
-    Done { agent_id: String, summary: String },
+    Done {
+        agent_id: String,
+        summary: String,
+    },
     /// Terminal: implies state `Failed`.
-    Failed { agent_id: String, error: String },
+    Failed {
+        agent_id: String,
+        error: String,
+    },
     /// One of the agent's own events (`Delta`, `Tool*`, `ApprovalRequired`)
     /// for its transcript view.
     Activity {
@@ -539,9 +548,18 @@ mod tests {
                 agent_id: id(),
                 state: AgentState::WaitingApproval,
             },
-            AgentEvent::Tokens { agent_id: id(), used: 42 },
-            AgentEvent::Done { agent_id: id(), summary: "ok".into() },
-            AgentEvent::Failed { agent_id: id(), error: "no".into() },
+            AgentEvent::Tokens {
+                agent_id: id(),
+                used: 42,
+            },
+            AgentEvent::Done {
+                agent_id: id(),
+                summary: "ok".into(),
+            },
+            AgentEvent::Failed {
+                agent_id: id(),
+                error: "no".into(),
+            },
             AgentEvent::Activity {
                 agent_id: id(),
                 payload: Box::new(Payload::Delta {

@@ -1575,34 +1575,50 @@ mod tests {
         events
     }
 
-    const BILLING_402: &str = r#"{"type":"error","error":{"type":"billing_error","message":"Insufficient balance"}}"#;
+    const BILLING_402: &str =
+        r#"{"type":"error","error":{"type":"billing_error","message":"Insufficient balance"}}"#;
     const SUBSCRIPTION_400: &str = r#"{"error":{"type":"billing_error","message":"This model is currently available only with a subscription"}}"#;
-    const FIREWALL_PAGE: &str = "<!DOCTYPE html><html><head><title>Attention Required! | Cloudflare</title></head></html>";
+    const FIREWALL_PAGE: &str =
+        "<!DOCTYPE html><html><head><title>Attention Required! | Cloudflare</title></head></html>";
 
     #[test]
     fn probe_verdicts_follow_the_classification_table() {
         use crate::model_access::Verdict;
         let v = |code, body| probe_verdict("mock", code, body);
-        assert_eq!(v(402, BILLING_402), Verdict::Paid("Insufficient balance".into()));
+        assert_eq!(
+            v(402, BILLING_402),
+            Verdict::Paid("Insufficient balance".into())
+        );
         // billing_error decides even when the status is not 402.
         assert!(matches!(v(400, SUBSCRIPTION_400), Verdict::Paid(r) if r.contains("subscription")));
-        assert!(matches!(v(403, r#"{"error":{"message":"no access"}}"#), Verdict::Paid(r) if r == "no access"));
-        assert!(matches!(v(404, r#"{"error":{"message":"model not found"}}"#), Verdict::NotChat(_)));
+        assert!(
+            matches!(v(403, r#"{"error":{"message":"no access"}}"#), Verdict::Paid(r) if r == "no access")
+        );
+        assert!(matches!(
+            v(404, r#"{"error":{"message":"model not found"}}"#),
+            Verdict::NotChat(_)
+        ));
         assert!(matches!(v(410, "{}"), Verdict::NotChat(r) if r == "HTTP 410"));
         assert!(matches!(v(422, "{}"), Verdict::NotChat(_)));
         assert_eq!(
             v(429, r#"{"error":{"message":"slow down"}}"#),
             Verdict::Unchecked("rate limited: slow down".into())
         );
-        assert!(matches!(v(401, r#"{"error":{"message":"bad key"}}"#), Verdict::BadKey(_)));
+        assert!(matches!(
+            v(401, r#"{"error":{"message":"bad key"}}"#),
+            Verdict::BadKey(_)
+        ));
         assert!(matches!(v(500, "oops"), Verdict::Unchecked(_)));
         assert!(matches!(v(503, "{}"), Verdict::Unchecked(_)));
         // A firewall page is never a verdict, even on a 403.
         assert!(matches!(v(403, FIREWALL_PAGE), Verdict::Unchecked(r) if r.contains("web page")));
         // A key echoed back in an error body never reaches the reason.
-        assert!(!v(402, r#"{"error":{"message":"key sk-abc123secret has no balance"}}"#)
-            .why()
-            .contains("abc123secret"));
+        assert!(!v(
+            402,
+            r#"{"error":{"message":"key sk-abc123secret has no balance"}}"#
+        )
+        .why()
+        .contains("abc123secret"));
     }
 
     fn access_file(name: &str) -> std::path::PathBuf {
@@ -1623,7 +1639,11 @@ mod tests {
             }
             let model = |m: &str| req.contains(&format!("\"model\":\"{m}\""));
             if model("ok") {
-                ("HTTP/1.1 200 OK", JSON, r#"{"choices":[{"message":{"content":"h"}}]}"#)
+                (
+                    "HTTP/1.1 200 OK",
+                    JSON,
+                    r#"{"choices":[{"message":{"content":"h"}}]}"#,
+                )
             } else if model("paid") {
                 ("HTTP/1.1 402 Payment Required", JSON, BILLING_402)
             } else if model("sub") {
@@ -1631,7 +1651,11 @@ mod tests {
             } else if model("gone") {
                 ("HTTP/1.1 410 Gone", JSON, "{}")
             } else if model("embed") {
-                ("HTTP/1.1 404 Not Found", JSON, r#"{"error":{"message":"not a chat model"}}"#)
+                (
+                    "HTTP/1.1 404 Not Found",
+                    JSON,
+                    r#"{"error":{"message":"not a chat model"}}"#,
+                )
             } else if model("flaky") {
                 ("HTTP/1.1 503 Service Unavailable", JSON, "{}")
             } else {
@@ -1659,9 +1683,15 @@ mod tests {
         {
             let seen = requests.lock().unwrap();
             assert_eq!(seen.len(), 8, "one list + one probe per model");
-            let probe = seen.iter().find(|r| r.contains("\"model\":\"ok\"")).unwrap();
+            let probe = seen
+                .iter()
+                .find(|r| r.contains("\"model\":\"ok\""))
+                .unwrap();
             assert!(probe.starts_with("POST /chat/completions"), "{probe}");
-            assert!(probe.contains("\"max_tokens\":1") && probe.contains("\"stream\":false"), "{probe}");
+            assert!(
+                probe.contains("\"max_tokens\":1") && probe.contains("\"stream\":false"),
+                "{probe}"
+            );
         }
         let stored = std::fs::read_to_string(&file).unwrap();
         assert!(!stored.contains("sk-test-key"));
@@ -1691,21 +1721,32 @@ mod tests {
                 let list = r#"{"data":[{"id":"m0"},{"id":"m1"},{"id":"m2"},{"id":"m3"},{"id":"m4"},{"id":"m5"},{"id":"m6"},{"id":"m7"},{"id":"m8"},{"id":"m9"},{"id":"m10"},{"id":"m11"},{"id":"m12"},{"id":"m13"},{"id":"m14"},{"id":"m15"},{"id":"m16"},{"id":"m17"},{"id":"m18"},{"id":"m19"}]}"#;
                 return ("HTTP/1.1 200 OK", "application/json", list);
             }
-            ("HTTP/1.1 429 Too Many Requests", "application/json", r#"{"error":{"type":"rate_limit_error","message":"Max 15 requests per minute"}}"#)
+            (
+                "HTTP/1.1 429 Too Many Requests",
+                "application/json",
+                r#"{"error":{"type":"rate_limit_error","message":"Max 15 requests per minute"}}"#,
+            )
         });
         let file = access_file("limited");
         let key = crate::model_access::entry_key("mock", "k", &base);
         let mut known = crate::model_access::Entry::fresh();
-        known.models.insert("m0".into(), crate::model_access::Verdict::Paid("Insufficient balance".into()));
+        known.models.insert(
+            "m0".into(),
+            crate::model_access::Verdict::Paid("Insufficient balance".into()),
+        );
         crate::model_access::store(&file, &key, &known);
 
-        let p = OpenAiCompatible::with_fixed(TEST_SERVICE, "k", &base).with_access_file(file.clone());
+        let p =
+            OpenAiCompatible::with_fixed(TEST_SERVICE, "k", &base).with_access_file(file.clone());
         let got = p.usable_models(true).unwrap();
         assert_eq!(got.hidden.len(), 1, "m0 stays hidden: {:?}", got.hidden);
         assert_eq!(got.models.len(), 19);
         assert_eq!(got.unchecked.len(), 19);
         let probes = requests.lock().unwrap().len() - 1;
-        assert!(probes < 19, "probing should stop after the first 429s, made {probes}");
+        assert!(
+            probes < 19,
+            "probing should stop after the first 429s, made {probes}"
+        );
         let entry = crate::model_access::load(&file, &key, crate::model_access::TTL).unwrap();
         assert_eq!(entry.models.len(), 1, "a 429 is never cached");
     }
@@ -1714,21 +1755,40 @@ mod tests {
     fn a_probe_refusing_the_key_fails_the_whole_listing() {
         let (base, _) = serve_by(|req| {
             if req.starts_with("GET") {
-                ("HTTP/1.1 200 OK", "application/json", r#"{"data":[{"id":"a"}]}"#)
+                (
+                    "HTTP/1.1 200 OK",
+                    "application/json",
+                    r#"{"data":[{"id":"a"}]}"#,
+                )
             } else {
-                ("HTTP/1.1 401 Unauthorized", "application/json", r#"{"error":{"message":"invalid key"}}"#)
+                (
+                    "HTTP/1.1 401 Unauthorized",
+                    "application/json",
+                    r#"{"error":{"message":"invalid key"}}"#,
+                )
             }
         });
         let p = OpenAiCompatible::with_fixed(TEST_SERVICE, "k", &base);
-        assert!(matches!(p.usable_models(false), Err(ProviderError::Auth(_))));
+        assert!(matches!(
+            p.usable_models(false),
+            Err(ProviderError::Auth(_))
+        ));
     }
 
     #[test]
     fn a_chat_turn_failing_with_402_hides_that_model_at_once() {
-        let (base, _) = serve("HTTP/1.1 402 Payment Required", "application/json", BILLING_402);
+        let (base, _) = serve(
+            "HTTP/1.1 402 Payment Required",
+            "application/json",
+            BILLING_402,
+        );
         let file = access_file("learn");
-        let p = OpenAiCompatible::with_fixed(TEST_SERVICE, "k", &base).with_access_file(file.clone());
-        let err = p.stream(&request(), &|| false, &mut |_| true).unwrap_err().to_string();
+        let p =
+            OpenAiCompatible::with_fixed(TEST_SERVICE, "k", &base).with_access_file(file.clone());
+        let err = p
+            .stream(&request(), &|| false, &mut |_| true)
+            .unwrap_err()
+            .to_string();
         let last = err.lines().last().unwrap();
         assert_eq!(
             last,
@@ -1741,9 +1801,14 @@ mod tests {
 
     #[test]
     fn a_chat_turn_failing_with_a_plain_400_hides_nothing() {
-        let (base, _) = serve("HTTP/1.1 400 Bad Request", "application/json", r#"{"error":{"message":"bad tools"}}"#);
+        let (base, _) = serve(
+            "HTTP/1.1 400 Bad Request",
+            "application/json",
+            r#"{"error":{"message":"bad tools"}}"#,
+        );
         let file = access_file("nolearn");
-        let p = OpenAiCompatible::with_fixed(TEST_SERVICE, "k", &base).with_access_file(file.clone());
+        let p =
+            OpenAiCompatible::with_fixed(TEST_SERVICE, "k", &base).with_access_file(file.clone());
         let err = p.stream(&request(), &|| false, &mut |_| true).unwrap_err();
         assert!(matches!(err, ProviderError::BadRequest(_)));
         assert!(!file.exists());
@@ -2059,10 +2124,19 @@ mod tests {
     fn an_html_outage_or_rate_limit_page_stays_retriable() {
         let page = "<html><head><title>502 Bad Gateway</title></head></html>";
         let e = classify_http_body("x", 503, None, page, "");
-        assert!(matches!(e, ProviderError::Server { status: 503, .. }) && e.is_retriable(), "{e:?}");
+        assert!(
+            matches!(e, ProviderError::Server { status: 503, .. }) && e.is_retriable(),
+            "{e:?}"
+        );
         let e = classify_http_body("x", 429, Some(Duration::from_secs(7)), page, "");
         assert!(
-            matches!(e, ProviderError::RateLimited { retry_after: Some(_), .. }),
+            matches!(
+                e,
+                ProviderError::RateLimited {
+                    retry_after: Some(_),
+                    ..
+                }
+            ),
             "{e:?}"
         );
     }
@@ -2073,7 +2147,9 @@ mod tests {
         let (base, _r) = serve("HTTP/1.1 403 Forbidden", "text/html", PAGE);
         let err = provider(&base).list_models().unwrap_err();
         match err {
-            ProviderError::Protocol(d) => assert!(d.contains("Cloudflare") && d.contains("web page"), "{d}"),
+            ProviderError::Protocol(d) => {
+                assert!(d.contains("Cloudflare") && d.contains("web page"), "{d}")
+            }
             other => panic!("expected Protocol, got {other:?}"),
         }
     }
@@ -2182,7 +2258,9 @@ mod tests {
         let status = p.detect();
         assert!(!status.configured);
         assert!(
-            status.detail.contains(&format!("se connect {} <api-url>", TEST_SERVICE.id)),
+            status
+                .detail
+                .contains(&format!("se connect {} <api-url>", TEST_SERVICE.id)),
             "{}",
             status.detail
         );

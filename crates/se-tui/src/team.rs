@@ -18,7 +18,8 @@ use crate::state::{AppState, Entry};
 /// provider, credential and catalogue construction.
 /// Returns the run and lines to show the operator (journal path, warnings).
 /// Starts a team file in the interface's current work mode.
-pub type Launcher = Box<dyn Fn(&Path, se_protocol::WorkMode) -> Result<(TeamRun, Vec<String>), String>>;
+pub type Launcher =
+    Box<dyn Fn(&Path, se_protocol::WorkMode) -> Result<(TeamRun, Vec<String>), String>>;
 
 #[derive(Default)]
 pub struct Panel {
@@ -261,10 +262,15 @@ mod tests {
         // The strip got the same run as agent events, activity included.
         let a = &state.agents.agents;
         assert_eq!(a.len(), 1);
-        assert_eq!((a[0].id.as_str(), a[0].state), ("a", se_protocol::AgentState::Done));
+        assert_eq!(
+            (a[0].id.as_str(), a[0].state),
+            ("a", se_protocol::AgentState::Done)
+        );
         assert!(a[0].ended.is_some());
         assert!(
-            a[0].transcript.iter().any(|e| matches!(e, Entry::Approval { .. })),
+            a[0].transcript
+                .iter()
+                .any(|e| matches!(e, Entry::Approval { .. })),
             "{:?}",
             a[0].transcript
         );

@@ -74,9 +74,15 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         // The agent's own transcript in the transcript area, with the same
         // wrapping and scroll handling, by lending it the slot.
         Some(i) => {
-            std::mem::swap(&mut state.transcript, &mut state.agents.agents[i].transcript);
+            std::mem::swap(
+                &mut state.transcript,
+                &mut state.agents.agents[i].transcript,
+            );
             draw_transcript(f, chunks[2], state);
-            std::mem::swap(&mut state.transcript, &mut state.agents.agents[i].transcript);
+            std::mem::swap(
+                &mut state.transcript,
+                &mut state.agents.agents[i].transcript,
+            );
         }
         None => draw_transcript(f, chunks[2], state),
     }
@@ -99,7 +105,11 @@ fn draw_sessions(f: &mut Frame, area: Rect, ov: &crate::sessions::Overlay, open:
     if area.height < 4 {
         return;
     }
-    let scope = if ov.all { "all recent projects" } else { "this project" };
+    let scope = if ov.all {
+        "all recent projects"
+    } else {
+        "this project"
+    };
     let title = format!(" conversations · {scope} · {} ", ov.items.len());
     f.render_widget(
         Block::default()
@@ -144,23 +154,40 @@ fn draw_sessions(f: &mut Frame, area: Rect, ov: &crate::sessions::Overlay, open:
         let pin = if r.pinned { "* " } else { "  " };
         let title_room = width.saturating_sub(meta.chars().count() + 4).max(10);
         lines.push(Line::from(vec![
-            Span::styled(if selected { "▌" } else { " " }, Style::default().fg(theme::LAVENDER)),
+            Span::styled(
+                if selected { "▌" } else { " " },
+                Style::default().fg(theme::LAVENDER),
+            ),
             Span::styled(pin, theme::accent()),
             Span::styled(
                 truncate(&r.title, title_room),
-                if selected { theme::accent_bold() } else { theme::base() },
+                if selected {
+                    theme::accent_bold()
+                } else {
+                    theme::base()
+                },
             ),
             Span::styled(meta, theme::muted()),
         ]));
     }
     f.render_widget(Paragraph::new(lines).style(theme::base()), inner);
     let prompt = match &ov.mode {
-        crate::sessions::Mode::Rename(buf) => format!("new title: {buf}▏  (Enter save · Esc cancel · empty = first message)"),
+        crate::sessions::Mode::Rename(buf) => {
+            format!("new title: {buf}▏  (Enter save · Esc cancel · empty = first message)")
+        }
         _ => ov.message.clone().unwrap_or_default(),
     };
-    let last = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
+    let last = Rect {
+        y: inner.y + inner.height.saturating_sub(1),
+        height: 1,
+        ..inner
+    };
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(truncate(&prompt, width), theme::accent()))).style(theme::base()),
+        Paragraph::new(Line::from(Span::styled(
+            truncate(&prompt, width),
+            theme::accent(),
+        )))
+        .style(theme::base()),
         last,
     );
 }
@@ -322,7 +349,11 @@ fn draw_strip(f: &mut Frame, area: Rect, state: &mut AppState) {
         Span::styled(" \u{25cf} ", Style::default().fg(c).bg(theme::CHARCOAL))
     };
     if strip.collapsed() {
-        let active = strip.agents.iter().filter(|a| !a.state.is_terminal()).count();
+        let active = strip
+            .agents
+            .iter()
+            .filter(|a| !a.state.is_terminal())
+            .count();
         let state_of_all = if active > 0 { S::Running } else { S::Done };
         lines.push(Line::from(vec![
             dot(state_of_all),
@@ -415,7 +446,11 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState) {
     spans.push(sep());
     spans.push(Span::styled(
         format!("{} mode", state.mode.name()),
-        if state.mode == se_protocol::WorkMode::Auto { Style::default().fg(theme::WARN).bg(theme::CHARCOAL) } else { theme::muted() },
+        if state.mode == se_protocol::WorkMode::Auto {
+            Style::default().fg(theme::WARN).bg(theme::CHARCOAL)
+        } else {
+            theme::muted()
+        },
     ));
     if let Some(agent) = &state.agent {
         spans.push(sep());
@@ -906,10 +941,20 @@ fn draw_help_bar(f: &mut Frame, area: Rect, state: &AppState) {
             Activity::AwaitingApproval { .. } => unreachable!("handled above"),
         }
     };
-    let mouse = if state.mouse_capture { "   F2 mouse:on   Shift+Tab mode" } else { "   F2 mouse:off   Shift+Tab mode" };
-    let mut spans = vec![Span::styled(hint, theme::muted()), Span::styled(mouse, theme::muted())];
+    let mouse = if state.mouse_capture {
+        "   F2 mouse:on   Shift+Tab mode"
+    } else {
+        "   F2 mouse:off   Shift+Tab mode"
+    };
+    let mut spans = vec![
+        Span::styled(hint, theme::muted()),
+        Span::styled(mouse, theme::muted()),
+    ];
     if state.agents.focus == crate::agents::Focus::Composer
-        && crate::agents::wants(state, &crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Down))
+        && crate::agents::wants(
+            state,
+            &crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Down),
+        )
     {
         spans.insert(1, Span::styled("   ↓ Agents", theme::muted()));
     }
@@ -962,7 +1007,9 @@ mod tests {
     /// screen, not only in a line printed to a terminal the alternate
     /// screen has already covered.
     fn strip_lines(out: &str) -> Vec<&str> {
-        out.lines().filter(|l| l.contains('\u{25cf}') && l.contains("task ")).collect()
+        out.lines()
+            .filter(|l| l.contains('\u{25cf}') && l.contains("task "))
+            .collect()
     }
 
     #[test]
@@ -1039,7 +1086,10 @@ mod tests {
         assert!(!out.contains("main chat answer"), "{out}");
         assert!(out.contains("Esc Back to agents"), "{out}");
         // Swapped back after drawing.
-        assert_eq!(state.transcript, vec![Entry::Assistant("main chat answer".into())]);
+        assert_eq!(
+            state.transcript,
+            vec![Entry::Assistant("main chat answer".into())]
+        );
         crate::agents::set_focus(&mut state, crate::agents::Focus::Composer);
         assert!(render(&mut state, 80, 20).contains("main chat answer"));
     }
@@ -1057,7 +1107,10 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         };
-        assert_eq!(crate::input::action_for_mouse(&state, click(0)), crate::Action::Nothing);
+        assert_eq!(
+            crate::input::action_for_mouse(&state, click(0)),
+            crate::Action::Nothing
+        );
         let a = crate::input::action_for_mouse(&state, click(y));
         crate::input::apply_local(&mut state, &a);
         assert_eq!(state.agents.focus, crate::agents::Focus::View(1));

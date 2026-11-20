@@ -129,9 +129,11 @@ fn main() -> std::process::ExitCode {
                 max_concurrent,
             } => team_cmd::resume(&cli, journal, *max_concurrent),
         },
-        Some(Command::Connect { provider, url, from_env }) => {
-            connect(provider.as_deref(), url.as_deref(), from_env.as_deref())
-        }
+        Some(Command::Connect {
+            provider,
+            url,
+            from_env,
+        }) => connect(provider.as_deref(), url.as_deref(), from_env.as_deref()),
         Some(Command::Disconnect { provider }) => disconnect(provider),
         Some(Command::Providers) => providers(),
         Some(Command::Models { provider, refresh }) => models(&cli, provider.as_deref(), *refresh),
@@ -175,9 +177,12 @@ fn resolve(cli: &Cli) -> Result<(String, String), String> {
     }
     let provider_id = match &cli.provider {
         Some(id) => {
-            let provider = registry
-                .get(id)
-                .ok_or_else(|| format!("{} is not a known provider — try `se providers`", shown_id(id)))?;
+            let provider = registry.get(id).ok_or_else(|| {
+                format!(
+                    "{} is not a known provider — try `se providers`",
+                    shown_id(id)
+                )
+            })?;
             let status = provider.detect();
             if !status.configured {
                 return Err(format!("`{id}` is not configured: {}", status.detail));
@@ -301,7 +306,8 @@ fn interactive(cli: &Cli, startup: se_protocol::Running) -> io::Result<()> {
     // `/team run <file>` builds its runner the same way `se team run`
     // does, at the moment it is asked for.
     let team_cli = cli.clone();
-    let launcher: se_tui::team::Launcher = Box::new(move |path, mode| team_cmd::start(&team_cli, path, mode));
+    let launcher: se_tui::team::Launcher =
+        Box::new(move |path, mode| team_cmd::start(&team_cli, path, mode));
     // `/resume` and `/new`: the same conversation + core building as
     // startup and `se --resume=<id>`.
     let open_resolved = resolved.clone();
@@ -328,9 +334,9 @@ fn interactive(cli: &Cli, startup: se_protocol::Running) -> io::Result<()> {
         doctor: Some(doctor_report(first_frame.duration)),
         remember_model: Some(std::sync::Arc::new(save_last_model)),
         list_providers: Some(std::sync::Arc::new(list_providers)),
-        save_key: Some(std::sync::Arc::new(|id: &str, key: &str, url: Option<&str>| {
-            store_and_validate(id, key, url)
-        })),
+        save_key: Some(std::sync::Arc::new(
+            |id: &str, key: &str, url: Option<&str>| store_and_validate(id, key, url),
+        )),
         copy: Some(std::sync::Arc::new(clipboard::copy)),
         default_model: resolved.as_ref().ok().map(|(p, m)| se_protocol::ModelRef {
             provider: p.clone(),
@@ -338,12 +344,21 @@ fn interactive(cli: &Cli, startup: se_protocol::Running) -> io::Result<()> {
         }),
         open_session: Some(opener),
         session_id: Some(convo.id.clone()),
-        sessions_dir: cwd.as_deref().map(se_core::session_store::default_sessions_dir),
+        sessions_dir: cwd
+            .as_deref()
+            .map(se_core::session_store::default_sessions_dir),
         recent_projects: recent_projects_path(),
         mode: cli.mode,
     };
     let prior = prior_entries(&convo, resolved.is_err());
-    let result = se_tui::run(&mut terminal, &mut core, banner, specialists, services, prior);
+    let result = se_tui::run(
+        &mut terminal,
+        &mut core,
+        banner,
+        specialists,
+        services,
+        prior,
+    );
     core.shutdown();
     restore()?;
 
@@ -447,8 +462,11 @@ fn open_core(
         // One event log per core: task ids restart in every core, so two
         // must never share a log file. Named `<id>.<ms>.` so it travels
         // with its conversation (`/resume` delete and undo).
-        let path = se_core::session_store::default_sessions_dir(&cwd)
-            .join(format!("{}.{}.events.jsonl", convo.id, unix_ms()));
+        let path = se_core::session_store::default_sessions_dir(&cwd).join(format!(
+            "{}.{}.events.jsonl",
+            convo.id,
+            unix_ms()
+        ));
         if let Err(e) = core.attach_session_log(&path) {
             banner = Some(match banner {
                 Some(existing) => format!("{existing} — also: session not logged ({e})"),
@@ -528,7 +546,8 @@ fn ask_approval(prefix: &str, name: &str, summary: &str) -> bool {
 }
 
 fn parse_mode(s: &str) -> Result<se_protocol::WorkMode, String> {
-    se_protocol::WorkMode::parse(s).ok_or_else(|| format!("`{s}` is not a mode: use manual, auto or plan"))
+    se_protocol::WorkMode::parse(s)
+        .ok_or_else(|| format!("`{s}` is not a mode: use manual, auto or plan"))
 }
 
 fn exec(cli: &Cli, request: &str) -> std::process::ExitCode {
@@ -688,7 +707,10 @@ fn connect(
         return std::process::ExitCode::from(2);
     };
     let Some(provider) = registry.get(id) else {
-        eprintln!("se: {} is not a known provider — run `se connect` to list them", shown_id(id));
+        eprintln!(
+            "se: {} is not a known provider — run `se connect` to list them",
+            shown_id(id)
+        );
         return std::process::ExitCode::from(2);
     };
     // An agent CLI keeps its own login: there is nothing to paste.
@@ -830,26 +852,25 @@ fn store_and_validate(id: &str, secret: &str, url: Option<&str>) -> Result<Strin
         .ok_or_else(|| format!("{id}'s address cannot receive a key; nothing was saved"))?;
     // Checked before anything is written, so a rejected key never replaces a working one.
     let candidate = se_provider::OpenAiCompatible::with_fixed(service, secret, &base);
-    let models = se_provider::ModelProvider::validate(&candidate)
-        .map_err(|e| {
-            // Only an API's own 401/403 means the key was refused; anything else means the key
-            // was never checked, and saying "refused" sent the user hunting for a key problem.
-            let why = match &e {
-                se_provider::ProviderError::Auth(_) => format!("{id} refused that key"),
-                se_provider::ProviderError::BadRequest(_) => format!(
-                    "the key was not checked: there is no model list at {base}/models, so the \
+    let models = se_provider::ModelProvider::validate(&candidate).map_err(|e| {
+        // Only an API's own 401/403 means the key was refused; anything else means the key
+        // was never checked, and saying "refused" sent the user hunting for a key problem.
+        let why = match &e {
+            se_provider::ProviderError::Auth(_) => format!("{id} refused that key"),
+            se_provider::ProviderError::BadRequest(_) => format!(
+                "the key was not checked: there is no model list at {base}/models, so the \
                      address is probably wrong (it is usually the API root, ending in /v1)"
-                ),
-                se_provider::ProviderError::Protocol(_) => format!(
-                    "the key was not checked: {base} answered with something that is not an API \
+            ),
+            se_provider::ProviderError::Protocol(_) => format!(
+                "the key was not checked: {base} answered with something that is not an API \
                      (a web page or a firewall block?), so check the address"
-                ),
-                _ => format!("the key was not checked: {id} could not be reached"),
-            };
-            // A provider's error body may quote the key back; never show it unredacted.
-            let detail = credentials::redact_secrets(&e.to_string());
-            format!("{why} ({detail}). Nothing was saved; any key stored before is unchanged.")
-        })?;
+            ),
+            _ => format!("the key was not checked: {id} could not be reached"),
+        };
+        // A provider's error body may quote the key back; never show it unredacted.
+        let detail = credentials::redact_secrets(&e.to_string());
+        format!("{why} ({detail}). Nothing was saved; any key stored before is unchanged.")
+    })?;
     credentials::store(id, secret, Some(&origin))
         .map_err(|e| format!("could not save the key for {id}: {e}"))?;
     // Written only once the key is stored, so a failed save never leaves a new address
@@ -956,7 +977,13 @@ fn list_providers() -> Vec<se_tui::ProviderEntry> {
                         };
                         (true, true, line)
                     } else if p.current_origin().is_none() {
-                        (true, false, format!("needs its API address: /connect {id} https://<api-address>/v1"))
+                        (
+                            true,
+                            false,
+                            format!(
+                                "needs its API address: /connect {id} https://<api-address>/v1"
+                            ),
+                        )
                     } else {
                         (
                             true,

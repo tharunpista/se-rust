@@ -167,7 +167,11 @@ pub fn agent_state(state: NodeState) -> Option<AgentState> {
 
 /// First line of `text`, at most `max` chars.
 pub(crate) fn one_line(text: &str, max: usize) -> String {
-    let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let line = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
     match line.char_indices().nth(max) {
         Some((at, _)) => format!("{}…", &line[..at]),
         None => line.to_string(),
@@ -410,25 +414,26 @@ impl TeamRun {
                 continue;
             }
             let agent_id = id.clone();
-            self.agent_events.push(match (state, self.outcomes.get(id)) {
-                (AgentState::Done, outcome) => AgentEvent::Done {
-                    agent_id,
-                    summary: match outcome {
-                        Some(Outcome::Completed { final_text }) => one_line(final_text, 120),
-                        _ => String::new(),
+            self.agent_events
+                .push(match (state, self.outcomes.get(id)) {
+                    (AgentState::Done, outcome) => AgentEvent::Done {
+                        agent_id,
+                        summary: match outcome {
+                            Some(Outcome::Completed { final_text }) => one_line(final_text, 120),
+                            _ => String::new(),
+                        },
                     },
-                },
-                (AgentState::Failed, outcome) => AgentEvent::Failed {
-                    agent_id,
-                    error: match outcome {
-                        Some(Outcome::Failed { detail }) => one_line(detail, 120),
-                        Some(Outcome::Incomplete { reason, .. }) => one_line(reason, 120),
-                        Some(other) => other.label().to_string(),
-                        None => "failed".to_string(),
+                    (AgentState::Failed, outcome) => AgentEvent::Failed {
+                        agent_id,
+                        error: match outcome {
+                            Some(Outcome::Failed { detail }) => one_line(detail, 120),
+                            Some(Outcome::Incomplete { reason, .. }) => one_line(reason, 120),
+                            Some(other) => other.label().to_string(),
+                            None => "failed".to_string(),
+                        },
                     },
-                },
-                (state, _) => AgentEvent::State { agent_id, state },
-            });
+                    (state, _) => AgentEvent::State { agent_id, state },
+                });
         }
     }
 
@@ -1082,7 +1087,12 @@ mod tests {
         let spawned: Vec<&str> = events
             .iter()
             .filter_map(|e| match e {
-                AgentEvent::Spawned { agent_id, role, parent, task } => {
+                AgentEvent::Spawned {
+                    agent_id,
+                    role,
+                    parent,
+                    task,
+                } => {
                     assert_eq!((role.as_str(), parent), ("backend-lead", &None));
                     assert!(!task.is_empty());
                     Some(agent_id.as_str())

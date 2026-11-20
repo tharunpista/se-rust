@@ -5,7 +5,9 @@
 //! now" in one readable place and lets the keymap be tested exhaustively
 //! without a terminal.
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 
 use crate::state::{Activity, AppState};
 
@@ -78,7 +80,9 @@ fn pasted_text(key: &KeyEvent) -> Option<char> {
     }
     let m = key.modifiers - KeyModifiers::SHIFT;
     match key.code {
-        KeyCode::Char(c) if m.is_empty() || m == KeyModifiers::CONTROL | KeyModifiers::ALT => Some(c),
+        KeyCode::Char(c) if m.is_empty() || m == KeyModifiers::CONTROL | KeyModifiers::ALT => {
+            Some(c)
+        }
         KeyCode::Enter if key.modifiers.is_empty() => Some('\n'),
         KeyCode::Tab if key.modifiers.is_empty() => Some('\t'),
         _ => None,
@@ -96,16 +100,17 @@ pub fn coalesce_paste(events: Vec<Event>) -> Vec<Event> {
     let mut run: Vec<Event> = Vec::new();
     let mut text = String::new();
     let mut presses = 0;
-    let flush = |out: &mut Vec<Event>, run: &mut Vec<Event>, text: &mut String, presses: &mut usize| {
-        if *presses >= 2 {
-            out.push(Event::Paste(std::mem::take(text)));
-            run.clear();
-        } else {
-            out.append(run);
-            text.clear();
-        }
-        *presses = 0;
-    };
+    let flush =
+        |out: &mut Vec<Event>, run: &mut Vec<Event>, text: &mut String, presses: &mut usize| {
+            if *presses >= 2 {
+                out.push(Event::Paste(std::mem::take(text)));
+                run.clear();
+            } else {
+                out.append(run);
+                text.clear();
+            }
+            *presses = 0;
+        };
     for ev in events {
         match &ev {
             Event::Key(k) if pasted_text(k).is_some() => {
@@ -430,7 +435,11 @@ mod tests {
     fn burst(s: &str) -> Vec<Event> {
         s.chars()
             .flat_map(|c| {
-                let code = if c == '\n' { KeyCode::Enter } else { KeyCode::Char(c) };
+                let code = if c == '\n' {
+                    KeyCode::Enter
+                } else {
+                    KeyCode::Char(c)
+                };
                 let mut up = press(code);
                 up.kind = KeyEventKind::Release;
                 [Event::Key(press(code)), Event::Key(up)]
@@ -457,9 +466,12 @@ mod tests {
     }
 
     fn sends_or_decides(acted: &[Action]) -> bool {
-        acted
-            .iter()
-            .any(|a| matches!(a, Action::Submit(_) | Action::Decide(_) | Action::PickerAccept))
+        acted.iter().any(|a| {
+            matches!(
+                a,
+                Action::Submit(_) | Action::Decide(_) | Action::PickerAccept
+            )
+        })
     }
 
     #[test]
@@ -507,7 +519,10 @@ mod tests {
         assert!(s.picker.is_open(), "a typed / still opens the picker");
 
         let mut s = awaiting();
-        assert_eq!(feed(&mut s, burst("y")), vec![Action::Decide(true), Action::Nothing]);
+        assert_eq!(
+            feed(&mut s, burst("y")),
+            vec![Action::Decide(true), Action::Nothing]
+        );
     }
 
     #[test]
@@ -664,11 +679,23 @@ mod tests {
         let shown = std::time::Instant::now();
         s.approval_shown_at = Some(shown);
         let early = shown + crate::state::APPROVAL_ARM_DELAY / 2;
-        assert_eq!(action_for_key_at(&s, press(KeyCode::Char('y')), early), Action::Nothing);
-        assert_eq!(action_for_key_at(&s, press(KeyCode::Char('n')), early), Action::Nothing);
+        assert_eq!(
+            action_for_key_at(&s, press(KeyCode::Char('y')), early),
+            Action::Nothing
+        );
+        assert_eq!(
+            action_for_key_at(&s, press(KeyCode::Char('n')), early),
+            Action::Nothing
+        );
         let late = shown + crate::state::APPROVAL_ARM_DELAY;
-        assert_eq!(action_for_key_at(&s, press(KeyCode::Char('y')), late), Action::Decide(true));
-        assert_eq!(action_for_key_at(&s, press(KeyCode::Char('n')), late), Action::Decide(false));
+        assert_eq!(
+            action_for_key_at(&s, press(KeyCode::Char('y')), late),
+            Action::Decide(true)
+        );
+        assert_eq!(
+            action_for_key_at(&s, press(KeyCode::Char('n')), late),
+            Action::Decide(false)
+        );
     }
 
     #[test]
@@ -676,8 +703,14 @@ mod tests {
         let mut s = awaiting();
         s.composer.set("draft".to_string());
         // y/n type into the draft; Enter does not send it; Esc still interrupts.
-        assert_eq!(action_for_key(&s, press(KeyCode::Char('y'))), Action::InsertChar('y'));
-        assert_eq!(action_for_key(&s, press(KeyCode::Char('n'))), Action::InsertChar('n'));
+        assert_eq!(
+            action_for_key(&s, press(KeyCode::Char('y'))),
+            Action::InsertChar('y')
+        );
+        assert_eq!(
+            action_for_key(&s, press(KeyCode::Char('n'))),
+            Action::InsertChar('n')
+        );
         assert_eq!(action_for_key(&s, press(KeyCode::Enter)), Action::Nothing);
         assert_eq!(action_for_key(&s, press(KeyCode::Esc)), Action::Interrupt);
         // A '/' in the draft does not open the picker over the prompt.
@@ -686,7 +719,10 @@ mod tests {
         assert!(!s.picker.is_open());
         // Once cleared, the answer keys work again.
         apply_local(&mut s, &Action::ClearComposer);
-        assert_eq!(action_for_key(&s, press(KeyCode::Char('y'))), Action::Decide(true));
+        assert_eq!(
+            action_for_key(&s, press(KeyCode::Char('y'))),
+            Action::Decide(true)
+        );
     }
 
     #[test]

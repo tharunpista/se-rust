@@ -12,7 +12,9 @@
 
 fn home() -> std::path::PathBuf {
     std::path::PathBuf::from(
-        std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default(),
+        std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_default(),
     )
 }
 

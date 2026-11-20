@@ -10,13 +10,19 @@ use std::path::PathBuf;
 
 fn home() -> std::path::PathBuf {
     std::path::PathBuf::from(
-        std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default(),
+        std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_default(),
     )
 }
 
 fn real_roots() -> Vec<PathBuf> {
     let h = home();
-    vec![h.join("SE/se/skills"), h.join("SE/.agents/skills"), h.join(".claude/skills")]
+    vec![
+        h.join("SE/se/skills"),
+        h.join("SE/.agents/skills"),
+        h.join(".claude/skills"),
+    ]
 }
 
 #[test]

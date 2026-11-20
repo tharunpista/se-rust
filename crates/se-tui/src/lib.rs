@@ -138,40 +138,40 @@ pub fn run<B: Backend>(
                 batch.push(event::read()?);
             }
             for ev in input::coalesce_paste(batch) {
-            match ev {
-                Event::Key(key) => {
-                    // Recorded before the action is resolved, so the
-                    // probe sees what the terminal delivered even for a
-                    // chord SE does not currently bind.
-                    state.keys.observe(key);
-                    let action = action_for_key(&state, key);
-                    dirty |= dispatch_with(&mut state, core, &mut panel, action);
-                }
-                Event::Mouse(mouse) => {
-                    let action = action_for_mouse(&state, mouse);
-                    dirty |= dispatch_with(&mut state, core, &mut panel, action);
-                }
-                Event::Paste(text) => {
-                    // Bracketed paste must be enabled by the binary for
-                    // this arm to ever fire; see `se`'s `enter()`.
-                    // Pasted text, including embedded newlines, is
-                    // inserted verbatim rather than key-by-key, so a
-                    // multi-line paste cannot submit on its first
-                    // newline the way un-bracketed paste would.
-                    if state.sessions.is_some() {
-                        sessions::paste(&mut state, &text);
-                    } else {
-                        state.composer.insert_str(&text);
+                match ev {
+                    Event::Key(key) => {
+                        // Recorded before the action is resolved, so the
+                        // probe sees what the terminal delivered even for a
+                        // chord SE does not currently bind.
+                        state.keys.observe(key);
+                        let action = action_for_key(&state, key);
+                        dirty |= dispatch_with(&mut state, core, &mut panel, action);
                     }
+                    Event::Mouse(mouse) => {
+                        let action = action_for_mouse(&state, mouse);
+                        dirty |= dispatch_with(&mut state, core, &mut panel, action);
+                    }
+                    Event::Paste(text) => {
+                        // Bracketed paste must be enabled by the binary for
+                        // this arm to ever fire; see `se`'s `enter()`.
+                        // Pasted text, including embedded newlines, is
+                        // inserted verbatim rather than key-by-key, so a
+                        // multi-line paste cannot submit on its first
+                        // newline the way un-bracketed paste would.
+                        if state.sessions.is_some() {
+                            sessions::paste(&mut state, &text);
+                        } else {
+                            state.composer.insert_str(&text);
+                        }
+                        dirty = true;
+                    }
+                    Event::Resize(_, _) => dirty = true,
+                    _ => {}
+                }
+                if state.switch_to.is_some() {
+                    switch_session(&mut state, core);
                     dirty = true;
                 }
-                Event::Resize(_, _) => dirty = true,
-                _ => {}
-            }
-            if state.switch_to.is_some() {
-                switch_session(&mut state, core);
-                dirty = true;
-            }
             }
         }
 
@@ -299,7 +299,10 @@ fn dispatch_with(
             let text = if trimmed.starts_with("//") {
                 trimmed[1..].to_string()
             } else if trimmed.starts_with('/')
-                && trimmed[1..].chars().next().is_some_and(|c| !c.is_whitespace())
+                && trimmed[1..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| !c.is_whitespace())
             {
                 let word = trimmed[1..].split_whitespace().next().unwrap_or("");
                 state.push(Entry::Notice(unknown_command(&state.commands, word)));
@@ -323,7 +326,8 @@ fn dispatch_with(
         }
         Action::CycleMode => {
             let all = se_protocol::WorkMode::ALL;
-            let next = all[(all.iter().position(|m| *m == state.mode).unwrap_or(0) + 1) % all.len()];
+            let next =
+                all[(all.iter().position(|m| *m == state.mode).unwrap_or(0) + 1) % all.len()];
             set_mode(state, core, next);
             true
         }
@@ -513,7 +517,9 @@ fn unknown_command(commands: &se_command::Registry, word: &str) -> String {
         .min_by_key(|(d, _)| *d);
     match best {
         Some((_, p)) => format!("unknown command /{word} \u{2014} did you mean /{p}?"),
-        None => format!("unknown command /{word} (start with // to send a message beginning with /)"),
+        None => {
+            format!("unknown command /{word} (start with // to send a message beginning with /)")
+        }
     }
 }
 
@@ -729,13 +735,25 @@ fn mouse_notice(on: bool) -> &'static str {
 /// `/copy [N]`: the Nth-from-last answer's stored text onto the clipboard.
 fn copy_answer(state: &mut AppState, raw_args: &str) {
     let arg = raw_args.trim();
-    let n = if arg.is_empty() { Some(1) } else { arg.parse::<usize>().ok().filter(|n| *n >= 1) };
+    let n = if arg.is_empty() {
+        Some(1)
+    } else {
+        arg.parse::<usize>().ok().filter(|n| *n >= 1)
+    };
     let Some(n) = n else {
-        state.push(Entry::Notice(format!("/copy takes a number (1 = last answer), not {arg:?}")));
+        state.push(Entry::Notice(format!(
+            "/copy takes a number (1 = last answer), not {arg:?}"
+        )));
         return;
     };
-    let Some(text) = state.nth_last_answer(n).filter(|t| !t.is_empty()).map(str::to_string) else {
-        state.push(Entry::Notice(format!("nothing to copy: there is no answer #{n} from the end")));
+    let Some(text) = state
+        .nth_last_answer(n)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+    else {
+        state.push(Entry::Notice(format!(
+            "nothing to copy: there is no answer #{n} from the end"
+        )));
         return;
     };
     let notice = match state.copy.0.clone() {
@@ -797,8 +815,8 @@ fn open_connect(state: &mut AppState, id: Option<String>) {
     let inbox = state.inbox.clone();
     std::thread::spawn(move || {
         // A panicking lister still answers (with nothing), so the pending lookup clears.
-        let list = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lister()))
-            .unwrap_or_default();
+        let list =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lister())).unwrap_or_default();
         inbox.send(services::Inbound::Providers(list));
     });
 }
@@ -850,7 +868,10 @@ fn open_address_field(state: &mut AppState, p: services::ProviderEntry, why: Opt
     )));
     state.composer.clear();
     state.picker.close();
-    state.connect = Some(state::ConnectStep::Address { id: p.id, name: p.name });
+    state.connect = Some(state::ConnectStep::Address {
+        id: p.id,
+        name: p.name,
+    });
 }
 
 /// Checks a typed or pasted address. A key pasted here is neither echoed nor kept.
@@ -886,7 +907,11 @@ fn open_key_field(state: &mut AppState, p: services::ProviderEntry, url: Option<
     )));
     state.composer.clear();
     state.picker.close();
-    state.connect = Some(state::ConnectStep::Key { id: p.id, name: p.name, url });
+    state.connect = Some(state::ConnectStep::Key {
+        id: p.id,
+        name: p.name,
+        url,
+    });
 }
 
 fn save_key(state: &mut AppState, id: &str, name: &str, url: Option<String>, key: &str) {
@@ -980,17 +1005,22 @@ fn usage_line(u: &se_protocol::Usage) -> String {
 /// the old one, then swaps cores and redraws. A failure to open leaves the
 /// current conversation untouched.
 pub fn switch_session(state: &mut AppState, core: &mut CoreHandle) {
-    let Some(target) = state.switch_to.take() else { return };
+    let Some(target) = state.switch_to.take() else {
+        return;
+    };
     let Some(open) = state.open_session.0.clone() else {
         state.push(Entry::Notice(
-            "switching conversation is unavailable here: quit and run `se` or `se --resume=<id>`".to_string(),
+            "switching conversation is unavailable here: quit and run `se` or `se --resume=<id>`"
+                .to_string(),
         ));
         return;
     };
     let opened = match open(target.as_deref()) {
         Ok(o) => o,
         Err(e) => {
-            state.push(Entry::Notice(format!("could not open the conversation: {e}")));
+            state.push(Entry::Notice(format!(
+                "could not open the conversation: {e}"
+            )));
             return;
         }
     };
@@ -1019,7 +1049,9 @@ pub fn switch_session(state: &mut AppState, core: &mut CoreHandle) {
 
 /// Writes `<id>.model` beside the conversation, for the `/resume` list.
 fn record_model(state: &AppState) {
-    if let (Some(dir), Some(id), Some(model)) = (&state.sessions_dir, &state.session_id, &state.turn_model) {
+    if let (Some(dir), Some(id), Some(model)) =
+        (&state.sessions_dir, &state.session_id, &state.turn_model)
+    {
         // shortcut: best effort; a lost write only blanks the picker's model column.
         let _ = std::fs::write(dir.join(format!("{id}.model")), model);
     }
@@ -1066,7 +1098,9 @@ fn refresh_models(state: &mut AppState) {
                 .to_string(),
         ));
     } else {
-        state.push(Entry::Notice("model listing is not available here".to_string()));
+        state.push(Entry::Notice(
+            "model listing is not available here".to_string(),
+        ));
     }
 }
 
@@ -1890,7 +1924,10 @@ mod tests {
                 provider: "apinex".into(),
                 models: Ok(vec!["good".into(), "maybe".into()]),
                 unchecked: vec!["maybe".into()],
-                note: Some("3 hidden: 3 need a subscription or balance — /models refresh to re-check".into()),
+                note: Some(
+                    "3 hidden: 3 need a subscription or balance — /models refresh to re-check"
+                        .into(),
+                ),
             }]
         });
         state.model_listing = services::Listing::new(Some(lister));
@@ -1929,7 +1966,11 @@ mod tests {
         let n = calls.clone();
         let lister: services::ModelLister = std::sync::Arc::new(move |_| {
             let first = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
-            let models = if first { vec!["old", "kept"] } else { vec!["kept", "new"] };
+            let models = if first {
+                vec!["old", "kept"]
+            } else {
+                vec!["kept", "new"]
+            };
             vec![services::ProviderModels {
                 provider: "nvidia".into(),
                 models: Ok(models.into_iter().map(String::from).collect()),
@@ -1939,7 +1980,11 @@ mod tests {
         });
         state.model_listing = services::Listing::new(Some(lister));
         let paths = |state: &AppState| -> Vec<String> {
-            state.picker_candidates().iter().map(|c| c.path.clone()).collect()
+            state
+                .picker_candidates()
+                .iter()
+                .map(|c| c.path.clone())
+                .collect()
         };
 
         run_command(&mut state, &core, "models", "");
@@ -2054,10 +2099,22 @@ mod tests {
             })
             .collect();
         assert!(notices[0].starts_with("nothing to copy"), "{notices:?}");
-        assert!(notices.contains(&"copied 7 chars".to_string()), "{notices:?}");
-        assert!(notices.contains(&"copied 25 chars".to_string()), "{notices:?}");
-        assert!(notices.iter().any(|n| n.contains("no answer #3")), "{notices:?}");
-        assert!(notices.iter().any(|n| n.contains("/copy takes a number")), "{notices:?}");
+        assert!(
+            notices.contains(&"copied 7 chars".to_string()),
+            "{notices:?}"
+        );
+        assert!(
+            notices.contains(&"copied 25 chars".to_string()),
+            "{notices:?}"
+        );
+        assert!(
+            notices.iter().any(|n| n.contains("no answer #3")),
+            "{notices:?}"
+        );
+        assert!(
+            notices.iter().any(|n| n.contains("/copy takes a number")),
+            "{notices:?}"
+        );
         core.shutdown();
     }
 
@@ -2077,7 +2134,11 @@ mod tests {
         run_command(&mut state, &core, "mode", "plan");
         assert_eq!(state.mode, WorkMode::Plan);
         run_command(&mut state, &core, "mode", "sideways");
-        assert_eq!(state.mode, WorkMode::Plan, "an unknown mode changes nothing");
+        assert_eq!(
+            state.mode,
+            WorkMode::Plan,
+            "an unknown mode changes nothing"
+        );
         core.shutdown();
     }
 
@@ -2085,7 +2146,10 @@ mod tests {
     fn mouse_capture_starts_off_and_f2_and_slash_mouse_toggle_it() {
         let core = se_core::start(EchoRunner::instant());
         let mut state = AppState::new();
-        assert!(!state.mouse_capture, "off by default so the terminal can select text");
+        assert!(
+            !state.mouse_capture,
+            "off by default so the terminal can select text"
+        );
         let f2 = action_for_key(&state, key_code(crossterm::event::KeyCode::F(2)));
         assert_eq!(f2, Action::ToggleMouse);
         dispatch(&mut state, &core, f2.clone());
@@ -2205,13 +2269,14 @@ mod tests {
                 },
             ]
         });
-        let saver: services::KeySaver = std::sync::Arc::new(move |id: &str, key: &str, _url: Option<&str>| {
-            saved
-                .lock()
-                .unwrap()
-                .push((id.to_string(), key.to_string()));
-            Ok(format!("{id}: key saved"))
-        });
+        let saver: services::KeySaver =
+            std::sync::Arc::new(move |id: &str, key: &str, _url: Option<&str>| {
+                saved
+                    .lock()
+                    .unwrap()
+                    .push((id.to_string(), key.to_string()));
+                Ok(format!("{id}: key saved"))
+            });
         state.list_providers = services::Hook(Some(lister));
         state.save_key = services::Hook(Some(saver));
         state
@@ -2248,13 +2313,22 @@ mod tests {
         };
 
         submit(&mut state, "/connect apinex");
-        assert!(matches!(state.connect, Some(state::ConnectStep::Address { .. })));
+        assert!(matches!(
+            state.connect,
+            Some(state::ConnectStep::Address { .. })
+        ));
 
         submit(&mut state, key); // pasted into the wrong field
-        assert!(matches!(state.connect, Some(state::ConnectStep::Address { .. })));
+        assert!(matches!(
+            state.connect,
+            Some(state::ConnectStep::Address { .. })
+        ));
 
         submit(&mut state, "https://api.example.com/v1");
-        assert!(matches!(state.connect, Some(state::ConnectStep::Key { .. })));
+        assert!(matches!(
+            state.connect,
+            Some(state::ConnectStep::Key { .. })
+        ));
 
         submit(&mut state, key);
         drain_until(&mut state, |_| got.lock().unwrap().is_some());
@@ -2303,7 +2377,10 @@ mod tests {
         for e in core.drain() {
             state.apply(&e);
         }
-        assert!(!state.transcript.iter().any(|e| matches!(e, Entry::User(_))), "nothing sent");
+        assert!(
+            !state.transcript.iter().any(|e| matches!(e, Entry::User(_))),
+            "nothing sent"
+        );
         assert!(
             !state.transcript.iter().any(|e| match e {
                 Entry::User(t) | Entry::Notice(t) | Entry::Assistant(t) => t.contains(key),
@@ -2332,13 +2409,19 @@ mod tests {
         });
         dispatch(&mut state, &core, Action::Submit("/models".to_string()));
         dispatch(&mut state, &core, Action::Submit("two words".to_string()));
-        assert!(matches!(state.connect, Some(state::ConnectStep::Key { .. })), "still open");
+        assert!(
+            matches!(state.connect, Some(state::ConnectStep::Key { .. })),
+            "still open"
+        );
 
         state.connect = None;
         state.connect_pending = Some("openai".to_string());
         dispatch(&mut state, &core, Action::Submit("hello model".to_string()));
         std::thread::sleep(Duration::from_millis(50));
-        assert!(core.drain().is_empty(), "nothing reached the core while pending");
+        assert!(
+            core.drain().is_empty(),
+            "nothing reached the core while pending"
+        );
 
         state.connect_pending = None;
         state.activity = Activity::Working {
@@ -2388,12 +2471,21 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         assert!(core.drain().is_empty(), "nothing reached the core");
         let n = notices(&state);
-        assert!(n.iter().any(|t| t == "unknown command /hepl \u{2014} did you mean /help?"), "{n:?}");
         assert!(
-            n.iter().any(|t| t.starts_with("unknown command /zzzzqqqq") && !t.contains("did you mean")),
+            n.iter()
+                .any(|t| t == "unknown command /hepl \u{2014} did you mean /help?"),
             "{n:?}"
         );
-        assert_eq!(state.composer.text(), "/zzzzqqqq", "the draft is kept to fix");
+        assert!(
+            n.iter()
+                .any(|t| t.starts_with("unknown command /zzzzqqqq") && !t.contains("did you mean")),
+            "{n:?}"
+        );
+        assert_eq!(
+            state.composer.text(),
+            "/zzzzqqqq",
+            "the draft is kept to fix"
+        );
 
         // A known command still runs.
         dispatch(&mut state, &core, Action::Submit("/exit".to_string()));
@@ -2405,13 +2497,19 @@ mod tests {
     fn a_double_slash_sends_the_literal_slash_message() {
         let core = se_core::start(EchoRunner::instant());
         let mut state = AppState::new();
-        dispatch(&mut state, &core, Action::Submit("//help is a word".to_string()));
+        dispatch(
+            &mut state,
+            &core,
+            Action::Submit("//help is a word".to_string()),
+        );
         assert!(pump_until_idle(&mut state, &core, Duration::from_secs(5)));
         assert!(state
             .transcript
             .iter()
             .any(|e| matches!(e, Entry::User(t) if t == "/help is a word")));
-        assert!(!notices(&state).iter().any(|t| t.contains("unknown command")));
+        assert!(!notices(&state)
+            .iter()
+            .any(|t| t.contains("unknown command")));
         core.shutdown();
     }
 
@@ -2425,16 +2523,25 @@ mod tests {
         for l in loaded {
             register_loaded(&mut state, l);
         }
-        assert_eq!(state.commands.resolve("help").unwrap().id, "help", "help is protected");
+        assert_eq!(
+            state.commands.resolve("help").unwrap().id,
+            "help",
+            "help is protected"
+        );
         assert_eq!(
             state.commands.resolve("sessions").unwrap().handler,
             se_command::HandlerKind::PromptTemplate,
             "the override takes effect"
         );
         let n = notices(&state);
-        assert!(n.iter().any(|t| t.contains("/help cannot be redefined")), "{n:?}");
+        assert!(
+            n.iter().any(|t| t.contains("/help cannot be redefined")),
+            "{n:?}"
+        );
         assert_eq!(
-            n.iter().filter(|t| t.contains("built-in sessions is hidden")).count(),
+            n.iter()
+                .filter(|t| t.contains("built-in sessions is hidden"))
+                .count(),
             1,
             "{n:?}"
         );
@@ -2659,7 +2766,10 @@ mod tests {
         assert!(!core.is_busy(), "a command is never a turn");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while set.lock().unwrap().is_empty() {
-            assert!(std::time::Instant::now() < deadline, "never reached the runner");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never reached the runner"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
         core.shutdown();
@@ -2733,7 +2843,10 @@ mod tests {
     fn save_convo(dir: &std::path::Path, id: &str, ask: &str, answer: &str) {
         use se_provider::{Message, Role};
         std::fs::create_dir_all(dir).unwrap();
-        let json = serde_json_free(&[Message::text(Role::User, ask), Message::text(Role::Assistant, answer)]);
+        let json = serde_json_free(&[
+            Message::text(Role::User, ask),
+            Message::text(Role::Assistant, answer),
+        ]);
         std::fs::write(dir.join(format!("{id}.conversation.json")), json).unwrap();
     }
 
@@ -2752,7 +2865,10 @@ mod tests {
         let next = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1000));
         std::sync::Arc::new(move |id: Option<&str>| {
             let id = id.map_or_else(
-                || next.fetch_add(1, std::sync::atomic::Ordering::SeqCst).to_string(),
+                || {
+                    next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        .to_string()
+                },
                 str::to_string,
             );
             let path = dir.join(format!("{id}.conversation.json"));
@@ -2764,9 +2880,16 @@ mod tests {
                     _ => Entry::Assistant(m.content),
                 })
                 .collect();
-            let core = se_core::start_conversation(EchoRunner::instant(), &path).map_err(|e| e.to_string())?;
+            let core = se_core::start_conversation(EchoRunner::instant(), &path)
+                .map_err(|e| e.to_string())?;
             let specialist = std::fs::read_to_string(dir.join(format!("{id}.specialist"))).ok();
-            Ok(services::Opened { core, id, prior, specialist, warning: None })
+            Ok(services::Opened {
+                core,
+                id,
+                prior,
+                specialist,
+                warning: None,
+            })
         })
     }
 
@@ -2786,7 +2909,11 @@ mod tests {
         std::fs::write(dir.join("100.specialist"), "backend-lead").unwrap();
         let mut state = sessions_state(&dir, "200");
         let mut core = se_core::start(EchoRunner::slow(Duration::from_millis(30), 200));
-        dispatch(&mut state, &core, Action::Submit("a long running turn".to_string()));
+        dispatch(
+            &mut state,
+            &core,
+            Action::Submit("a long running turn".to_string()),
+        );
         let started = Instant::now();
         while state.running_task().is_none() && started.elapsed() < Duration::from_secs(5) {
             pump(&mut state, &core);
@@ -2795,7 +2922,10 @@ mod tests {
 
         run_command(&mut state, &core, "resume", "");
         assert!(state.sessions.is_some(), "/resume opens the picker");
-        assert_eq!(state.sessions.as_ref().unwrap().items[0].row.title, "old question");
+        assert_eq!(
+            state.sessions.as_ref().unwrap().items[0].row.title,
+            "old question"
+        );
         press(&mut state, &core, crossterm::event::KeyCode::Enter);
         assert_eq!(state.switch_to, Some(Some("100".to_string())));
         switch_session(&mut state, &mut core);
@@ -2804,11 +2934,18 @@ mod tests {
         assert!(!state.is_busy(), "the old turn was stopped");
         assert_eq!(state.session_id.as_deref(), Some("100"));
         assert_eq!(state.agent.as_deref(), Some("backend-lead"));
-        assert!(matches!(&state.transcript[..], [Entry::User(q), Entry::Assistant(a)] if q == "old question" && a == "old answer"));
+        assert!(
+            matches!(&state.transcript[..], [Entry::User(q), Entry::Assistant(a)] if q == "old question" && a == "old answer")
+        );
         // The new core continues that file.
         dispatch(&mut state, &core, Action::Submit("follow up".to_string()));
         assert!(pump_until_idle(&mut state, &core, Duration::from_secs(5)));
-        assert_eq!(se_core::load_conversation(&dir.join("100.conversation.json")).unwrap().len(), 4);
+        assert_eq!(
+            se_core::load_conversation(&dir.join("100.conversation.json"))
+                .unwrap()
+                .len(),
+            4
+        );
         core.shutdown();
     }
 
@@ -2818,14 +2955,20 @@ mod tests {
         let dir = tmp.0.join(".se").join("sessions");
         save_convo(&dir, "100", "q", "a");
         let mut state = sessions_state(&dir, "100");
-        let mut core = se_core::start_conversation(EchoRunner::instant(), &dir.join("100.conversation.json")).unwrap();
+        let mut core =
+            se_core::start_conversation(EchoRunner::instant(), &dir.join("100.conversation.json"))
+                .unwrap();
         state.push(Entry::User("q".into()));
         state.push(Entry::Assistant("a".into()));
         for cmd in ["new", "clear"] {
             let before = state.session_id.clone();
             run_command(&mut state, &core, cmd, "");
             switch_session(&mut state, &mut core);
-            assert!(state.transcript.is_empty(), "/{cmd}: {:?}", state.transcript);
+            assert!(
+                state.transcript.is_empty(),
+                "/{cmd}: {:?}",
+                state.transcript
+            );
             assert_ne!(state.session_id, before, "/{cmd} gets a new id");
         }
         assert!(dir.join("100.conversation.json").exists());
@@ -2841,17 +2984,36 @@ mod tests {
         let core = se_core::start(EchoRunner::instant());
         let mut state = sessions_state(&dir, "100");
         crate::sessions::open(&mut state);
-        let at = |s: &AppState, id: &str| s.sessions.as_ref().unwrap().items.iter().position(|i| i.row.id == id).unwrap();
+        let at = |s: &AppState, id: &str| {
+            s.sessions
+                .as_ref()
+                .unwrap()
+                .items
+                .iter()
+                .position(|i| i.row.id == id)
+                .unwrap()
+        };
         state.sessions.as_mut().unwrap().selected = at(&state, "100");
         press(&mut state, &core, crossterm::event::KeyCode::Char('d'));
-        assert!(state.sessions.as_ref().unwrap().message.as_deref().unwrap().contains("open conversation"));
+        assert!(state
+            .sessions
+            .as_ref()
+            .unwrap()
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("open conversation"));
         assert!(dir.join("100.conversation.json").exists());
 
         state.sessions.as_mut().unwrap().selected = at(&state, "101");
         press(&mut state, &core, crossterm::event::KeyCode::Char('d'));
         press(&mut state, &core, crossterm::event::KeyCode::Char('y'));
         assert!(!dir.join("101.conversation.json").exists());
-        assert!(dir.join(".trash").join("101").join("101.conversation.json").exists());
+        assert!(dir
+            .join(".trash")
+            .join("101")
+            .join("101.conversation.json")
+            .exists());
         press(&mut state, &core, crossterm::event::KeyCode::Char('u'));
         assert!(dir.join("101.conversation.json").exists());
         assert_eq!(state.sessions.as_ref().unwrap().items.len(), 2);
@@ -2868,7 +3030,15 @@ mod tests {
         let core = se_core::start(EchoRunner::instant());
         let mut state = sessions_state(&dir, "9");
         crate::sessions::open(&mut state);
-        let ids = |s: &AppState| s.sessions.as_ref().unwrap().items.iter().map(|i| i.row.id.clone()).collect::<Vec<_>>();
+        let ids = |s: &AppState| {
+            s.sessions
+                .as_ref()
+                .unwrap()
+                .items
+                .iter()
+                .map(|i| i.row.id.clone())
+                .collect::<Vec<_>>()
+        };
         let start = ids(&state);
         // Shift+Down moves the top row down; K moves it back.
         let shifted = crossterm::event::KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT);
@@ -2887,12 +3057,22 @@ mod tests {
         press(&mut state, &core, KeyCode::Char('!'));
         press(&mut state, &core, KeyCode::Enter);
         let top = start[0].clone();
-        assert_eq!(se_core::sessions::list(&dir).0.iter().find(|r| r.id == top).unwrap().title, "Renamed!");
+        assert_eq!(
+            se_core::sessions::list(&dir)
+                .0
+                .iter()
+                .find(|r| r.id == top)
+                .unwrap()
+                .title,
+            "Renamed!"
+        );
         // p pins the second row, which then comes first.
         press(&mut state, &core, KeyCode::Down);
         press(&mut state, &core, KeyCode::Char('p'));
         assert_eq!(ids(&state)[0], start[1]);
-        assert!(std::fs::read_to_string(dir.join("index.json")).unwrap().contains("pinned"));
+        assert!(std::fs::read_to_string(dir.join("index.json"))
+            .unwrap()
+            .contains("pinned"));
         // Esc closes, and the composer never saw any of those keys.
         press(&mut state, &core, KeyCode::Esc);
         assert!(state.sessions.is_none());
@@ -2914,7 +3094,11 @@ mod tests {
         let mut state = sessions_state(&here, "1");
         state.recent_projects = Some(recent);
         crate::sessions::open(&mut state);
-        assert_eq!(state.sessions.as_ref().unwrap().items.len(), 1, "this project only");
+        assert_eq!(
+            state.sessions.as_ref().unwrap().items.len(),
+            1,
+            "this project only"
+        );
         press(&mut state, &core, crossterm::event::KeyCode::Tab);
         let ov = state.sessions.as_ref().unwrap();
         assert_eq!(ov.items.len(), 2, "this project's row is not listed twice");
@@ -2923,7 +3107,10 @@ mod tests {
         press(&mut state, &core, crossterm::event::KeyCode::Enter);
         assert_eq!(state.switch_to, None);
         let msg = state.sessions.as_ref().unwrap().message.clone().unwrap();
-        assert!(msg.contains("start SE in") && msg.contains("other") && msg.contains("--resume=7"), "{msg}");
+        assert!(
+            msg.contains("start SE in") && msg.contains("other") && msg.contains("--resume=7"),
+            "{msg}"
+        );
         core.shutdown();
     }
 }

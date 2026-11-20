@@ -281,8 +281,7 @@ impl ModelProvider for ExternalCli {
             .map_err(|e| ProviderError::Transport(format!("no scratch folder: {e}")))?;
         if request.tools.is_empty() {
             let (system, prompt) = split_prompt(&request.messages);
-            let (more, stdin_text) =
-                self.invocation(&request.model, &system, &prompt, &scratch)?;
+            let (more, stdin_text) = self.invocation(&request.model, &system, &prompt, &scratch)?;
             args.extend(more);
             let mut cmd = Command::new(&program);
             cmd.args(&args).current_dir(&scratch);
@@ -295,8 +294,7 @@ impl ModelProvider for ExternalCli {
         if self.kind == Kind::Codex {
             system.push_str(CODEX_JSON_NOTE);
         }
-        let (mut more, stdin_text) =
-            self.invocation(&request.model, &system, &prompt, &scratch)?;
+        let (mut more, stdin_text) = self.invocation(&request.model, &system, &prompt, &scratch)?;
         if self.kind == Kind::Codex {
             // Codex's own prompt outweighs text instructions (seen live: it ignored
             // <tool_call> blocks); a schema on its final answer does not.
@@ -305,7 +303,10 @@ impl ModelProvider for ExternalCli {
                 ProviderError::Transport(format!("cannot write the output schema: {e}"))
             })?;
             let at = more.len().saturating_sub(1); // before the trailing `-` (prompt on stdin)
-            more.splice(at..at, ["--output-schema".to_string(), file.display().to_string()]);
+            more.splice(
+                at..at,
+                ["--output-schema".to_string(), file.display().to_string()],
+            );
         }
         args.extend(more);
         let mut cmd = Command::new(&program);
@@ -313,16 +314,21 @@ impl ModelProvider for ExternalCli {
         // shortcut: the reply is buffered (a tool block can arrive mid-stream), so a
         // tool-enabled turn shows its text at the end; stream prose live if it matters.
         let mut text = String::new();
-        let result = run_cli(self.kind, self.id(), cmd, stdin_text, cancelled, &mut |event| {
-            match event {
+        let result = run_cli(
+            self.kind,
+            self.id(),
+            cmd,
+            stdin_text,
+            cancelled,
+            &mut |event| match event {
                 StreamEvent::TextDelta(t) => {
                     text.push_str(&t);
                     true
                 }
                 StreamEvent::FinishReason(_) | StreamEvent::Done => true,
                 other => on_event(other),
-            }
-        });
+            },
+        );
         // For `se exec` debugging: stderr would scribble over the TUI's screen.
         if std::env::var_os("SE_BRIDGE_DEBUG").is_some() {
             eprintln!("\n[bridge raw reply]\n{text}\n[/bridge raw reply]");
@@ -338,7 +344,11 @@ impl ModelProvider for ExternalCli {
         if !prose.is_empty() && !on_event(StreamEvent::TextDelta(prose)) {
             return Err(ProviderError::Cancelled);
         }
-        let finish = if calls.is_empty() { "stop" } else { "tool_calls" };
+        let finish = if calls.is_empty() {
+            "stop"
+        } else {
+            "tool_calls"
+        };
         for (id, name, arguments) in calls {
             if !on_event(StreamEvent::ToolCallRequested {
                 id,
@@ -378,7 +388,9 @@ impl ModelProvider for ExternalCli {
                     && run(&["auth", "list"]).is_ok_and(|o| {
                         strip_ansi(&String::from_utf8_lossy(&o.stdout))
                             .lines()
-                            .any(|l| l.trim_start().starts_with('●') && l.to_lowercase().contains("kilo"))
+                            .any(|l| {
+                                l.trim_start().starts_with('●') && l.to_lowercase().contains("kilo")
+                            })
                     });
                 let native = native_providers();
                 Ok(String::from_utf8_lossy(&out.stdout)
@@ -466,7 +478,11 @@ fn run_cli(
             Ok(Some(s)) => break s,
             Ok(None) if cancelled() => return stop(&mut child),
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(e) => return Err(ProviderError::Transport(format!("lost the CLI process: {e}"))),
+            Err(e) => {
+                return Err(ProviderError::Transport(format!(
+                    "lost the CLI process: {e}"
+                )))
+            }
         }
     };
     let stderr_text = erx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
@@ -771,7 +787,10 @@ fn bridge_prompt(messages: &[Message], tools: &[crate::ToolDefinition]) -> (Stri
          - When the work is done, give your final answer with no tool_call block.\n\nTools:\n",
     );
     for t in tools {
-        spec.push_str(&format!("- {}: {}\n  arguments schema: {}\n", t.name, t.description, t.parameters));
+        spec.push_str(&format!(
+            "- {}: {}\n  arguments schema: {}\n",
+            t.name, t.description, t.parameters
+        ));
     }
     system.push(spec);
 
@@ -889,7 +908,10 @@ fn parse_tool_calls(text: &str) -> (String, BridgedCalls) {
             .trim_start_matches("```")
             .trim_end_matches("```")
             .trim();
-        let id = format!("bridge-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let id = format!(
+            "bridge-{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
         let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
         match parsed.as_ref().and_then(|v| Some((v["name"].as_str()?, v))) {
             Some((name, v)) => {
@@ -1171,13 +1193,38 @@ mod tests {
         assert!(!offered(Kind::OpenCode, "nvidia/llama-x", false, &native));
         // Kilo not signed in: free gateway models only.
         assert!(offered(Kind::Kilo, "kilo/kilo-auto/free", false, &native));
-        assert!(offered(Kind::Kilo, "kilo/cohere/north-mini-code:free", false, &native));
-        assert!(!offered(Kind::Kilo, "kilo/~anthropic/claude-sonnet-latest", false, &native));
+        assert!(offered(
+            Kind::Kilo,
+            "kilo/cohere/north-mini-code:free",
+            false,
+            &native
+        ));
+        assert!(!offered(
+            Kind::Kilo,
+            "kilo/~anthropic/claude-sonnet-latest",
+            false,
+            &native
+        ));
         // Signed in: the whole gateway.
-        assert!(offered(Kind::Kilo, "kilo/~anthropic/claude-sonnet-latest", true, &native));
+        assert!(offered(
+            Kind::Kilo,
+            "kilo/~anthropic/claude-sonnet-latest",
+            true,
+            &native
+        ));
         // OpenCode already filters its own gateway; its other logins pass through.
-        assert!(offered(Kind::OpenCode, "claude-agent/claude-opus-5", false, &native));
-        assert!(offered(Kind::OpenCode, "opencode/big-pickle", false, &native));
+        assert!(offered(
+            Kind::OpenCode,
+            "claude-agent/claude-opus-5",
+            false,
+            &native
+        ));
+        assert!(offered(
+            Kind::OpenCode,
+            "opencode/big-pickle",
+            false,
+            &native
+        ));
     }
 
     #[test]
@@ -1291,7 +1338,11 @@ mod tests {
         };
         let started = std::time::Instant::now();
         let r = login_check(Kind::Claude, sleeper, Duration::from_millis(300));
-        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
         assert!(r.as_ref().is_ok_and(|s| s.contains("unknown")), "{r:?}");
 
         let missing = Command::new("se-no-such-program-for-a-login-check");
@@ -1348,7 +1399,11 @@ mod tests {
         let started = std::time::Instant::now();
         let deadline = started + Duration::from_millis(800);
         let (r, got) = run_fake(cmd, &|| std::time::Instant::now() >= deadline);
-        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
         assert!(matches!(r, Err(ProviderError::Cancelled)), "{r:?}");
         assert_eq!(got, "part");
     }
@@ -1422,7 +1477,10 @@ mod tests {
         assert_eq!(prose, "Looking first.\n done");
         let names: Vec<&str> = calls.iter().map(|c| c.1.as_str()).collect();
         assert_eq!(names, ["read", "shell", "invalid_tool_call"]);
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&calls[0].2).unwrap()["path"], "a.rs");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[0].2).unwrap()["path"],
+            "a.rs"
+        );
         assert_eq!(calls[1].2, "{\"command\":\"ls\"}");
         assert_eq!(calls[2].2, "not json");
         assert!(calls[0].0 != calls[1].0, "ids are unique");
@@ -1468,14 +1526,25 @@ mod tests {
         let args: serde_json::Value = serde_json::from_str(&calls[0].2).unwrap();
         assert_eq!(args["path"], "a.txt");
         // Done: no calls. Plain text is not this shape at all.
-        assert!(json_tool_calls("{\"message\": \"ok\", \"tool_calls\": []}").unwrap().1.is_empty());
+        assert!(json_tool_calls("{\"message\": \"ok\", \"tool_calls\": []}")
+            .unwrap()
+            .1
+            .is_empty());
         assert!(json_tool_calls("just text {not json").is_none());
         // Seen live: the object, then more text in the same turn. The call still runs.
         let trailing = "{\"message\": \"Writing.\", \"tool_calls\": [{\"name\": \"write\", \"arguments_json\": \"{}\"}]}Escalation: user - none";
         let (prose, calls) = json_tool_calls(trailing).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(prose, "Writing.\n\nEscalation: user - none");
-        let tools = vec![crate::ToolDefinition { name: "read".into(), description: String::new(), parameters: serde_json::json!({}) }];
-        assert_eq!(codex_schema(&tools)["properties"]["tool_calls"]["items"]["properties"]["name"]["enum"][0], "read");
+        let tools = vec![crate::ToolDefinition {
+            name: "read".into(),
+            description: String::new(),
+            parameters: serde_json::json!({}),
+        }];
+        assert_eq!(
+            codex_schema(&tools)["properties"]["tool_calls"]["items"]["properties"]["name"]["enum"]
+                [0],
+            "read"
+        );
     }
 }

@@ -97,7 +97,10 @@ fn parse(
             .ok_or_else(|| format!("missing or empty `{k}`"))
     };
     let (role, task) = (get("role")?, get("task")?);
-    let background = v.get("background").and_then(|b| b.as_bool()).unwrap_or(false);
+    let background = v
+        .get("background")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
     if agents.iter().any(|a| a.frontmatter.id == role) {
         return Ok((role, task, background));
     }
@@ -175,7 +178,10 @@ impl ProviderRunner {
                 }
             };
             let id = next_id();
-            let shown = format!("{role} [{id}]: {}", crate::team::driver::one_line(&task, 80));
+            let shown = format!(
+                "{role} [{id}]: {}",
+                crate::team::driver::one_line(&task, 80)
+            );
             let scope = format!("spawn {role}#{id}");
             // A spawn goes through the same policy and mode as any tool call:
             // deny is final, manual asks, auto and an allow rule run it.
@@ -240,7 +246,9 @@ impl ProviderRunner {
                 .iter()
                 .map(|job| {
                     let mut child_sink = parent_sink.child(&job.id, &job.role, job.stop.clone());
-                    s.spawn(move || self.run_child(&mut child_sink, job, &parent.0, chosen, deadline))
+                    s.spawn(move || {
+                        self.run_child(&mut child_sink, job, &parent.0, chosen, deadline)
+                    })
                 })
                 .collect();
             // The parent's interrupt (Esc, /new, /resume, shutdown) and each
@@ -261,7 +269,10 @@ impl ProviderRunner {
             }
             handles
                 .into_iter()
-                .map(|h| h.join().unwrap_or_else(|_| Err("the agent crashed".to_string())))
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err("the agent crashed".to_string()))
+                })
                 .collect()
         });
 
@@ -327,7 +338,11 @@ impl ProviderRunner {
             .is_some_and(|p| p.is_agent_cli());
         let child = Child {
             id: agent_id.clone(),
-            budget: if cli { CLI_CHILD_TOKEN_BUDGET } else { CHILD_TOKEN_BUDGET },
+            budget: if cli {
+                CLI_CHILD_TOKEN_BUDGET
+            } else {
+                CHILD_TOKEN_BUDGET
+            },
             deadline,
         };
         let outcome = self.run_inner(&turn, &[], sink, Some(&child));
@@ -548,7 +563,11 @@ mod tests {
     fn approve_spawns(core: &crate::CoreHandle, e: &CoreEvent) {
         if let Payload::ApprovalRequired { call, name, .. } = &e.payload {
             if name == AGENT_TOOL {
-                core.approve(se_protocol::ApprovalDecision { task: e.task, call: *call, allow: true });
+                core.approve(se_protocol::ApprovalDecision {
+                    task: e.task,
+                    call: *call,
+                    allow: true,
+                });
             }
         }
     }
@@ -556,7 +575,11 @@ mod tests {
     /// Manual mode asks before a spawn, and a "no" means the child never runs.
     #[test]
     fn a_spawn_asks_first_and_a_refusal_runs_no_child() {
-        let (runner, seen, _) = runner("spawn-no", Ruleset::default(), reader_script(vec![spawn("reader", "one")]));
+        let (runner, seen, _) = runner(
+            "spawn-no",
+            Ruleset::default(),
+            reader_script(vec![spawn("reader", "one")]),
+        );
         let core = crate::start(runner);
         core.submit("go", vec![]).unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -565,7 +588,11 @@ mod tests {
             for e in core.drain_blocking(Duration::from_millis(20)) {
                 if let Payload::ApprovalRequired { call, name, .. } = &e.payload {
                     asked |= name == AGENT_TOOL;
-                    core.approve(se_protocol::ApprovalDecision { task: e.task, call: *call, allow: false });
+                    core.approve(se_protocol::ApprovalDecision {
+                        task: e.task,
+                        call: *call,
+                        allow: false,
+                    });
                 }
                 if let Payload::TaskFinished { .. } = e.payload {
                     break 'run;
@@ -574,7 +601,10 @@ mod tests {
         }
         core.shutdown();
         assert!(asked, "the spawn was not put to the user");
-        assert!(!seen.lock().unwrap().iter().any(is_child), "a refused child ran");
+        assert!(
+            !seen.lock().unwrap().iter().any(is_child),
+            "a refused child ran"
+        );
         assert_eq!(results(&seen), ["denied: not approved"]);
     }
 
@@ -673,7 +703,10 @@ mod tests {
 
         let res = results(&seen);
         assert_eq!(res.len(), 1);
-        assert!(res[0].starts_with("summary: ") && res[0].contains("heron"), "{res:?}");
+        assert!(
+            res[0].starts_with("summary: ") && res[0].contains("heron"),
+            "{res:?}"
+        );
 
         // Spawned, Running, ..., Done -- and Done is the last for that id.
         let id = spawned(&payloads).pop().expect("spawned");
@@ -684,7 +717,13 @@ mod tests {
         assert!(
             matches!(mine[0], AgentEvent::Spawned { parent: Some(p), role, .. } if p == NATIVE_LOOP_AGENT_ID && role == "reader")
         );
-        assert!(matches!(mine[1], AgentEvent::State { state: AgentState::Running, .. }));
+        assert!(matches!(
+            mine[1],
+            AgentEvent::State {
+                state: AgentState::Running,
+                ..
+            }
+        ));
         assert!(
             matches!(mine.last().unwrap(), AgentEvent::Done { summary, .. } if summary.contains("heron"))
         );
@@ -694,9 +733,9 @@ mod tests {
         assert!(!payloads
             .iter()
             .any(|p| matches!(p, Payload::ToolCompleted { name, .. } if name == "read")));
-        assert!(payloads
-            .iter()
-            .any(|p| matches!(p, Payload::ToolCompleted { name, ok: true, .. } if name == "agent")));
+        assert!(payloads.iter().any(
+            |p| matches!(p, Payload::ToolCompleted { name, ok: true, .. } if name == "agent")
+        ));
 
         let records = crate::audit_log::read(&audit).unwrap();
         let tag = format!("reader#{id}");
@@ -713,14 +752,15 @@ mod tests {
 
     #[test]
     fn a_child_cannot_deploy_agents_even_when_its_role_declares_it() {
-        let (runner, seen, audit) =
-            runner("depth", Ruleset::default(), |r| match (is_child(r), last_is_tool(r)) {
+        let (runner, seen, audit) = runner("depth", Ruleset::default(), |r| {
+            match (is_child(r), last_is_tool(r)) {
                 (false, false) => calls(&[spawn("reader", "try to recurse")]),
                 (false, true) => say("parent done"),
                 // Forced: not offered, called anyway.
                 (true, false) => calls(&[spawn("reader", "grandchild")]),
                 (true, true) => say(&r.messages.last().unwrap().content.clone()),
-            });
+            }
+        });
         let (_, payloads) = drive(runner, approve_all);
         assert_eq!(spawned(&payloads).len(), 1, "no grandchild may spawn");
         let child = seen
@@ -732,7 +772,10 @@ mod tests {
             .clone();
         assert!(!child.tools.iter().any(|t| t.name == "agent"));
         let res = results(&seen);
-        assert!(res[0].contains("a sub-agent cannot deploy agents"), "{res:?}");
+        assert!(
+            res[0].contains("a sub-agent cannot deploy agents"),
+            "{res:?}"
+        );
         let records = crate::audit_log::read(&audit).unwrap();
         assert!(records.iter().any(|r| r["tool"] == "agent"
             && r["effect"] == "Deny"
@@ -742,12 +785,13 @@ mod tests {
     #[test]
     fn at_most_four_children_run_per_reply() {
         let five: Vec<_> = (0..5).map(|_| spawn("spender", "work")).collect();
-        let (runner, seen, _) =
-            runner("cap", Ruleset::default(), move |r| match (is_child(r), last_is_tool(r)) {
+        let (runner, seen, _) = runner("cap", Ruleset::default(), move |r| {
+            match (is_child(r), last_is_tool(r)) {
                 (false, false) => calls(&five),
                 (false, true) => say("parent done"),
                 (true, _) => say("ok"),
-            });
+            }
+        });
         let (_, payloads) = drive(runner, |_, _| {});
         assert_eq!(spawned(&payloads).len(), MAX_CHILDREN);
         let res = results(&seen);
@@ -758,8 +802,8 @@ mod tests {
 
     #[test]
     fn a_child_over_its_token_budget_fails_and_the_parent_gets_an_error() {
-        let (runner, seen, _) =
-            runner("budget", Ruleset::default(), |r| match (is_child(r), last_is_tool(r)) {
+        let (runner, seen, _) = runner("budget", Ruleset::default(), |r| {
+            match (is_child(r), last_is_tool(r)) {
                 (false, false) => calls(&[spawn("spender", "spend")]),
                 (false, true) => say("parent done"),
                 (true, _) => {
@@ -771,7 +815,8 @@ mod tests {
                     });
                     e
                 }
-            });
+            }
+        });
         let (_, payloads) = drive(runner, |_, _| {});
         let events = agent_events(&payloads);
         assert!(events.iter().any(
@@ -790,11 +835,12 @@ mod tests {
 
     #[test]
     fn a_child_past_its_deadline_fails() {
-        let (mut runner, seen, _) =
-            runner("deadline", Ruleset::default(), |r| match (is_child(r), last_is_tool(r)) {
+        let (mut runner, seen, _) = runner("deadline", Ruleset::default(), |r| {
+            match (is_child(r), last_is_tool(r)) {
                 (false, false) => calls(&[spawn("slow", "never ends")]),
                 _ => say("parent done"),
-            });
+            }
+        });
         // A child's deadline is min(10 min, the runner's turn deadline).
         runner.turn_deadline = Duration::from_millis(300);
         let started = Instant::now();
@@ -812,11 +858,12 @@ mod tests {
 
     #[test]
     fn interrupting_the_parent_cancels_its_children() {
-        let (runner, _, _) =
-            runner("cancel", Ruleset::default(), |r| match (is_child(r), last_is_tool(r)) {
+        let (runner, _, _) = runner("cancel", Ruleset::default(), |r| {
+            match (is_child(r), last_is_tool(r)) {
                 (false, false) => calls(&[spawn("slow", "a"), spawn("slow", "b")]),
                 _ => say("parent done"),
-            });
+            }
+        });
         let mut running = 0;
         let started = Instant::now();
         let (outcome, payloads) = drive(runner, |core, e| {
@@ -859,7 +906,10 @@ mod tests {
                 if last_is_tool(r) {
                     say("done")
                 } else {
-                    calls(&[("write", serde_json::json!({"path": "out.txt", "content": "hi"}))])
+                    calls(&[(
+                        "write",
+                        serde_json::json!({"path": "out.txt", "content": "hi"}),
+                    )])
                 }
             });
             runner.set_mode(mode);
@@ -868,16 +918,32 @@ mod tests {
                 asked |= matches!(e.payload, Payload::ApprovalRequired { .. });
                 approve_all(core, e);
             });
-            assert!(matches!(outcome, Outcome::Completed { .. }), "{mode:?}: {outcome:?}");
+            assert!(
+                matches!(outcome, Outcome::Completed { .. }),
+                "{mode:?}: {outcome:?}"
+            );
             let written = audit.parent().unwrap().join("ws").join("out.txt").exists();
-            let offered: Vec<String> = seen.lock().unwrap()[0].tools.iter().map(|t| t.name.clone()).collect();
+            let offered: Vec<String> = seen.lock().unwrap()[0]
+                .tools
+                .iter()
+                .map(|t| t.name.clone())
+                .collect();
             match mode {
                 WorkMode::Manual => assert!(asked && written, "manual asks, then writes"),
                 WorkMode::Auto => assert!(!asked && written, "auto writes without asking"),
                 WorkMode::Plan => {
                     assert!(!asked && !written, "plan never writes");
-                    assert!(results(&seen)[0].contains("plan mode"), "{:?}", results(&seen));
-                    assert!(!offered.iter().any(|t| t == "write" || t == "edit" || t == "shell"), "{offered:?}");
+                    assert!(
+                        results(&seen)[0].contains("plan mode"),
+                        "{:?}",
+                        results(&seen)
+                    );
+                    assert!(
+                        !offered
+                            .iter()
+                            .any(|t| t == "write" || t == "edit" || t == "shell"),
+                        "{offered:?}"
+                    );
                 }
             }
         }
@@ -891,13 +957,20 @@ mod tests {
             if last_is_tool(r) {
                 say("done")
             } else {
-                calls(&[("write", serde_json::json!({"path": "out.txt", "content": "hi"}))])
+                calls(&[(
+                    "write",
+                    serde_json::json!({"path": "out.txt", "content": "hi"}),
+                )])
             }
         });
         runner.set_mode(se_protocol::WorkMode::Auto);
         drive(runner, approve_all);
         assert!(!audit.parent().unwrap().join("ws").join("out.txt").exists());
-        assert!(results(&seen)[0].contains("denied by policy"), "{:?}", results(&seen));
+        assert!(
+            results(&seen)[0].contains("denied by policy"),
+            "{:?}",
+            results(&seen)
+        );
     }
 
     #[test]
@@ -948,7 +1021,10 @@ mod tests {
         };
         core.shutdown();
         assert!(matches!(outcome, Outcome::Completed { .. }), "{outcome:?}");
-        assert!(!overlapped, "a second prompt showed before the first was answered");
+        assert!(
+            !overlapped,
+            "a second prompt showed before the first was answered"
+        );
         assert_eq!(prompts.len(), 2, "{prompts:?}");
         for p in &prompts {
             assert!(
@@ -994,15 +1070,16 @@ mod tests {
 
     #[test]
     fn background_runs_in_the_foreground_and_says_so() {
-        let (runner, seen, _) =
-            runner("bg", Ruleset::default(), |r| match (is_child(r), last_is_tool(r)) {
+        let (runner, seen, _) = runner("bg", Ruleset::default(), |r| {
+            match (is_child(r), last_is_tool(r)) {
                 (false, false) => calls(&[(
                     "agent",
                     serde_json::json!({"role": "spender", "task": "t", "background": true}),
                 )]),
                 (false, true) => say("parent done"),
                 (true, _) => say("bg answer"),
-            });
+            }
+        });
         drive(runner, |_, _| {});
         let res = results(&seen);
         assert!(

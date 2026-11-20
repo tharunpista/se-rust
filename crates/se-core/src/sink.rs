@@ -28,8 +28,8 @@ use std::time::Duration;
 const APPROVAL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 use se_protocol::{
-    AgentEvent, AgentState, CoreEvent, DeltaKind, Payload, SeqCounter, SessionId, Span, Stage, TaskId, ToolCallId, TurnId,
-    Usage,
+    AgentEvent, AgentState, CoreEvent, DeltaKind, Payload, SeqCounter, SessionId, Span, Stage,
+    TaskId, ToolCallId, TurnId, Usage,
 };
 
 /// Why a send failed. Only ever because the interface is gone, which

@@ -582,14 +582,18 @@ impl AppState {
                 // (wrapped) next step for that call is the answer to it.
                 if let se_protocol::AgentEvent::Activity { payload, .. } = e {
                     let answered = match payload.as_ref() {
-                        Payload::ToolRequested { call, .. } | Payload::ToolCompleted { call, .. } => {
-                            Some((*call, true))
-                        }
+                        Payload::ToolRequested { call, .. }
+                        | Payload::ToolCompleted { call, .. } => Some((*call, true)),
                         Payload::ToolDenied { call, .. } => Some((*call, false)),
                         _ => None,
                     };
-                    if let (Some((call, allow)), Activity::AwaitingApproval { task, call: waiting }) =
-                        (answered, self.activity)
+                    if let (
+                        Some((call, allow)),
+                        Activity::AwaitingApproval {
+                            task,
+                            call: waiting,
+                        },
+                    ) = (answered, self.activity)
                     {
                         if call == waiting {
                             self.mark_approval_decided(allow);
@@ -712,7 +716,12 @@ impl AppState {
 }
 
 /// Settles the newest running `name` tool entry; shared with agent transcripts.
-pub(crate) fn settle_tool(transcript: &mut Vec<Entry>, name: &str, new_state: ToolState, preview: &str) {
+pub(crate) fn settle_tool(
+    transcript: &mut Vec<Entry>,
+    name: &str,
+    new_state: ToolState,
+    preview: &str,
+) {
     for entry in transcript.iter_mut().rev() {
         if let Entry::Tool {
             name: existing,
@@ -1029,7 +1038,12 @@ mod tests {
             ),
         ] {
             let mut app = AppState::new();
-            app.apply(&ev(0, Payload::TaskStarted { request: "x".into() }));
+            app.apply(&ev(
+                0,
+                Payload::TaskStarted {
+                    request: "x".into(),
+                },
+            ));
             app.apply(&ev(
                 1,
                 Payload::Agent(AgentEvent::Spawned {
@@ -1071,7 +1085,12 @@ mod tests {
     #[test]
     fn an_arriving_approval_closes_the_picker_and_snaps_to_the_bottom() {
         let mut app = AppState::new();
-        app.apply(&ev(0, Payload::TaskStarted { request: "x".into() }));
+        app.apply(&ev(
+            0,
+            Payload::TaskStarted {
+                request: "x".into(),
+            },
+        ));
         app.composer.set("/".to_string());
         app.picker.open(0);
         app.scroll = 7;

@@ -78,9 +78,7 @@ pub fn stored_base_url(id: &str) -> Option<String> {
 }
 
 pub fn store_base_url(id: &str, url: &str) -> Result<(), String> {
-    url_entry(id)?
-        .set_password(url)
-        .map_err(|e| e.to_string())
+    url_entry(id)?.set_password(url).map_err(|e| e.to_string())
 }
 
 /// Normalises a URL to its origin: scheme + authority (host and port,
@@ -321,8 +319,26 @@ pub fn fingerprint(secret: &str) -> String {
 
 /// Vendor key prefixes (`sk-` also covers `sk-ant-`, `sk-proj-`, `sk-or-`).
 const SECRET_PREFIXES: &[&str] = &[
-    "sk-", "sk_", "nvapi-", "gsk_", "AIza", "ghp_", "gho_", "ghu_", "ghs_", "github_pat_",
-    "xoxb-", "xoxp-", "xoxa-", "hf_", "r8_", "pplx-", "glpat-", "xai-", "fw_", "AKIA",
+    "sk-",
+    "sk_",
+    "nvapi-",
+    "gsk_",
+    "AIza",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "github_pat_",
+    "xoxb-",
+    "xoxp-",
+    "xoxa-",
+    "hf_",
+    "r8_",
+    "pplx-",
+    "glpat-",
+    "xai-",
+    "fw_",
+    "AKIA",
 ];
 
 const KEY_WORDS: &[&str] = &["key", "token", "secret", "apikey", "="];
@@ -358,7 +374,8 @@ fn is_random_key(t: &str, keyish_line: bool) -> bool {
     }) || (keyish_line
         && t.len() >= 40
         && digits(t) >= 3
-        && t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && t.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         && has(t, |c| ('g'..='z').contains(c)))
 }
 
@@ -458,7 +475,10 @@ mod tests {
             "Zq8XkLm2Pw9vRt4Yn6Bc1Hd5Jf3Gs7Ae0Uo", // no prefix, random
         ] {
             assert!(looks_like_secret(key), "{key}");
-            assert!(looks_like_secret(&format!("here is my key: {key} thanks")), "{key}");
+            assert!(
+                looks_like_secret(&format!("here is my key: {key} thanks")),
+                "{key}"
+            );
             assert_eq!(redact_secrets(&format!("k={key}!")), "k=[REDACTED]!");
         }
         // 40+ lowercase+digit, only on a line that talks about a key.
@@ -470,7 +490,9 @@ mod tests {
         assert!(looks_like_secret(json));
         assert_eq!(redact_secrets(json), r#"{"content":"hello\n[REDACTED]"}"#);
         // A vendor key in a URL query still counts.
-        assert!(looks_like_secret("https://x.example/v1?key=sk-abcdefghij0123456789ABCDEF"));
+        assert!(looks_like_secret(
+            "https://x.example/v1?key=sk-abcdefghij0123456789ABCDEF"
+        ));
 
         for prose in [
             "did it connect the api key",

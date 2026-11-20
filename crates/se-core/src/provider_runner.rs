@@ -815,57 +815,61 @@ impl ProviderRunner {
         // kept only when the user named it.
         let keep = |id: &String| id != FALLBACK_AGENT_ID || turn.specialist_id.is_some();
         // A sub-agent's role is never the conversation's specialist.
-        if let (None, None, Some(id)) = (
-            node,
-            child,
-            specialist_id.as_ref().filter(|id| keep(id)),
-        ) {
+        if let (None, None, Some(id)) = (node, child, specialist_id.as_ref().filter(|id| keep(id)))
+        {
             self.sticky_specialist.set(Some(id.clone()));
         }
         let (system_prompt, invoked, allowed_tools, max_calls, budget_tokens, roster) =
             match &specialist_id {
-            None if evaluator => (
-                crate::team::evaluate::EVALUATOR_SYSTEM.to_string(),
-                None,
-                None,
-                None,
-                None,
-                String::new(),
-            ),
-            None => (SYSTEM_PROMPT.to_string(), None, None, None, None, String::new()),
-            Some(id) => {
-                let report = catalogue.expect("loaded whenever a specialist id exists");
-                let roster = crate::router::roster(&report.agents);
-                let Some(agent) = report.agents.into_iter().find(|a| &a.frontmatter.id == id)
-                else {
-                    return Outcome::Failed {
-                        detail: format!(
+                None if evaluator => (
+                    crate::team::evaluate::EVALUATOR_SYSTEM.to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    String::new(),
+                ),
+                None => (
+                    SYSTEM_PROMPT.to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    String::new(),
+                ),
+                Some(id) => {
+                    let report = catalogue.expect("loaded whenever a specialist id exists");
+                    let roster = crate::router::roster(&report.agents);
+                    let Some(agent) = report.agents.into_iter().find(|a| &a.frontmatter.id == id)
+                    else {
+                        return Outcome::Failed {
+                            detail: format!(
                             "no specialist `{id}` in the catalogue -- try `se agents` to list ids"
                         ),
+                        };
                     };
-                };
-                // An empty `tools:` list is "not specified", not "no
-                // tools allowed" -- the 194 real definitions vary in
-                // whether they set it, and an unset allowlist must not
-                // silently deny every call a specialist with no
-                // opinion on tools makes.
-                // Declared but mapping to nothing (e.g. only memory-*)
-                // stays `Some(empty)`: deny-all, never widened to `None`.
-                let allowed = if agent.frontmatter.tools.is_empty() {
-                    None
-                } else {
-                    Some(se_tools_for(&agent.frontmatter.tools))
-                };
-                (
-                    agent.body,
-                    Some((agent.frontmatter.id, agent.content_hash)),
-                    allowed,
-                    agent.frontmatter.max_calls,
-                    agent.frontmatter.context_budget_tokens,
-                    roster,
-                )
-            }
-        };
+                    // An empty `tools:` list is "not specified", not "no
+                    // tools allowed" -- the 194 real definitions vary in
+                    // whether they set it, and an unset allowlist must not
+                    // silently deny every call a specialist with no
+                    // opinion on tools makes.
+                    // Declared but mapping to nothing (e.g. only memory-*)
+                    // stays `Some(empty)`: deny-all, never widened to `None`.
+                    let allowed = if agent.frontmatter.tools.is_empty() {
+                        None
+                    } else {
+                        Some(se_tools_for(&agent.frontmatter.tools))
+                    };
+                    (
+                        agent.body,
+                        Some((agent.frontmatter.id, agent.content_hash)),
+                        allowed,
+                        agent.frontmatter.max_calls,
+                        agent.frontmatter.context_budget_tokens,
+                        roster,
+                    )
+                }
+            };
         // Depth 1, enforced here: a sub-agent is never offered `agent`,
         // and neither is a role that did not declare it, an evaluator,
         // or a team node (its claims and budget would not reach the child).
@@ -1183,10 +1187,12 @@ impl ProviderRunner {
             self.charge(node, round_usage.as_ref());
             if let (Some(c), Some(used)) = (child, reported_tokens(round_usage.as_ref())) {
                 child_used += used;
-                let _ = sink.emit(se_protocol::Payload::Agent(se_protocol::AgentEvent::Tokens {
-                    agent_id: c.id.clone(),
-                    used: child_used,
-                }));
+                let _ = sink.emit(se_protocol::Payload::Agent(
+                    se_protocol::AgentEvent::Tokens {
+                        agent_id: c.id.clone(),
+                        used: child_used,
+                    },
+                ));
                 if child_used > c.budget {
                     break Outcome::Failed {
                         detail: format!(
@@ -3914,8 +3920,14 @@ mod tests {
             on_event: &mut dyn FnMut(StreamEvent) -> bool,
         ) -> Result<(), ProviderError> {
             let user = &request.messages.last().unwrap().content;
-            assert!(!user.contains("Which department"), "an agent CLI is never asked to route");
-            self.0.lock().unwrap().push(request.messages[0].content.clone());
+            assert!(
+                !user.contains("Which department"),
+                "an agent CLI is never asked to route"
+            );
+            self.0
+                .lock()
+                .unwrap()
+                .push(request.messages[0].content.clone());
             on_event(StreamEvent::TextDelta("answered".into()));
             on_event(StreamEvent::Done);
             Ok(())
@@ -3949,7 +3961,12 @@ mod tests {
             _cancelled: &dyn Fn() -> bool,
             on_event: &mut dyn FnMut(StreamEvent) -> bool,
         ) -> Result<(), ProviderError> {
-            let reply = self.0.lock().unwrap().pop_front().expect("an unscripted routing call");
+            let reply = self
+                .0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("an unscripted routing call");
             on_event(StreamEvent::TextDelta(reply.into()));
             on_event(StreamEvent::Done);
             Ok(())
@@ -3959,7 +3976,13 @@ mod tests {
         }
     }
 
-    fn cli_core(router: Option<Vec<&'static str>>) -> (crate::CoreHandle, Arc<std::sync::Mutex<Vec<String>>>, std::path::PathBuf) {
+    fn cli_core(
+        router: Option<Vec<&'static str>>,
+    ) -> (
+        crate::CoreHandle,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        std::path::PathBuf,
+    ) {
         let systems = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (mut runner, _) = runner_with(Vec::new(), Duration::ZERO, None);
         let mut registry = Registry::empty();
@@ -4071,10 +4094,24 @@ mod tests {
             .unwrap();
         wait_finished(&core);
         core.shutdown();
-        let role: Vec<String> = role_seen.lock().unwrap().iter().map(|s| role_body(s).trim().to_string()).collect();
-        let default: Vec<String> = default_seen.lock().unwrap().iter().map(|s| role_body(s).trim().to_string()).collect();
+        let role: Vec<String> = role_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| role_body(s).trim().to_string())
+            .collect();
+        let default: Vec<String> = default_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| role_body(s).trim().to_string())
+            .collect();
         assert_eq!(role, ["DB BODY"], "the mapped role ran on its own model");
-        assert_eq!(default, ["FRONTEND BODY"], "an unmapped role stayed on the default");
+        assert_eq!(
+            default,
+            ["FRONTEND BODY"],
+            "an unmapped role stayed on the default"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4365,11 +4402,19 @@ mod tests {
     #[test]
     fn catalogue_tool_names_map_to_se_tools() {
         assert_eq!(
-            se_tools_for(&names(&["read-files", "search", "write-files", "run-shell"])),
+            se_tools_for(&names(&[
+                "read-files",
+                "search",
+                "write-files",
+                "run-shell"
+            ])),
             names(&["read", "search", "write", "edit", "shell"])
         );
         // SE's own names pass through (definitions may use either).
-        assert_eq!(se_tools_for(&names(&["read", "edit"])), names(&["read", "edit"]));
+        assert_eq!(
+            se_tools_for(&names(&["read", "edit"])),
+            names(&["read", "edit"])
+        );
         // run-tests never becomes shell.
         assert!(se_tools_for(&names(&["read-files", "run-tests"])) == names(&["read"]));
         // Declared, but nothing SE has: deny-all, not "unrestricted".
@@ -4377,7 +4422,10 @@ mod tests {
         assert!(se_tools_for(&names(&["no-such-tool"])).is_empty());
         // C2: deploying sub-agents.
         assert_eq!(se_tools_for(&names(&["invoke-agent"])), names(&["agent"]));
-        assert_eq!(se_tools_for(&names(&["agent", "read"])), names(&["agent", "read"]));
+        assert_eq!(
+            se_tools_for(&names(&["agent", "read"])),
+            names(&["agent", "read"])
+        );
     }
 
     /// The real catalogue's definition of `id`, or `None` (skipped) off
@@ -4412,7 +4460,10 @@ mod tests {
         let Some(allowed) = real_allowlist("chief-orchestrator") else {
             return;
         };
-        assert!(!denied(&allowed, "read") && !denied(&allowed, "search"), "{allowed:?}");
+        assert!(
+            !denied(&allowed, "read") && !denied(&allowed, "search"),
+            "{allowed:?}"
+        );
         // It declares neither write-files nor run-shell.
         for tool in ["write", "edit", "shell"] {
             assert!(denied(&allowed, tool), "{tool}: {allowed:?}");
@@ -4461,12 +4512,21 @@ mod tests {
         // Resume: a fresh runner on the same file comes back to it.
         let (resumed, _) = runner_with(Vec::new(), Duration::ZERO, None);
         let resumed = resumed.with_specialist_file(path.clone());
-        assert_eq!(resumed.sticky_specialist.get().as_deref(), Some("backend-lead"));
+        assert_eq!(
+            resumed.sticky_specialist.get().as_deref(),
+            Some("backend-lead")
+        );
         // `/agents none`: cleared, and saved as cleared.
         resumed.set_specialist(None);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
         let (again, _) = runner_with(Vec::new(), Duration::ZERO, None);
-        assert_eq!(again.with_specialist_file(path.clone()).sticky_specialist.get(), None);
+        assert_eq!(
+            again
+                .with_specialist_file(path.clone())
+                .sticky_specialist
+                .get(),
+            None
+        );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -4477,7 +4537,10 @@ mod tests {
         // A new chat is a new conversation id, so a file not yet written.
         let fresh = old.with_file_name("new.specialist");
         let (runner, _) = runner_with(Vec::new(), Duration::ZERO, None);
-        assert_eq!(runner.with_specialist_file(fresh).sticky_specialist.get(), None);
+        assert_eq!(
+            runner.with_specialist_file(fresh).sticky_specialist.get(),
+            None
+        );
         let _ = std::fs::remove_dir_all(old.parent().unwrap());
     }
 }
