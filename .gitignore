@@ -5,3 +5,24 @@
 # SE's own local state, when the binary is run inside this repo.
 .se/
 .claude/worktrees/
+
+# Agent memory and local Claude Code state: personal, never published.
+.claude/agent-memory/
+.claude/settings.local.json
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+*.bundle
+
+# Internal working reports (machine-specific or process notes), kept locally.
+/docs/TUI_REPAIR_REPORT.md
+/docs/SECURITY_FINDINGS_DISPOSITION.md
+/docs/IMPLEMENTATION_BASELINE.md
+/docs/RUNTIME_DETECTION_FINDINGS.md

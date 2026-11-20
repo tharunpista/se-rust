@@ -6,8 +6,9 @@
 //! alone is unreliable on real wording, so the choice is two short
 //! multiple-choice questions: the department (~15 options), then a role
 //! within it. Every answer is checked against the real catalogue; an
-//! answer that is not an option falls back to keyword scoring, and if
-//! that finds nothing either, the turn simply runs without a specialist.
+//! answer that is not an option routes nowhere (the runner's fallback).
+//! Keyword scoring ([`lexical`]) is kept only for ensemble members, which
+//! must all get the same specialist without a model call.
 //!
 //! Pure functions only; the model call itself is the runner's.
 
@@ -31,7 +32,28 @@ pub fn departments(agents: &[AgentDefinition]) -> Vec<(String, usize)> {
     out
 }
 
-pub fn department_prompt(task: &str, departments: &[(String, usize)]) -> String {
+/// Every enabled role id, one line per department: what a role that deploys
+/// agents needs to name a real one (ids only, about 1.5k tokens for 194).
+pub fn roster(agents: &[AgentDefinition]) -> String {
+    departments(agents)
+        .iter()
+        .map(|(d, _)| {
+            let ids: Vec<&str> = agents
+                .iter()
+                .filter(|a| a.frontmatter.enabled && &a.frontmatter.department == d)
+                .map(|a| a.frontmatter.id.as_str())
+                .collect();
+            format!("  {d}: {}\n", ids.join(", "))
+        })
+        .collect()
+}
+
+/// With `current` (the conversation's specialist and its department), KEEP is also an answer.
+pub fn department_prompt(
+    task: &str,
+    departments: &[(String, usize)],
+    current: Option<(&str, &str)>,
+) -> String {
     let mut p = format!(
         "Task:\n{}\n\nWhich department should own this task? Options:\n",
         clip(task, 2_000)
@@ -39,7 +61,13 @@ pub fn department_prompt(task: &str, departments: &[(String, usize)]) -> String 
     for (d, n) in departments {
         p.push_str(&format!("- {d} ({n} roles)\n"));
     }
-    p.push_str("\nReply with the department id only.");
+    match current {
+        Some((id, d)) => p.push_str(&format!(
+            "\nThe conversation is with `{id}` ({d}). If this message is a follow-up or still \
+             {d} work, reply KEEP. Otherwise reply with the department id only."
+        )),
+        None => p.push_str("\nReply with the department id only."),
+    }
     p
 }
 
@@ -153,7 +181,10 @@ mod tests {
     /// whole catalogue stays small.
     #[test]
     fn the_real_catalogue_fits_a_two_step_choice() {
-        let root = std::path::Path::new(r"%USERPROFILE%\SE\se\agents");
+        let root_buf = std::path::PathBuf::from(std::env::var("SE_CATALOGUE_ROOT").unwrap_or_else(|_| {
+            format!("{}/SE/se/agents", std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default())
+        }));
+        let root = root_buf.as_path();
         if !root.exists() {
             eprintln!("skipped: no real catalogue on this machine");
             return;
@@ -161,7 +192,7 @@ mod tests {
         let report = se_catalogue::load(root).unwrap();
         let depts = departments(&report.agents);
         assert!(depts.len() <= 20, "{} departments", depts.len());
-        assert!(department_prompt("x", &depts).len() < 1_500);
+        assert!(department_prompt("x", &depts, None).len() < 1_500);
         for (d, _) in &depts {
             let roles: Vec<&AgentDefinition> = report
                 .agents

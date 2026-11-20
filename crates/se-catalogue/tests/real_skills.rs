@@ -6,17 +6,17 @@
 //! user's `SE`/`.claude` trees must not fail its test suite over a
 //! missing external directory.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+fn home() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default(),
+    )
+}
 
 fn real_roots() -> Vec<PathBuf> {
-    [
-        r"%USERPROFILE%\SE\se\skills",
-        r"%USERPROFILE%\SE\.agents\skills",
-        r"%USERPROFILE%\.claude\skills",
-    ]
-    .into_iter()
-    .map(PathBuf::from)
-    .collect()
+    let h = home();
+    vec![h.join("SE/se/skills"), h.join("SE/.agents/skills"), h.join(".claude/skills")]
 }
 
 #[test]
@@ -36,7 +36,8 @@ fn the_real_skill_roots_load_atina_and_tolerate_the_claude_skills_synced_junk() 
         report.skipped
     );
 
-    let se_skills_root = Path::new(r"%USERPROFILE%\SE\se\skills");
+    let se_skills_buf = home().join("SE/se/skills");
+    let se_skills_root = se_skills_buf.as_path();
     if se_skills_root.exists() {
         assert!(
             report
@@ -55,7 +56,8 @@ fn the_real_skill_roots_load_atina_and_tolerate_the_claude_skills_synced_junk() 
     // `~\.claude\skills\synced\...` holds unrelated bucket/manifest
     // files with no `SKILL.md` directly inside it -- not a skill
     // candidate, so it must appear in neither list.
-    let claude_skills_root = Path::new(r"%USERPROFILE%\.claude\skills");
+    let claude_skills_buf = home().join(".claude/skills");
+    let claude_skills_root = claude_skills_buf.as_path();
     if claude_skills_root.exists() {
         assert!(
             !report.skills.iter().any(|s| s

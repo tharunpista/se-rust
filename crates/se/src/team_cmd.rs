@@ -131,7 +131,11 @@ fn build_runner(
         .map_err(|e| e.to_string())?
         .with_ruleset(ruleset);
     let runner = match crate::catalogue_root() {
-        Some(root) => runner.with_catalogue_root(root).with_auto_route(true),
+        Some(root) => runner
+            .with_catalogue_root(root)
+            .with_auto_route(true)
+            .with_router_model(crate::router_model())
+            .with_role_models(crate::role_models()),
         None => runner,
     };
     se_core::Runner::set_mode(&runner, mode);

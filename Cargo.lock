@@ -849,6 +849,7 @@ dependencies = [
  "se-protocol",
  "se-provider",
  "se-tui",
+ "serde_json",
 ]
 
 [[package]]

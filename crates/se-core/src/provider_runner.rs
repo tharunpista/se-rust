@@ -128,6 +128,12 @@ pub struct ProviderRunner {
     sticky_specialist: Sticky,
     /// Manual, auto or plan; read at every tool call so a switch takes effect mid-turn.
     mode: std::sync::Mutex<se_protocol::WorkMode>,
+    /// A cheap model that picks the specialist (`SE_ROUTER_MODEL`). Without one, an
+    /// agent-CLI turn is not routed at all: keyword guesses picked wrong roles.
+    router_model: Option<se_protocol::ModelRef>,
+    /// Roles that run on their own model (`~/.se/models.json` "roles"), e.g. the
+    /// chief and the architects on the strongest model the user has.
+    role_models: std::collections::HashMap<String, se_protocol::ModelRef>,
 }
 
 /// The conversation's specialist, saved beside the conversation (when a
@@ -204,6 +210,8 @@ impl ProviderRunner {
             compact_at_tokens: None,
             sticky_specialist: Default::default(),
             mode: Default::default(),
+            router_model: None,
+            role_models: Default::default(),
             team: None,
         })
     }
@@ -234,6 +242,21 @@ impl ProviderRunner {
 
     pub fn with_auto_route(mut self, on: bool) -> Self {
         self.auto_route = on;
+        self
+    }
+
+    /// Routes specialist choice through this model instead of the turn's own.
+    pub fn with_router_model(mut self, model: Option<se_protocol::ModelRef>) -> Self {
+        self.router_model = model;
+        self
+    }
+
+    /// Gives these roles their own model, by role id.
+    pub fn with_role_models(
+        mut self,
+        models: std::collections::HashMap<String, se_protocol::ModelRef>,
+    ) -> Self {
+        self.role_models = models;
         self
     }
 
@@ -461,6 +484,71 @@ fn render_transcript(messages: &[Message]) -> String {
 }
 
 /// One short, tool-less question to the model; its text answer or `None`.
+/// Appended to every specialist's body. The 194 roles were written for a richer host
+/// (memory, escalation, web search, pre-flight questions); without this a role waits on
+/// tools that do not exist here, which is how a turn ended in a plan and no change.
+const RUNTIME_NOTE: &str = concat!(
+    "\n\n---\nSE runtime (this overrides anything above that assumes otherwise):\n",
+    "- You work on the user's real project through the tools offered to you this turn; ",
+    "no other tool exists here. Memory, escalation, web search, task graphs and skills are not available.\n",
+    "- Once decisions are settled and the task asks for a change you have a write tool for, make the change; ",
+    "do not only describe it.\n",
+    "- To escalate, finish what you safely can, then add a line `Escalation: <role id or user> - <reason>`.\n",
+    "- End with a short handoff: files changed, what you checked and how, what is left.\n",
+);
+
+/// Who can settle an open decision, which decides how a role handles one.
+#[derive(Clone, Copy)]
+enum Asker {
+    /// The user is in the conversation: ask them, with options, then wait.
+    User,
+    /// A sub-agent: hand the question back to the agent that deployed it.
+    Parent,
+    /// An unattended team task: nobody can answer mid-run.
+    Nobody,
+}
+
+const ASK_USER: &str = "- Do not guess at a decision that changes what gets built (scope, stack, design, \
+data model, anything destructive or hard to undo), including where your procedure says to read memory or \
+ask a pre-flight question. If the user has not settled it, ask before building: at most 3 questions, each \
+with 2-3 concrete options, your recommendation first and marked (recommended), and a last option \
+\"Something else - tell me what you prefer\". Then stop and wait for the answer. A small, clear task needs \
+no questions: just do it.\n";
+const ASK_PARENT: &str = "- You cannot reach the user. If a decision that changes what gets built is \
+unsettled, do not guess: stop and return the question, with 2-3 options and your recommendation first, to \
+the agent that deployed you, which will ask the user.\n";
+const ASSUME: &str = "- This is an unattended team task and nobody can answer mid-run: where a decision is \
+unsettled, take the safest reasonable option and list it under `Assumptions:` in your handoff. Never take a \
+destructive or irreversible step on an assumption.\n";
+
+fn runtime_note(body: String, roster: Option<&str>, asker: Asker, root: &str) -> String {
+    let decide = match asker {
+        Asker::User => ASK_USER,
+        Asker::Parent => ASK_PARENT,
+        Asker::Nobody => ASSUME,
+    };
+    // An agent CLI runs in an empty folder of its own and took that for the project.
+    let mut out = format!(
+        "{body}{RUNTIME_NOTE}{decide}- The project root is `{root}`. Use paths relative to it, \
+         also in a task you hand to another agent.\n"
+    );
+    if let Some(r) = roster {
+        out.push_str(
+            "- A change your own tools cannot make goes to the specialist who owns it: call the \
+             `agent` tool with its role id and the complete task, then report its result. If it \
+             returns a question, put it to the user with its options. Specialists by department:\n",
+        );
+        out.push_str(r);
+    }
+    out
+}
+
+/// The role body a specialist prompt starts with, without SE's runtime note (tests).
+#[cfg(test)]
+pub(crate) fn role_body(prompt: &str) -> &str {
+    prompt.split("\n\n---\nSE runtime").next().unwrap_or(prompt)
+}
+
 fn ask(
     provider: &dyn se_provider::ModelProvider,
     model: &str,
@@ -472,7 +560,9 @@ fn ask(
         model,
         crate::router::ROUTER_SYSTEM,
         prompt,
-        64,
+        // Room for a reasoning model to think before its one-word answer: at 64
+        // tokens, MiniMax and Nemotron spent it all thinking and answered nothing.
+        1024,
         sink,
     )
 }
@@ -518,14 +608,20 @@ fn ask_with(
     (result.ok().map(|()| text), usage)
 }
 
-/// Total tokens a call reported, or `None` when it reported neither
-/// figure (never treated as zero).
+/// Fresh tokens a call reported (input minus cache reads, plus output), or
+/// `None` when it reported neither figure (never treated as zero). Cache
+/// reads are left out: an agent CLI resends its ~30k-token prompt every
+/// round from cache, which spent a 60k sub-agent budget in two rounds.
 fn reported_tokens(u: Option<&Usage>) -> Option<u64> {
     let u = u?;
     if u.input_tokens.is_none() && u.output_tokens.is_none() {
         return None;
     }
-    Some(u.input_tokens.unwrap_or(0) + u.output_tokens.unwrap_or(0))
+    let fresh_input = u
+        .input_tokens
+        .unwrap_or(0)
+        .saturating_sub(u.cached_input_tokens.unwrap_or(0));
+    Some(fresh_input + u.output_tokens.unwrap_or(0))
 }
 
 impl Runner for ProviderRunner {
@@ -693,13 +789,24 @@ impl ProviderRunner {
                     .then(|| self.sticky_specialist.get())
                     .flatten()
                     .filter(|id| c.agents.iter().any(|a| &a.frontmatter.id == id));
-                if let Some(id) = kept {
-                    return id;
+                // Without a router model the specialist stays put (a re-route would cost
+                // the turn's own model two calls a turn); with one, it may move.
+                if let Some(id) = kept.as_ref().filter(|_| self.router_model.is_none()) {
+                    return id.clone();
                 }
-                let (picked, usage) =
-                    self.route(provider, &chosen.model, &turn.text, &c.agents, sink, node);
+                let (picked, usage) = self.route(
+                    provider,
+                    &chosen.model,
+                    &turn.text,
+                    &c.agents,
+                    sink,
+                    node,
+                    kept.as_deref(),
+                );
                 total_usage = usage;
-                picked.unwrap_or_else(|| FALLBACK_AGENT_ID.to_string())
+                picked
+                    .or(kept)
+                    .unwrap_or_else(|| FALLBACK_AGENT_ID.to_string())
             }),
         };
 
@@ -715,18 +822,20 @@ impl ProviderRunner {
         ) {
             self.sticky_specialist.set(Some(id.clone()));
         }
-        let (system_prompt, invoked, allowed_tools, max_calls, budget_tokens) = match &specialist_id
-        {
+        let (system_prompt, invoked, allowed_tools, max_calls, budget_tokens, roster) =
+            match &specialist_id {
             None if evaluator => (
                 crate::team::evaluate::EVALUATOR_SYSTEM.to_string(),
                 None,
                 None,
                 None,
                 None,
+                String::new(),
             ),
-            None => (SYSTEM_PROMPT.to_string(), None, None, None, None),
+            None => (SYSTEM_PROMPT.to_string(), None, None, None, None, String::new()),
             Some(id) => {
                 let report = catalogue.expect("loaded whenever a specialist id exists");
+                let roster = crate::router::roster(&report.agents);
                 let Some(agent) = report.agents.into_iter().find(|a| &a.frontmatter.id == id)
                 else {
                     return Outcome::Failed {
@@ -753,8 +862,61 @@ impl ProviderRunner {
                     allowed,
                     agent.frontmatter.max_calls,
                     agent.frontmatter.context_budget_tokens,
+                    roster,
                 )
             }
+        };
+        // Depth 1, enforced here: a sub-agent is never offered `agent`,
+        // and neither is a role that did not declare it, an evaluator,
+        // or a team node (its claims and budget would not reach the child).
+        // Agent CLIs get it too, through the text tool bridge in se-provider.
+        let may_spawn = child.is_none()
+            && !evaluator
+            && node.is_none()
+            && allowed_tools
+                .as_ref()
+                .is_none_or(|a| a.iter().any(|t| t == agent_tool::AGENT_TOOL));
+        let system_prompt = match &invoked {
+            Some(_) => {
+                let asker = match (child, node) {
+                    (Some(_), _) => Asker::Parent,
+                    (None, Some(_)) => Asker::Nobody,
+                    (None, None) => Asker::User,
+                };
+                runtime_note(
+                    system_prompt,
+                    may_spawn.then_some(roster.as_str()),
+                    asker,
+                    &self.workspace_root.display().to_string(),
+                )
+            }
+            None => system_prompt,
+        };
+
+        // Charter §6.6 level 2: a role given its own model (`~/.se/models.json`) runs on it.
+        // It outranks the session's `/models` pick (the user set both, and this one names
+        // the role), never a team task's explicit `model:`.
+        let profile = invoked
+            .as_ref()
+            .and_then(|(id, _)| self.role_models.get(id))
+            .filter(|m| **m != chosen && !(node.is_some() && turn.model.is_some()));
+        // Sub-agents start from the session's model, not this role's own: the chief on
+        // the top model must not put every specialist it deploys there too (seen live).
+        let session_model = chosen.clone();
+        let (chosen, provider) = match profile {
+            None => (chosen, provider),
+            Some(m) => match self.registry.get(&m.provider) {
+                Some(p) if p.detect().configured => (m.clone(), p),
+                _ => {
+                    return Outcome::Failed {
+                        detail: format!(
+                            "this role runs on {}/{} (~/.se/models.json), but that provider is not \
+                             configured -- connect it or change the file",
+                            m.provider, m.model
+                        ),
+                    };
+                }
+            },
         };
 
         // Who this turn acts as, for every gateway decision it causes:
@@ -856,16 +1018,6 @@ impl ProviderRunner {
         let turn_started = Instant::now();
         let turn_deadline = child.map_or(self.turn_deadline, |c| c.deadline);
         let deadline_fired = Arc::new(AtomicBool::new(false));
-        // Depth 1, enforced here: a sub-agent is never offered `agent`,
-        // and neither is a role that did not declare it, an evaluator,
-        // or a team node (its claims and budget would not reach the child).
-        // Agent CLIs get it too, through the text tool bridge in se-provider.
-        let may_spawn = child.is_none()
-            && !evaluator
-            && node.is_none()
-            && allowed_tools
-                .as_ref()
-                .is_none_or(|a| a.iter().any(|t| t == agent_tool::AGENT_TOOL));
         let mut tools = if evaluator {
             Vec::new()
         } else {
@@ -1103,7 +1255,7 @@ impl ProviderRunner {
                     // A round's `agent` calls run first, side by side; the
                     // results are fed back below in the model's order.
                     let mut spawned = if may_spawn {
-                        self.run_agents(sink, &tool_calls, &agent, &chosen)
+                        self.run_agents(sink, &tool_calls, &agent, &session_model)
                     } else {
                         vec![None; tool_calls.len()]
                     };
@@ -1269,12 +1421,16 @@ impl ProviderRunner {
     }
 
     /// Picks a specialist for a turn that named none (see `crate::router`):
-    /// two short multiple-choice questions to the turn's own model, each
-    /// answer checked against the catalogue, then keyword scoring, then
-    /// `None` (a plain turn). A failed routing call never fails the turn.
+    /// two short multiple-choice questions to the router model (or the turn's
+    /// own API model), each answer checked against the catalogue, else `None`.
+    /// No keyword fallback: on real wording it picked confidently wrong roles.
+    /// With `current`, the router may answer KEEP, and a same-department
+    /// answer keeps it too, so a follow-up never flip-flops within a field.
+    /// A failed routing call never fails the turn.
     ///
     /// shortcut: the two routing calls' token usage is not reported.
     /// Fold it into the turn's usage when cost attribution needs it.
+    #[allow(clippy::too_many_arguments)] // one call site; a params struct would only rename them
     fn route(
         &self,
         provider: &dyn se_provider::ModelProvider,
@@ -1283,16 +1439,19 @@ impl ProviderRunner {
         agents: &[se_catalogue::AgentDefinition],
         sink: &TurnSink,
         node: Option<&str>,
+        current: Option<&str>,
     ) -> (Option<String>, Option<Usage>) {
         use crate::router;
-        // An agent CLI costs a process start and its own large prompt per
-        // call, so it is routed by the free keyword match alone.
-        if provider.is_agent_cli() {
-            return (
-                router::lexical(task, agents).map(|a| a.frontmatter.id.clone()),
-                None,
-            );
-        }
+        let routed = self
+            .router_model
+            .as_ref()
+            .and_then(|m| Some((self.registry.get(&m.provider)?, m.model.as_str())));
+        let (provider, model) = match routed {
+            Some(r) => r,
+            // An agent CLI costs a process start and its own large prompt per call.
+            None if provider.is_agent_cli() => return (None, None),
+            None => (provider, model),
+        };
         let mut usage: Option<Usage> = None;
         // Each routing call is budgeted and charged like any other; a
         // spent budget skips straight to the free keyword fallback.
@@ -1310,8 +1469,22 @@ impl ProviderRunner {
         };
         let depts = router::departments(agents);
         let names: Vec<&str> = depts.iter().map(|(d, _)| d.as_str()).collect();
-        let dept = ask_once(&router::department_prompt(task, &depts))
-            .and_then(|r| router::pick(&r, &names).map(str::to_string));
+        let current_dept = current.and_then(|id| {
+            agents
+                .iter()
+                .find(|a| a.frontmatter.id == id)
+                .map(|a| (id, a.frontmatter.department.as_str()))
+        });
+        let reply = ask_once(&router::department_prompt(task, &depts, current_dept));
+        if let Some((id, d)) = current_dept {
+            let keep = reply.as_deref().is_none_or(|r| {
+                r.trim().eq_ignore_ascii_case("keep") || router::pick(r, &names) == Some(d)
+            });
+            if keep {
+                return (Some(id.to_string()), usage);
+            }
+        }
+        let dept = reply.and_then(|r| router::pick(&r, &names).map(str::to_string));
         if let Some(dept) = dept {
             let roles: Vec<&se_catalogue::AgentDefinition> = agents
                 .iter()
@@ -1324,10 +1497,7 @@ impl ProviderRunner {
                 return (role, usage);
             }
         }
-        (
-            router::lexical(task, agents).map(|a| a.frontmatter.id.clone()),
-            usage,
-        )
+        (None, usage)
     }
 
     fn admit(&self, node: Option<&str>) -> Result<(), String> {
@@ -1368,7 +1538,9 @@ impl ProviderRunner {
         // it is audited), but it is never put back to them as a question.
         // Every interactive turn runs as a specialist, so asking here would
         // ask on every turn after a `/models` pick.
-        let users_pick = turn.team_node.is_none() && turn.model.as_ref() == Some(chosen);
+        // A model the user gave a role in ~/.se/models.json is their pick too.
+        let users_pick = (turn.team_node.is_none() && turn.model.as_ref() == Some(chosen))
+            || self.role_models.values().any(|m| m == chosen);
         let shown = format!(
             "{} wants to use {}/{} with its stored credential",
             agent.0, chosen.provider, chosen.model
@@ -1442,6 +1614,21 @@ impl ProviderRunner {
                 agent,
                 "plan mode: only read and search run; describe the change instead of making it",
             );
+        }
+        // A tool the role was never offered. Said plainly: "denied by policy" read as a
+        // permission wall, and the chief stopped instead of handing the change on (seen live).
+        if let Some(own) = allowed_tools.filter(|a| !a.iter().any(|t| t == &call.name)) {
+            let next = if own.iter().any(|t| t == agent_tool::AGENT_TOOL) {
+                "call the `agent` tool with the owning specialist's role id and the complete task"
+            } else {
+                "name the change and the role that should make it in your answer"
+            };
+            let reason = format!(
+                "`{}` is not one of your tools (yours: {}); {next}",
+                call.name,
+                own.join(", ")
+            );
+            return self.reject_unparsed(sink, call, agent, &reason);
         }
         let parsed =
             match tool_loop::parse_tool_call(&self.workspace_root, &call.name, &call.arguments) {
@@ -1794,6 +1981,8 @@ mod tests {
                 compact_at_tokens: None,
                 sticky_specialist: Default::default(),
                 mode: Default::default(),
+                router_model: None,
+                role_models: Default::default(),
                 team: None,
             },
             requests,
@@ -1940,6 +2129,8 @@ mod tests {
             compact_at_tokens: None,
             sticky_specialist: Default::default(),
             mode: Default::default(),
+            router_model: None,
+            role_models: Default::default(),
             team: None,
         };
         (runner, requests_seen)
@@ -2380,6 +2571,8 @@ mod tests {
             compact_at_tokens: None,
             sticky_specialist: Default::default(),
             mode: Default::default(),
+            router_model: None,
+            role_models: Default::default(),
             team: None,
         };
 
@@ -2710,6 +2903,8 @@ mod tests {
             compact_at_tokens: None,
             sticky_specialist: Default::default(),
             mode: Default::default(),
+            router_model: None,
+            role_models: Default::default(),
             team: None,
         };
 
@@ -2723,7 +2918,7 @@ mod tests {
         let requests = seen.lock().unwrap().clone();
         assert_eq!(requests.len(), 1);
         assert_eq!(
-            requests[0][0].trim(), "SPECIALIST SYSTEM PROMPT MARKER",
+            role_body(&requests[0][0]).trim(), "SPECIALIST SYSTEM PROMPT MARKER",
             "the provider's first message must be the agent's own body, not the generic system prompt"
         );
 
@@ -2808,7 +3003,7 @@ mod tests {
         assert_eq!(seen.len(), 2, "a denial forces a second round trip");
         let first_system = seen[0].messages[0].content.clone();
         let second_system = seen[1].messages[0].content.clone();
-        assert_eq!(first_system.trim(), "PINNED SYSTEM PROMPT");
+        assert_eq!(role_body(&first_system).trim(), "PINNED SYSTEM PROMPT");
         assert_eq!(
             first_system, second_system,
             "the system prompt must be identical across round trips, not re-resolved"
@@ -2854,7 +3049,7 @@ mod tests {
         );
         let saw_denial = payloads.iter().any(|p| match p {
             Payload::ToolCompleted { ok, preview, .. } => {
-                !ok && preview.contains("denied by policy")
+                !ok && preview.contains("is not one of your tools")
             }
             _ => false,
         });
@@ -3467,20 +3662,20 @@ mod tests {
             true,
         );
         assert_eq!(invoked(&payloads).as_deref(), Some("database-engineer"));
-        assert_eq!(systems[0].trim(), "DB BODY");
+        assert_eq!(role_body(&systems[0]).trim(), "DB BODY");
     }
 
-    /// A small model's useless answers fall back to keyword scoring.
+    /// A small model's useless answers route to the fallback, never to a keyword guess.
     #[test]
-    fn bad_routing_answers_fall_back_to_keywords() {
+    fn bad_routing_answers_go_to_the_fallback_not_a_keyword_guess() {
         let (systems, payloads) = run_routed(
             "no idea",
             "",
             "build a react component for the settings screen",
             true,
         );
-        assert_eq!(invoked(&payloads).as_deref(), Some("frontend-lead"));
-        assert_eq!(systems[0].trim(), "FRONTEND BODY");
+        assert_eq!(invoked(&payloads).as_deref(), Some(FALLBACK_AGENT_ID));
+        assert_eq!(role_body(systems.last().unwrap()).trim(), "ORCH BODY");
     }
 
     /// Nothing matches anywhere: the turn still runs as an SE specialist
@@ -3489,7 +3684,7 @@ mod tests {
     fn an_unroutable_turn_runs_as_the_fallback_specialist() {
         let (systems, payloads) = run_routed("??", "??", "hello there", true);
         assert_eq!(invoked(&payloads).as_deref(), Some(FALLBACK_AGENT_ID));
-        assert_eq!(systems.last().unwrap().trim(), "ORCH BODY");
+        assert_eq!(role_body(systems.last().unwrap()).trim(), "ORCH BODY");
     }
 
     /// Forced routing: an unreadable catalogue fails the turn before any
@@ -3689,6 +3884,237 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An agent CLI that records each turn's system prompt, and a router
+    /// that answers routing questions from a script (KEEP, departments, roles).
+    struct FakeCli(Arc<std::sync::Mutex<Vec<String>>>);
+    impl ModelProvider for FakeCli {
+        fn id(&self) -> &str {
+            "cli"
+        }
+        fn display_name(&self) -> &str {
+            "cli"
+        }
+        fn env_var(&self) -> &str {
+            "SE_TEST_CLI"
+        }
+        fn detect(&self) -> Status {
+            Status {
+                configured: true,
+                detail: "c".into(),
+                source: se_provider::Source::Environment,
+            }
+        }
+        fn is_agent_cli(&self) -> bool {
+            true
+        }
+        fn stream(
+            &self,
+            request: &ChatRequest,
+            _cancelled: &dyn Fn() -> bool,
+            on_event: &mut dyn FnMut(StreamEvent) -> bool,
+        ) -> Result<(), ProviderError> {
+            let user = &request.messages.last().unwrap().content;
+            assert!(!user.contains("Which department"), "an agent CLI is never asked to route");
+            self.0.lock().unwrap().push(request.messages[0].content.clone());
+            on_event(StreamEvent::TextDelta("answered".into()));
+            on_event(StreamEvent::Done);
+            Ok(())
+        }
+        fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct ScriptRouter(std::sync::Mutex<std::collections::VecDeque<&'static str>>);
+    impl ModelProvider for ScriptRouter {
+        fn id(&self) -> &str {
+            "router"
+        }
+        fn display_name(&self) -> &str {
+            "router"
+        }
+        fn env_var(&self) -> &str {
+            "SE_TEST_ROUTER"
+        }
+        fn detect(&self) -> Status {
+            Status {
+                configured: true,
+                detail: "r".into(),
+                source: se_provider::Source::Environment,
+            }
+        }
+        fn stream(
+            &self,
+            _request: &ChatRequest,
+            _cancelled: &dyn Fn() -> bool,
+            on_event: &mut dyn FnMut(StreamEvent) -> bool,
+        ) -> Result<(), ProviderError> {
+            let reply = self.0.lock().unwrap().pop_front().expect("an unscripted routing call");
+            on_event(StreamEvent::TextDelta(reply.into()));
+            on_event(StreamEvent::Done);
+            Ok(())
+        }
+        fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn cli_core(router: Option<Vec<&'static str>>) -> (crate::CoreHandle, Arc<std::sync::Mutex<Vec<String>>>, std::path::PathBuf) {
+        let systems = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut runner, _) = runner_with(Vec::new(), Duration::ZERO, None);
+        let mut registry = Registry::empty();
+        registry.register(Box::new(FakeCli(systems.clone())));
+        let router_model = router.map(|script| {
+            registry.register(Box::new(ScriptRouter(std::sync::Mutex::new(script.into()))));
+            se_protocol::ModelRef {
+                provider: "router".into(),
+                model: "small".into(),
+            }
+        });
+        runner.registry = registry;
+        runner.provider_id = "cli".into();
+        let root = routing_catalogue();
+        let core = crate::start(
+            runner
+                .with_catalogue_root(root.clone())
+                .with_auto_route(true)
+                .with_router_model(router_model),
+        );
+        (core, systems, root)
+    }
+
+    /// No router model: an agent-CLI turn is never keyword-guessed into a
+    /// role; it goes to the fallback, which is told the real roster.
+    #[test]
+    fn an_agent_cli_turn_without_a_router_goes_to_the_fallback_with_the_roster() {
+        // "react component screen" would keyword-match frontend-lead.
+        let (core, systems, root) = cli_core(None);
+        finish(&core, "build a react component for the settings screen");
+        core.shutdown();
+        let seen = systems.lock().unwrap().clone();
+        assert_eq!(role_body(&seen[0]).trim(), "ORCH BODY");
+        assert!(seen[0].contains("SE runtime"), "{}", seen[0]);
+        assert!(
+            seen[0].contains("backend-and-data: backend-lead, database-engineer"),
+            "{}",
+            seen[0]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// With a router model, the CLI turn is routed by it; a follow-up the
+    /// router calls KEEP or same-department stays; a move to another
+    /// department switches the specialist.
+    #[test]
+    fn a_router_model_routes_cli_turns_keeps_follow_ups_and_switches_on_a_new_field() {
+        let (core, systems, root) = cli_core(Some(vec![
+            "backend-and-data",
+            "database-engineer",
+            "KEEP",
+            "backend-and-data",
+            "frontend",
+            "frontend-lead",
+        ]));
+        for task in [
+            "add an orders table",
+            "what is the codename again?",
+            "and an index on it",
+            "now the settings screen",
+        ] {
+            finish(&core, task);
+        }
+        core.shutdown();
+        let seen: Vec<String> = systems
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| role_body(s).trim().to_string())
+            .collect();
+        assert_eq!(seen, ["DB BODY", "DB BODY", "DB BODY", "FRONTEND BODY"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A role given its own model runs on it, even over the session's default,
+    /// and without asking (the user set it in models.json).
+    #[test]
+    fn a_role_with_its_own_model_runs_on_that_model() {
+        let default_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let role_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut runner, _) = runner_with(Vec::new(), Duration::ZERO, None);
+        let mut registry = Registry::empty();
+        registry.register(Box::new(RoutingProvider {
+            dept_reply: "backend-and-data",
+            role_reply: "database-engineer",
+            systems: default_seen.clone(),
+            asked: Arc::new(AtomicUsize::new(0)),
+        }));
+        registry.register(Box::new(FakeCli(role_seen.clone())));
+        runner.registry = registry;
+        runner.provider_id = "routing".into();
+        let root = routing_catalogue();
+        let roles = std::collections::HashMap::from([(
+            "database-engineer".to_string(),
+            se_protocol::ModelRef {
+                provider: "cli".into(),
+                model: "top".into(),
+            },
+        )]);
+        let core = crate::start(
+            runner
+                .with_catalogue_root(root.clone())
+                .with_role_models(roles),
+        );
+        core.submit_specialist("database-engineer", "add an orders table", vec![])
+            .unwrap();
+        wait_finished(&core);
+        core.submit_specialist("frontend-lead", "now the screen", vec![])
+            .unwrap();
+        wait_finished(&core);
+        core.shutdown();
+        let role: Vec<String> = role_seen.lock().unwrap().iter().map(|s| role_body(s).trim().to_string()).collect();
+        let default: Vec<String> = default_seen.lock().unwrap().iter().map(|s| role_body(s).trim().to_string()).collect();
+        assert_eq!(role, ["DB BODY"], "the mapped role ran on its own model");
+        assert_eq!(default, ["FRONTEND BODY"], "an unmapped role stayed on the default");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Budgets count fresh tokens: an agent CLI's cached, resent prompt is not new spend.
+    #[test]
+    fn budgets_count_fresh_tokens_not_cache_reads() {
+        let u = Usage {
+            input_tokens: Some(31_000),
+            output_tokens: Some(200),
+            cached_input_tokens: Some(30_000),
+            ..Default::default()
+        };
+        assert_eq!(reported_tokens(Some(&u)), Some(1_200));
+        let none = Usage::default();
+        assert_eq!(reported_tokens(Some(&none)), None, "silence is not zero");
+    }
+
+    /// A role that cannot deploy agents is not shown the roster.
+    #[test]
+    fn the_roster_is_only_shown_to_a_role_that_may_deploy_agents() {
+        let with = runtime_note("B".into(), Some("  d: a, b\n"), Asker::User, "/p");
+        let without = runtime_note("B".into(), None, Asker::Parent, "/p");
+        assert!(with.contains("d: a, b") && with.starts_with("B"));
+        assert!(!without.contains("call the `agent` tool"));
+        assert_eq!(role_body(&without), "B");
+    }
+
+    /// Open decisions: the user is asked (with options and a free choice), a
+    /// sub-agent hands the question up, an unattended team task records assumptions.
+    #[test]
+    fn open_decisions_are_asked_handed_up_or_recorded_by_who_can_answer() {
+        let user = runtime_note("B".into(), None, Asker::User, "/p");
+        assert!(user.contains("ask before building") && user.contains("Something else - tell me"));
+        assert!(user.contains("(recommended)"));
+        let child = runtime_note("B".into(), None, Asker::Parent, "/p");
+        assert!(child.contains("cannot reach the user") && !child.contains("ask before building"));
+        let team = runtime_note("B".into(), None, Asker::Nobody, "/p");
+        assert!(team.contains("Assumptions:") && !team.contains("ask before building"));
+    }
+
     /// A conversation keeps its specialist: a follow-up is not re-routed
     /// on its own words (no routing calls), and naming another switches it.
     #[test]
@@ -3728,7 +4154,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .map(|s| s.trim().to_string())
+            .map(|s| role_body(s).trim().to_string())
             .collect();
         assert_eq!(
             seen,

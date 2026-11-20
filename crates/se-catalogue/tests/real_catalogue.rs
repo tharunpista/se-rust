@@ -10,15 +10,23 @@
 //! user's `SE` tree must not fail its test suite over a missing
 //! external directory.
 
-use std::path::Path;
+fn home() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default(),
+    )
+}
 
-const CATALOGUE_ROOT: &str = r"%USERPROFILE%\SE\se\agents";
+fn catalogue_root() -> String {
+    std::env::var("SE_CATALOGUE_ROOT")
+        .unwrap_or_else(|_| home().join("SE/se/agents").to_string_lossy().into_owned())
+}
 
 #[test]
 fn the_real_catalogue_loads_194_agents_and_skips_exactly_the_2_known_non_agent_files() {
-    let root = Path::new(CATALOGUE_ROOT);
+    let root_buf = std::path::PathBuf::from(catalogue_root());
+    let root = root_buf.as_path();
     if !root.exists() {
-        eprintln!("skipping: {CATALOGUE_ROOT} not present on this machine");
+        eprintln!("skipping: {} not present on this machine", catalogue_root());
         return;
     }
 
@@ -74,9 +82,10 @@ fn the_real_catalogue_loads_194_agents_and_skips_exactly_the_2_known_non_agent_f
 
 #[test]
 fn loading_the_real_catalogue_twice_in_a_row_never_modifies_it() {
-    let root = Path::new(CATALOGUE_ROOT);
+    let root_buf = std::path::PathBuf::from(catalogue_root());
+    let root = root_buf.as_path();
     if !root.exists() {
-        eprintln!("skipping: {CATALOGUE_ROOT} not present on this machine");
+        eprintln!("skipping: {} not present on this machine", catalogue_root());
         return;
     }
 

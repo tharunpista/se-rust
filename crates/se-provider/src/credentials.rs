@@ -476,7 +476,7 @@ mod tests {
             "did it connect the api key",
             "use sk-learn-and-numpy-for-this-task please",
             "free sk_buff_head_v2_allocation on exit",
-            "see %USERPROFILE%\\SE\\se-rust\\crates\\se-provider\\src\\credentials.rs",
+            "see C:\\Users\\someone\\SE\\se-rust\\crates\\se-provider\\src\\credentials.rs",
             "https://integrate.api.nvidia.com/v1/chat/completions?stream=true",
             "commit 3f9a1c2b4d5e6f7081928374655647382910abcd broke it", // lowercase hex SHA
             "sha=3f9a1c2b4d5e6f7081928374655647382910abcd",              // hex even with =

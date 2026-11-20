@@ -405,7 +405,11 @@ fn open_core(
                 if let Some(root) = catalogue_root.clone() {
                     // A turn that names no specialist gets one picked
                     // from the catalogue automatically.
-                    runner = runner.with_catalogue_root(root).with_auto_route(true);
+                    runner = runner
+                        .with_catalogue_root(root)
+                        .with_auto_route(true)
+                        .with_router_model(router_model())
+                        .with_role_models(role_models());
                 }
                 let (runner, audit_warning) = with_audit_log(
                     runner
@@ -543,7 +547,11 @@ fn exec(cli: &Cli, request: &str) -> std::process::ExitCode {
         }
     };
     let runner = match catalogue_root() {
-        Some(root) => runner.with_catalogue_root(root).with_auto_route(true),
+        Some(root) => runner
+            .with_catalogue_root(root)
+            .with_auto_route(true)
+            .with_router_model(router_model())
+            .with_role_models(role_models()),
         None => runner,
     };
     let (runner, audit_warning) = with_audit_log(runner.with_compaction(compact_at()));
@@ -577,6 +585,22 @@ fn exec(cli: &Cli, request: &str) -> std::process::ExitCode {
             match event.payload {
                 Payload::SpecialistInvoked { agent_id, .. } => {
                     eprintln!("se: specialist {agent_id}");
+                }
+                // Sub-agents, on stderr like the rest of the run's narration.
+                Payload::Agent(se_protocol::AgentEvent::Spawned {
+                    agent_id,
+                    role,
+                    parent,
+                    task,
+                }) => eprintln!(
+                    "se: ├─ agent {agent_id} {role} (from {}): {task}",
+                    parent.as_deref().unwrap_or("main")
+                ),
+                Payload::Agent(se_protocol::AgentEvent::Done { agent_id, .. }) => {
+                    eprintln!("se: ├─ agent {agent_id} done");
+                }
+                Payload::Agent(se_protocol::AgentEvent::Failed { agent_id, error }) => {
+                    eprintln!("se: ├─ agent {agent_id} failed: {error}");
                 }
                 // Reasoning goes to stderr: stdout carries only the answer,
                 // so `se exec` output stays pipeable.
@@ -1075,6 +1099,56 @@ fn last_model_path() -> Option<std::path::PathBuf> {
     std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(|h| std::path::PathBuf::from(h).join(".se").join("last-model"))
+}
+
+fn model_ref(text: &str) -> Option<se_protocol::ModelRef> {
+    let (p, m) = text.trim().split_once('/')?;
+    (!p.is_empty() && !m.is_empty()).then(|| se_protocol::ModelRef {
+        provider: p.to_string(),
+        model: m.to_string(),
+    })
+}
+
+/// `~/.se/models.json`: `{"router": "<provider>/<model>", "roles": {"<role id>": "<provider>/<model>"}}`.
+/// A missing file is no settings; an unreadable one is reported once and ignored.
+fn models_file() -> serde_json::Value {
+    let Some(path) = last_model_path().map(|p| p.with_file_name("models.json")) else {
+        return serde_json::Value::Null;
+    };
+    match std::fs::read_to_string(&path) {
+        Err(_) => serde_json::Value::Null,
+        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
+            eprintln!("se: ignoring {}: {e}", path.display());
+            serde_json::Value::Null
+        }),
+    }
+}
+
+/// The cheap model that picks specialists: `SE_ROUTER_MODEL`, else models.json `router`.
+/// Opt-in, because every task's text is sent to it.
+pub(crate) fn router_model() -> Option<se_protocol::ModelRef> {
+    match std::env::var("SE_ROUTER_MODEL") {
+        Ok(text) => model_ref(&text),
+        Err(_) => model_ref(models_file()["router"].as_str()?),
+    }
+}
+
+/// Roles with their own model, from models.json `roles`.
+pub(crate) fn role_models() -> std::collections::HashMap<String, se_protocol::ModelRef> {
+    let file = models_file();
+    let Some(roles) = file["roles"].as_object() else {
+        return Default::default();
+    };
+    roles
+        .iter()
+        .filter_map(|(id, v)| match v.as_str().and_then(model_ref) {
+            Some(m) => Some((id.clone(), m)),
+            None => {
+                eprintln!("se: models.json: `{id}` needs \"<provider>/<model>\"; ignored");
+                None
+            }
+        })
+        .collect()
 }
 
 fn load_last_model() -> Option<(String, String)> {

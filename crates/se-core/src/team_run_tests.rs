@@ -148,6 +148,8 @@ fn runner(ws: &Path, vendors: &[(&str, Option<(u64, u64)>)]) -> (ProviderRunner,
         compact_at_tokens: None,
         sticky_specialist: Default::default(),
         mode: Default::default(),
+        router_model: None,
+        role_models: Default::default(),
         team: None,
     };
     (runner, seen)

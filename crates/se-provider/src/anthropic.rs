@@ -147,7 +147,16 @@ pub fn parse_frame(payload: &str, state: &mut StreamState) -> Vec<StreamEvent> {
     match value.get("type").and_then(|t| t.as_str()).unwrap_or("") {
         "message_start" => {
             let usage = &value["message"]["usage"];
-            state.input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64());
+            // Anthropic counts cache reads and writes apart from `input_tokens`; SE's
+            // `Usage` treats cached input as part of input, as OpenAI and Codex report it.
+            state.input_tokens = [
+                "input_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+            ]
+            .iter()
+            .filter_map(|k| usage.get(*k).and_then(|v| v.as_u64()))
+            .reduce(|a, b| a + b);
             state.cached_input_tokens = usage
                 .get("cache_read_input_tokens")
                 .and_then(|v| v.as_u64());
@@ -321,7 +330,7 @@ mod tests {
             vec![
                 StreamEvent::TextDelta("Let me look.".into()),
                 StreamEvent::Usage {
-                    input_tokens: Some(12),
+                    input_tokens: Some(16),
                     output_tokens: Some(30),
                     cached_input_tokens: Some(4),
                 },

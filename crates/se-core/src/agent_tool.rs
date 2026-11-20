@@ -18,6 +18,8 @@ pub(super) const AGENT_TOOL: &str = "agent";
 pub(super) const MAX_CHILDREN: usize = 4;
 /// Tokens (input + output, as the provider reports them) one child may use.
 pub(super) const CHILD_TOKEN_BUDGET: u64 = 60_000;
+/// The same for a child on an agent CLI (Codex, Claude Code): about eight rounds.
+pub(super) const CLI_CHILD_TOKEN_BUDGET: u64 = 300_000;
 /// Wall-clock bound on one child, approval waits included.
 pub(super) const CHILD_DEADLINE: Duration = Duration::from_secs(600);
 /// A child's answer is cut to this many chars before it reaches the parent.
@@ -317,9 +319,15 @@ impl ProviderRunner {
             specialist_id: Some(job.role.clone()),
             team_node: None,
         };
+        // An agent CLI sends its own ~30k-token prompt fresh on every round (a new
+        // process each time, so little of it comes from cache): 60k is two rounds.
+        let cli = self
+            .registry
+            .get(&chosen.provider)
+            .is_some_and(|p| p.is_agent_cli());
         let child = Child {
             id: agent_id.clone(),
-            budget: CHILD_TOKEN_BUDGET,
+            budget: if cli { CLI_CHILD_TOKEN_BUDGET } else { CHILD_TOKEN_BUDGET },
             deadline,
         };
         let outcome = self.run_inner(&turn, &[], sink, Some(&child));
@@ -506,6 +514,8 @@ mod tests {
             compact_at_tokens: None,
             sticky_specialist: Default::default(),
             mode: Default::default(),
+            router_model: None,
+            role_models: Default::default(),
             team: None,
         };
         (runner, seen, audit)
@@ -651,7 +661,10 @@ mod tests {
         let requests = seen.lock().unwrap().clone();
         assert!(requests[0].tools.iter().any(|t| t.name == "agent"));
         let child = requests.iter().find(|r| is_child(r)).unwrap();
-        assert_eq!(child.messages[0].content.trim(), "ROLE:reader");
+        assert_eq!(
+            crate::provider_runner::role_body(&child.messages[0].content).trim(),
+            "ROLE:reader"
+        );
         assert_eq!(child.messages.last().unwrap().content, "summarise note.txt");
         assert_eq!(child.model, "fake-model");
         // Declared read-files + invoke-agent: offered `read` only.

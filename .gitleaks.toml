@@ -1,0 +1,19 @@
+# Keep every default gitleaks rule. Only obviously fake fixture values are
+# allowlisted: the secret-guard and redaction tests must contain key-shaped
+# strings to prove they are caught. Real keys never match these stopwords.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "fake credentials used by redaction and secret-guard tests"
+stopwords = [
+  "abcdefghij",
+  "0123456789",
+  "abc123",
+  "abcdef1234567890",
+  "FAKE",
+  "EXAMPLE",
+  "this-must-never-leave",
+  "super-secret-value",
+  "Ab3dEf6hIj9kLm2nOp5q",
+]

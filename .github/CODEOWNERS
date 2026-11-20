@@ -1,0 +1,4 @@
+# Every path needs the owner's review. With branch protection ("require review
+# from Code Owners") nobody else can change main, including through pull
+# requests. Replace with your real GitHub login if it differs.
+*  @tharunpista

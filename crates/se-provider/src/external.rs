@@ -833,16 +833,18 @@ fn codex_schema(tools: &[crate::ToolDefinition]) -> serde_json::Value {
     })
 }
 
-/// A reply ending in the `codex_schema` object, as `(prose, calls)`. Earlier
-/// progress messages before the object are kept as prose. `None`: not that shape.
+/// A reply holding the `codex_schema` object, as `(prose, calls)`. Text before
+/// and after the object is kept as prose: Codex can send further messages after
+/// it in one turn, and requiring the object to end the reply dropped its tool
+/// call (seen live, gpt-5.6-luna). `None`: no such object.
 fn json_tool_calls(text: &str) -> Option<(String, BridgedCalls)> {
-    let (start, v) = text
-        .match_indices('{')
-        .find_map(|(i, _)| {
-            let v: serde_json::Value = serde_json::from_str(text[i..].trim_end()).ok()?;
-            v.get("tool_calls")?.as_array()?;
-            Some((i, v))
-        })?;
+    let (start, end, v) = text.match_indices('{').find_map(|(i, _)| {
+        let mut values =
+            serde_json::Deserializer::from_str(&text[i..]).into_iter::<serde_json::Value>();
+        let v = values.next()?.ok()?;
+        v.get("tool_calls")?.as_array()?;
+        Some((i, i + values.byte_offset(), v))
+    })?;
     let mut blocks = String::new();
     for c in v["tool_calls"].as_array()? {
         let name = c["name"].as_str().unwrap_or("invalid_tool_call");
@@ -855,9 +857,13 @@ fn json_tool_calls(text: &str) -> Option<(String, BridgedCalls)> {
     }
     let before = text[..start].trim();
     let message = v["message"].as_str().unwrap_or("").trim();
-    let prose = [before, message].iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join("
-
-");
+    let after = text[end..].trim();
+    let prose = [before, message, after]
+        .iter()
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n\n");
     let (_, calls) = parse_tool_calls(&blocks);
     Some((prose, calls))
 }
@@ -1464,6 +1470,11 @@ mod tests {
         // Done: no calls. Plain text is not this shape at all.
         assert!(json_tool_calls("{\"message\": \"ok\", \"tool_calls\": []}").unwrap().1.is_empty());
         assert!(json_tool_calls("just text {not json").is_none());
+        // Seen live: the object, then more text in the same turn. The call still runs.
+        let trailing = "{\"message\": \"Writing.\", \"tool_calls\": [{\"name\": \"write\", \"arguments_json\": \"{}\"}]}Escalation: user - none";
+        let (prose, calls) = json_tool_calls(trailing).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(prose, "Writing.\n\nEscalation: user - none");
         let tools = vec![crate::ToolDefinition { name: "read".into(), description: String::new(), parameters: serde_json::json!({}) }];
         assert_eq!(codex_schema(&tools)["properties"]["tool_calls"]["items"]["properties"]["name"]["enum"][0], "read");
     }

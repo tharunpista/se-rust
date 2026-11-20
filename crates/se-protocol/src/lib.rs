@@ -164,6 +164,7 @@ pub enum DeltaKind {
 /// number nobody produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Usage {
+    /// All input, cache reads included (`cached_input_tokens` is a part of it).
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
